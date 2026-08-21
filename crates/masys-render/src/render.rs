@@ -20,7 +20,7 @@ use ratatui::widgets::{Block, Clear, List, ListItem, ListState, Paragraph};
 use unicode_width::UnicodeWidthStr;
 
 use masys_domain::finding::Finding;
-use masys_view::{Header, KeyBinding, Metrics, ModalView, Node, StatusLine, View};
+use masys_view::{ActionGroup, ActionRow, Header, KeyBinding, Metrics, ModalView, Node, StatusLine, SwitchRow, View};
 
 use crate::theme::Theme;
 use crate::view;
@@ -67,9 +67,14 @@ fn indented(line: Line<'static>) -> Line<'static> {
     Line::from(spans)
 }
 
-/// One non-`Finding` `Node`, as a list row. `Node::Overview` is the only
-/// multi-line case; `Finding` rows never come through here - they are
-/// batched per section by `build_items` so their labels can be aligned.
+/// One non-`Finding` `Node`, as a list row. `Node::Overview` and the Nix
+/// view's two blocks are the multi-line cases; `Finding` rows never come
+/// through here - they are batched per section by `build_items` so their
+/// labels can be aligned.
+///
+/// Exhaustive, with no `_` arm: the compiler pointing at this file is
+/// what makes the next row type impossible to forget, and a catch-all
+/// would trade that for a blank line nobody notices.
 fn row_item(node: &Node, theme: &Theme, columns: &view::ProcColumns) -> ListItem<'static> {
     match node {
         // The one row that is *not* indented: it is what the others are
@@ -92,7 +97,19 @@ fn row_item(node: &Node, theme: &Theme, columns: &view::ProcColumns) -> ListItem
         | Node::DirEntry { .. }
         | Node::Disk { .. }
         | Node::Timer { .. }
-        | Node::Interface { .. } => ListItem::new(Line::default()),
+        | Node::Interface { .. }
+        // The three columnar Nix rows, batched per section by
+        // `build_items` for the same reason units and timers are.
+        | Node::Generation { .. }
+        | Node::Input { .. }
+        | Node::NixPolicy { .. } => ListItem::new(Line::default()),
+        // The Nix view's two blocks. Several lines in one item, like
+        // `Overview`, because each is one statement rather than a list.
+        // The reboot block is the only row in the buffer that is *not*
+        // indented: `build_nix_rows` gives it no section header, so it
+        // stands where a header would.
+        Node::RebootPending { .. } => ListItem::new(view::reboot_lines(node, theme)),
+        Node::NixStore { .. } => ListItem::new(view::nix_store_lines(node, theme).into_iter().map(indented).collect::<Vec<_>>()),
     }
 }
 
@@ -267,6 +284,56 @@ fn build_items<'a>(
                 // one-to-one place among the items.
                 first_item.extend(items.len()..items.len() + section.len());
                 items.extend(view::journal_lines(&section, theme, scope).into_iter().map(indented).map(ListItem::new));
+            }
+            // The Nix view's three columnar sections, batched for the
+            // reason findings and units are: each pads a column across a
+            // whole run, so the builder has to see the run.
+            //
+            // A maximal run is exactly one section here too.
+            // `masys_app::nix_buffer::build_nix_rows` emits a
+            // `SectionHeader` ahead of every profile's generations, so
+            // two profiles' generations can never end up adjacent and the
+            // home profile's ids are never padded to the system
+            // profile's.
+            Node::Generation { .. } => {
+                let mut section: Vec<view::GenerationRow> = Vec::new();
+                while let Some(Node::Generation { generation, age_ms, .. }) = nodes.get(index) {
+                    section.push(view::GenerationRow { generation: generation.clone(), age_ms: *age_ms });
+                    index += 1;
+                }
+                // One item per row in the batch, so these nodes keep a
+                // one-to-one place among the items.
+                first_item.extend(items.len()..items.len() + section.len());
+                items.extend(view::generation_lines(&section, theme).into_iter().map(indented).map(ListItem::new));
+            }
+            Node::Input { .. } => {
+                let mut section: Vec<(masys_domain::declarative::Input, Option<u32>)> = Vec::new();
+                while let Some(Node::Input { input, age_days }) = nodes.get(index) {
+                    section.push((input.clone(), *age_days));
+                    index += 1;
+                }
+                // One item per row in the batch, so these nodes keep a
+                // one-to-one place among the items.
+                first_item.extend(items.len()..items.len() + section.len());
+                items.extend(view::input_lines(&section, theme).into_iter().map(indented).map(ListItem::new));
+            }
+            Node::NixPolicy { .. } => {
+                let mut section: Vec<view::NixPolicyRow> = Vec::new();
+                while let Some(Node::NixPolicy { job, unit, retention, next_in_ms, last_ago_ms, enabled }) = nodes.get(index) {
+                    section.push(view::NixPolicyRow {
+                        job: job.clone(),
+                        unit: unit.clone(),
+                        retention: retention.clone(),
+                        next_in_ms: *next_in_ms,
+                        last_ago_ms: *last_ago_ms,
+                        enabled: *enabled,
+                    });
+                    index += 1;
+                }
+                // One item per row in the batch, so these nodes keep a
+                // one-to-one place among the items.
+                first_item.extend(items.len()..items.len() + section.len());
+                items.extend(view::nix_policy_lines(&section, theme).into_iter().map(indented).map(ListItem::new));
             }
             // The two blocks that are several lines: one item each, so a
             // long one scrolls rather than vanishing.
@@ -560,28 +627,43 @@ fn draw_modal(frame: &mut Frame, modal: &ModalView, area: Rect, theme: &Theme) -
         // terminal the popup silently dropped the last nine - including
         // every action key. A reference card that hides half the keys is
         // worse than no reference card.
-        ModalView::Keys { groups } => (" keys ", key_help_lines(groups, theme, area.height.saturating_sub(2))),
+        ModalView::Keys { groups } => (" keys ".to_string(), key_help_lines(groups, theme, area.height.saturating_sub(2))),
         // A confirmation is one line and deliberately plain: the prompt
         // already names the signal and the process, and decorating it
         // would only make the two outcomes harder to tell apart.
         ModalView::Confirm { prompt } => {
-            (" confirm ", vec![Line::from(Span::styled(prompt.to_string(), Style::default().fg(theme.status_error)))])
+            (" confirm ".to_string(), vec![Line::from(Span::styled(prompt.to_string(), Style::default().fg(theme.status_error)))])
         }
         // A block for a cursor, so it is obvious the popup is taking
         // keystrokes rather than the buffer behind it.
-        ModalView::Input { prompt, typed, .. } => (
-            " filter ",
-            vec![Line::from(vec![
+        //
+        // Titled `input`, not `filter`: this is a transient's text-entry
+        // sub-step - a retention, a generation spec, a search query - and
+        // the buffer filter is not a popup at all. The old title dates
+        // from before that was settled, and nothing caught it because
+        // nothing had ever constructed an `Input`.
+        ModalView::Input { prompt, typed, candidates } => (
+            " input ".to_string(),
+            std::iter::once(Line::from(vec![
                 Span::styled(format!("{prompt}: "), Style::default().fg(theme.section_header)),
                 Span::raw(format!("{typed}\u{2588}")),
-            ])],
+            ]))
+            .chain(candidates.iter().flat_map(|list| candidate_lines(list, theme)))
+            .collect(),
         ),
-        // Transients are a later plan.
-        ModalView::Transient { .. } => return (0, 0),
+        // The title names the subject - `Unit . restic-backup.service`,
+        // `Generation 436` - so it is padded here the way the fixed titles
+        // above are written padded, and not by every caller.
+        ModalView::Transient { title, switches, groups } => (format!(" {title} "), transient_lines(switches, groups, theme)),
     };
 
     let content = lines.len() as u16;
-    let widest = lines.iter().map(|l| l.width()).max().unwrap_or(0) as u16;
+    // The title is measured with the lines, not after them: a transient
+    // names its subject - `Unit . restic-backup.service` - and is
+    // routinely wider than any row under it. Sized to the rows alone, the
+    // border ate the end of the title, which is the one part of a popup
+    // that says what you are about to act on.
+    let widest = lines.iter().map(|l| l.width()).chain([UnicodeWidthStr::width(title.as_str())]).max().unwrap_or(0) as u16;
     // +2 on each axis for the border.
     let height = (content + 2).min(area.height);
     let width = (widest + 4).min(area.width);
@@ -646,17 +728,161 @@ fn group_block(group: &masys_view::KeyGroup, theme: &Theme) -> Vec<Line<'static>
     let mut lines =
         vec![Line::from(Span::styled(group.heading.clone(), Style::default().fg(theme.section_header).add_modifier(Modifier::BOLD)))];
     for binding in &group.bindings {
-        let (chord_style, label_style) = if binding.dimmed {
-            (Style::default().fg(theme.info).add_modifier(Modifier::DIM), Style::default().add_modifier(Modifier::DIM))
-        } else {
-            (Style::default().fg(theme.info), Style::default())
-        };
+        let (chord_style, label_style) = row_styles(binding.dimmed, theme);
         lines.push(Line::from(vec![
             Span::styled(format!("  {:<6}", binding.chord), chord_style),
             Span::styled(binding.label.clone(), label_style),
         ]));
     }
     lines
+}
+
+/// A picker's candidates, the highlighted one reversed.
+///
+/// `REVERSED` rather than a `>` marker because it is what already means
+/// "the cursor is here" everywhere else in masys - the list's
+/// `highlight_style` and the footer's active buffer - and a second idiom
+/// for the same idea would have to be learned separately.
+///
+/// An empty match set draws a line saying so. Drawing nothing would leave
+/// the typed text with blank space under it, which reads as a picker
+/// still thinking rather than one that has answered.
+fn candidate_lines(list: &masys_view::CandidateList, theme: &Theme) -> Vec<Line<'static>> {
+    if list.matches.is_empty() {
+        return vec![Line::from(Span::styled("  no matches".to_string(), Style::default().fg(theme.info).add_modifier(Modifier::DIM)))];
+    }
+
+    list.matches
+        .iter()
+        .enumerate()
+        .map(|(index, candidate)| {
+            let style = match index == list.selected {
+                true => Style::default().add_modifier(Modifier::REVERSED),
+                false => Style::default(),
+            };
+            Line::from(Span::styled(format!("  {candidate}"), style))
+        })
+        .collect()
+}
+
+/// A transient's contents: its switch groups, then its action groups,
+/// one blank line between each.
+///
+/// Switches lead because they change what the actions under them will
+/// do. Read after choosing an action, they have been read too late.
+fn transient_lines(switches: &[SwitchRow], groups: &[ActionGroup], theme: &Theme) -> Vec<Line<'static>> {
+    let blocks: Vec<Vec<Line<'static>>> =
+        switch_blocks(switches, theme).into_iter().chain(groups.iter().map(|group| action_block(group, theme))).collect();
+
+    blocks.into_iter().enumerate().flat_map(|(index, block)| (index > 0).then(Line::default).into_iter().chain(block)).collect()
+}
+
+/// The switch rows, bucketed by their `group` in first-appearance order.
+///
+/// A `SwitchRow` carries its heading on itself rather than sitting inside
+/// a wrapper the way an `ActionRow` sits inside an `ActionGroup`, so
+/// putting the buckets back together is the renderer's job. First
+/// appearance rather than sorted: the order a transient lists its
+/// switches in is the order its author chose, and alphabetising it here
+/// would silently overrule them.
+fn switch_blocks(switches: &[SwitchRow], theme: &Theme) -> Vec<Vec<Line<'static>>> {
+    let headings = switches.iter().map(|switch| switch.group).fold(Vec::new(), |mut seen, group| {
+        if !seen.contains(&group) {
+            seen.push(group);
+        }
+        seen
+    });
+    // One label column across every switch group, not one per group, so
+    // the `[x]` boxes line up down the whole popup rather than stepping
+    // in and out at each heading.
+    let width = switches.iter().map(|switch| UnicodeWidthStr::width(switch.label)).max().unwrap_or(0);
+
+    headings
+        .into_iter()
+        .map(|heading| {
+            std::iter::once(heading_line(heading.to_string(), None, theme))
+                .chain(switches.iter().filter(|switch| switch.group == heading).map(|switch| switch_line(switch, theme, width)))
+                .collect()
+        })
+        .collect()
+}
+
+/// `-v  verbose            [x]`.
+///
+/// An unsupported switch is dimmed rather than dropped, for the reason a
+/// dimmed action row is: a switch that vanishes on some hosts makes the
+/// popup unreadable by position.
+fn switch_line(switch: &SwitchRow, theme: &Theme, width: usize) -> Line<'static> {
+    let (chord_style, label_style) = row_styles(!switch.supported, theme);
+    Line::from(vec![
+        Span::styled(format!("  {:<4}", switch.chord), chord_style),
+        Span::styled(format!("{:<width$}", switch.label, width = width), label_style),
+        Span::styled(if switch.on { "  [x]" } else { "  [ ]" }.to_string(), label_style),
+    ])
+}
+
+/// One action group: its heading, then its rows.
+///
+/// Rows pair two to a line when no row in the group carries a note, and
+/// go one to a line when any does - which is exactly how the design draws
+/// the unit popup, `s start / S stop` side by side above `e enable` alone
+/// with `reverts on nixos-rebuild` beside it. The rule is per group
+/// rather than per row so that a group reads as one shape; pairing the
+/// note-less rows of a mixed group would put the same group's actions in
+/// two different places to look.
+fn action_block(group: &ActionGroup, theme: &Theme) -> Vec<Line<'static>> {
+    let heading = heading_line(group.heading.clone(), group.note.clone(), theme);
+    let width = group.rows.iter().map(|row| UnicodeWidthStr::width(row.label)).max().unwrap_or(0);
+    let annotated = group.rows.iter().any(|row| row.note.is_some());
+    let per_line = if annotated { 1 } else { 2 };
+
+    std::iter::once(heading)
+        .chain(group.rows.chunks(per_line).map(|pair| {
+            Line::from(
+                pair.iter().enumerate().flat_map(|(index, row)| action_cell(row, theme, width, index + 1 < pair.len())).collect::<Vec<_>>(),
+            )
+        }))
+        .collect()
+}
+
+/// One action row's spans - `  s  start` plus whatever follows it, which
+/// is its note, or padding if another cell shares the line, or nothing.
+///
+/// Spans rather than a `Line` so that two cells can be laid on one.
+fn action_cell(row: &ActionRow, theme: &Theme, width: usize, paired: bool) -> Vec<Span<'static>> {
+    let (chord_style, label_style) = row_styles(row.dimmed, theme);
+    let label = if paired || row.note.is_some() { format!("{:<width$}", row.label, width = width) } else { row.label.to_string() };
+
+    std::iter::once(Span::styled(format!("  {}  ", row.chord), chord_style))
+        .chain(std::iter::once(Span::styled(label, label_style)))
+        .chain(row.note.iter().map(|note| Span::styled(format!("  {note}"), Style::default().add_modifier(Modifier::DIM))))
+        .chain(paired.then(|| Span::raw("   ".to_string())))
+        .collect()
+}
+
+/// A group heading, with its group-level note trailing it.
+///
+/// The note is drawn exactly as given. The designs write two of them -
+/// the unit popup's `! declared in nix` and the Nix transient's
+/// `policy: weekly, keep 14d` - and only one is a warning. A renderer
+/// that prefixed every note with `!` would announce a retention policy as
+/// an alarm, so the marker belongs to whoever wrote the note and knows
+/// which kind it is.
+fn heading_line(heading: String, note: Option<String>, theme: &Theme) -> Line<'static> {
+    Line::from(
+        std::iter::once(Span::styled(heading, Style::default().fg(theme.section_header).add_modifier(Modifier::BOLD)))
+            .chain(note.map(|note| Span::styled(format!("   {note}"), Style::default().fg(theme.info))))
+            .collect::<Vec<_>>(),
+    )
+}
+
+/// Dimming, in one place: a dimmed row keeps its position and its chord
+/// still works, so only the styling says anything is different about it.
+fn row_styles(dimmed: bool, theme: &Theme) -> (Style, Style) {
+    match dimmed {
+        true => (Style::default().fg(theme.info).add_modifier(Modifier::DIM), Style::default().add_modifier(Modifier::DIM)),
+        false => (Style::default().fg(theme.info), Style::default()),
+    }
 }
 
 /// Lays columns side by side, padding each to its own widest line so the

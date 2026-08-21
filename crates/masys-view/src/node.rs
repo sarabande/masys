@@ -1,6 +1,7 @@
 //! The outline's row model: a flat, ordered list of what a buffer shows.
 //! Structure only - no styling; masys-render's own row type adds that.
 
+use masys_domain::declarative::ProfileKind;
 use masys_domain::finding::Finding;
 use masys_domain::journal::Entry;
 use masys_domain::proc_detail::ProcDetail;
@@ -47,6 +48,73 @@ pub enum SectionKind {
     /// Always present, never hidden even with nothing else to show - it
     /// doubles as the "checks actually ran" indicator.
     System,
+    /// A profile's generations.
+    ///
+    /// The profile is part of the tag, unlike `Units`, which covers every
+    /// state group with one variant. The difference is `fold_key`: three
+    /// generation sections are on screen at once and each folds
+    /// separately, so the tag has to tell them apart. A unit group's title
+    /// already does that job for `Units` - `Services`, `Sockets` - while a
+    /// generations heading carries a count and, for home-manager, how it
+    /// is deployed, neither of which is an identity.
+    Generations(ProfileKind),
+    /// What pins the configuration - flake inputs or channels.
+    Inputs,
+    /// Store capacity and the declared maintenance policy.
+    NixStore,
+    /// Nix's own units, filtered out of the units masys already polls.
+    NixUnits,
+}
+
+impl SectionKind {
+    /// Whether a section of this kind folds under `TAB`.
+    ///
+    /// Named once, here, rather than restated as a match arm in each of
+    /// `App::cycle_section` and `App::group_names` - which is how those
+    /// two came to carry a comment asking the next reader to keep them in
+    /// step by hand. `NixStore` and `System` are the deliberate absences:
+    /// both always render, as the "checks actually ran" indicator of
+    /// their view, so neither has a fold to cycle into.
+    pub fn folds(self) -> bool {
+        matches!(
+            self,
+            SectionKind::Units | SectionKind::Journal | SectionKind::Generations(_) | SectionKind::Inputs | SectionKind::NixUnits
+        )
+    }
+
+    /// The key this section folds under, given its rendered title.
+    ///
+    /// **Not the title**, which is what it used to be everywhere. A title
+    /// is display text, and the Nix view's titles carry readings: the
+    /// Inputs heading names both revisions and the drift verdict, and the
+    /// Home-manager heading says whether `nixos-rebuild` activates it.
+    /// Fold Inputs, rebuild in another terminal, and the heading turns
+    /// from `drift - not rebuilt` into `in sync` - which silently reopens
+    /// the section the operator folded and strands the old key in the set
+    /// for the rest of the session. That is the exact workflow the view
+    /// exists for.
+    ///
+    /// `build_nix_rows` only ever argued that its titles are unique
+    /// *within one call*. A fold set outlives the call, so what it
+    /// actually needs is stability *across* calls, which is a different
+    /// and stronger property.
+    ///
+    /// So the kind supplies the key wherever the kind is enough, and the
+    /// `nix:` prefix keeps those keys out of the space of titles - the
+    /// set is one set for the whole session, not one per buffer.
+    /// `Units` and `Journal` still key on their titles, because that is
+    /// where their distinguisher lives: a unit type and a calendar day
+    /// both name the section rather than describe what is in it.
+    pub fn fold_key(self, title: &str) -> String {
+        match self {
+            SectionKind::Generations(ProfileKind::System) => "nix:generations:system".to_string(),
+            SectionKind::Generations(ProfileKind::Home) => "nix:generations:home".to_string(),
+            SectionKind::Generations(ProfileKind::Channels) => "nix:generations:channels".to_string(),
+            SectionKind::Inputs => "nix:inputs".to_string(),
+            SectionKind::NixUnits => "nix:units".to_string(),
+            _ => title.to_string(),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -143,6 +211,81 @@ pub enum Node {
         /// says nothing about whether the schedule is working. This is
         /// the column the whole section exists for.
         activated_failed: bool,
+    },
+    /// One generation of one profile.
+    Generation {
+        generation: masys_domain::declarative::Generation,
+        kind: masys_domain::declarative::ProfileKind,
+        /// How long ago it was created, in milliseconds. Precomputed
+        /// because the renderer has no clock - the same reason
+        /// `Node::Timer` carries durations rather than timestamps.
+        /// `None` where the generation's mtime could not be read, which
+        /// renders as `-` rather than as an age counted from 1970.
+        age_ms: Option<u64>,
+    },
+    /// One pinned input.
+    Input {
+        input: masys_domain::declarative::Input,
+        /// How many days old the input is. `None` when
+        /// `masys_domain::declarative::Input::last_modified_secs` is
+        /// itself `None` - a channel records no such timestamp at all,
+        /// and the view renders `-` rather than an age counted from
+        /// 1970, the same convention `Node::Generation::age_ms` follows.
+        age_days: Option<u32>,
+    },
+    /// A reboot the current generation needs.
+    RebootPending {
+        booted: Option<u64>,
+        current: Option<u64>,
+        kernel_changed: bool,
+        initrd_changed: bool,
+    },
+    /// Store capacity and what is retained in it.
+    NixStore {
+        /// `None` before `/nix` has been matched among the sampled
+        /// filesystems - reachable before the first tick, when
+        /// `facts.filesystems` is still empty. Renders as `-`, not as a
+        /// store measured at zero.
+        used_percent: Option<f32>,
+        /// Same reasoning as `used_percent`: unmeasured, not empty.
+        free_bytes: Option<u64>,
+        /// `None` until the profiles have been read once, and for the
+        /// whole session on a host whose profile directories keep
+        /// refusing. `0` is a count somebody would act on - it says this
+        /// host has no generations to roll back to - and it must not be
+        /// what a read failure looks like. Absent profiles do still count
+        /// as zero: a host with no home-manager genuinely has no home
+        /// generations, and that is an answer rather than a gap.
+        system_generations: Option<u32>,
+        /// Same reasoning as `system_generations`.
+        home_generations: Option<u32>,
+        /// `None` until the roots have been counted once. `0` reads as
+        /// "nothing is pinning your store", which is the actionable claim
+        /// `DeclarativeService::gc_roots` returns `Err` rather than `0`
+        /// to avoid making - and the view must not put it back.
+        gc_roots: Option<u32>,
+    },
+    /// One declared maintenance job, from its timer and its configuration.
+    ///
+    /// `retention` is the only field this cannot get from systemd, and is
+    /// why the declarative port answers `gc_retention` at all.
+    NixPolicy {
+        job: String,
+        unit: String,
+        /// Three states, because there are three facts. `None` is "not
+        /// read" and renders as `-`. `Some(None)` is "read, and this job
+        /// retains nothing" - which is the whole truth for `optimise`,
+        /// and for a `nix-gc.service` whose generated script sets no
+        /// `--delete-older-than`. `Some(Some(..))` is the declared
+        /// policy.
+        ///
+        /// The middle state is a finding: a gc job with no retention will
+        /// collect everything but the current generation. That is exactly
+        /// why it must not be what a failed read looks like.
+        retention: Option<Option<String>>,
+        next_in_ms: Option<u64>,
+        last_ago_ms: Option<u64>,
+        enabled: bool,
     },
     /// One journal line - backs both the Kernel and Recent errors
     /// sections; which one is which comes from the enclosing

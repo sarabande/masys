@@ -10,3 +10,22 @@ categories = ["command-line-utilities", "os::linux-apis"]
 
 [dependencies]
 masys-domain = { path = "../masys-domain", version = "0.1.0" }
+# flake.lock is nested JSON of arbitrary shape. Parsed with a real parser
+# rather than string-matched, because the failure mode of the alternative
+# is silently misreporting somebody's pins.
+serde_json = "1"
+# faccessat, for whether a profile directory can be written. The kernel
+# already knows; a mode-and-owner comparison would get ACLs and
+# capabilities wrong, and `PermissionsExt::readonly()` reads
+# `drwxr-xr-x root root` as writable. Already in the workspace lock via
+# masys-render, masys-scan and masys-systemd.
+libc = "0.2"
+
+[dev-dependencies]
+# geteuid, so the read-only-directory test can say when it is being run by
+# somebody the check cannot refuse.
+libc = "0.2"
+# Terminal columns, not bytes: `reboot_reason`'s budget is a width on
+# somebody's screen, and the measure that decides where a line is clipped
+# is the one the test has to use. Already in the workspace via ratatui.
+unicode-width = "0.2"

@@ -27,4 +27,4 @@ ratatui = "0.30"
 crossterm = "0.29"
 # Reading ~/.config/masys/config.toml. Parsed here rather than in
 # masys-app, which stays free of I/O and of a config format.
-toml = "0.9"
+toml = "1"

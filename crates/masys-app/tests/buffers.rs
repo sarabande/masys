@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 
+use masys_app::buffer::{Buffer, Registry};
 use masys_app::io_buffer::build_io_rows;
 use masys_app::log_buffer::{TAIL, build_log_rows};
 use masys_app::systemd_buffer::build_unit_rows;
@@ -580,4 +581,30 @@ fn a_unit_scoped_journal_is_sectioned_by_day() {
         })
         .collect();
     assert_eq!(titles, vec!["1970-01-01"], "the day, not the unit");
+}
+
+/// The whole reason the registry stops being a static slice: on Debian
+/// there is no Nix view, and a digit that opens an empty screen explaining
+/// that NixOS was not found is worse than a digit that does nothing.
+#[test]
+fn the_nix_view_is_absent_without_a_declarative_service() {
+    let registry = Registry::new(false);
+    assert!(!registry.contains(Buffer::Nix));
+    assert!(registry.by_key('5').is_none());
+}
+
+#[test]
+fn the_nix_view_takes_digit_five_when_the_service_is_present() {
+    let registry = Registry::new(true);
+    assert_eq!(registry.by_key('5'), Some(Buffer::Nix));
+}
+
+/// Digits 1 to 4 are unaffected either way.
+#[test]
+fn the_existing_views_keep_their_digits_in_both_registries() {
+    for present in [false, true] {
+        let registry = Registry::new(present);
+        assert_eq!(registry.by_key('1'), Some(Buffer::Status));
+        assert_eq!(registry.by_key('4'), Some(Buffer::Io));
+    }
 }

@@ -109,7 +109,9 @@ pub fn build_log_rows(
             count_at = rows.len();
             rows.push(Node::SectionHeader { title: day_label(day), kind: SectionKind::Journal, count: Some(0) });
             open_day = Some(day);
-            shut = collapsed.contains(&day_label(day));
+            // Through `fold_key`, for the reason `build_unit_rows` gives:
+            // one place decides what a section is filed under.
+            shut = collapsed.contains(&SectionKind::Journal.fold_key(&day_label(day)));
         }
         // Counted whether or not it is drawn: a folded day keeps its
         // heading and its count, which is most of what a folded section

@@ -13,6 +13,9 @@
 
 use std::collections::{HashMap, HashSet};
 
+use masys_domain::declarative::{
+    DeclarativeService, Generation, HomeMode, InputSource, Inputs, NixOp, Profile, ProfileKind, RebootState, RebuildVerb,
+};
 use masys_domain::error::MasysError;
 use masys_domain::finding::{Finding, Thresholds};
 use masys_domain::journal::{Entry, Priority};
@@ -24,22 +27,96 @@ use masys_domain::scan::{DirScanner, ScanProgress};
 use masys_domain::service::{PlatformService, Signal, SystemService};
 use masys_domain::triage;
 use masys_domain::unit::{ActiveState, Unit};
-use masys_view::{Header, KeyBinding, KeyGroup, ModalView, Node, Overview, SectionKind, StatusLine, View};
+use masys_view::{Header, KeyBinding, KeyGroup, ModalView, Node, Overview, StatusLine, View};
 
 use crate::buffer::Buffer;
 use crate::io_buffer::build_io_rows;
 use crate::key::{Key, KeyCode};
-use crate::keymap::{Action, Keymap, Sort, UnitVerb};
+use crate::keymap::{Action, Keymap, NixVerb, Sort, UnitVerb};
 use crate::log_buffer::build_log_rows;
+use crate::nix_buffer::{build_nix_rows, nix_transient};
 use crate::procs::build_proc_rows;
 use crate::status::build_status_rows;
-use crate::systemd_buffer::build_unit_rows;
+use crate::systemd_buffer::{build_unit_rows, severity, unit_rows, unit_transient};
+use crate::transient::{DefGroup, DefRow, TransientDef};
+
+/// A transient's open text-entry sub-step.
+///
+/// Holds the verb it will run rather than a closure or a queued `NixOp`,
+/// because the operation cannot be built until the value exists - which
+/// is the whole reason this state is here. `App::nix_op_typed` turns the
+/// pair into an operation at the moment enter is pressed, so a tick that
+/// lands mid-typing cannot move a row out from under an argument already
+/// resolved.
+#[derive(Debug, Clone)]
+struct InputState {
+    verb: NixVerb,
+    prompt: &'static str,
+    typed: String,
+}
+
+/// What a Nix verb can do on the row the cursor is on.
+///
+/// Three answers where there used to be two, because the transient
+/// brought verbs that need a value nobody has read: a query, an option
+/// name, a generation spec. `Asks` is not "cannot act here" - the row is
+/// live, and pressing it opens the input sub-step - and folding the two
+/// together would mark `search packages` on every host, which is the one
+/// operation that always works.
+///
+/// One function answers all three, which is the invariant `nix_offer`'s
+/// doc protects: the footer, the popup and the dispatch all ask it, so a
+/// row that is offered is a row that will act.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum NixOffer {
+    /// Runnable now, arguments resolved.
+    Ready(NixOp),
+    /// Runnable once the operator types something.
+    Asks { prompt: &'static str },
+    /// Not runnable here.
+    No,
+}
 
 /// An action waiting on confirmation.
 #[derive(Debug, Clone)]
 enum Pending {
-    Kill { pid: u32, signal: Signal },
-    Unit { unit: String, verb: UnitVerb },
+    Kill {
+        pid: u32,
+        signal: Signal,
+    },
+    Unit {
+        unit: String,
+        verb: UnitVerb,
+    },
+    /// A Nix operation that changes the machine. The arguments are
+    /// already resolved: which generation, which profile, which
+    /// retention. Resolving them when the key is pressed rather than when
+    /// the confirmation is answered is what makes the prompt able to name
+    /// them, and it is also what keeps a tick that lands in between from
+    /// moving the rows under an answer already given.
+    Nix {
+        op: NixOp,
+    },
+}
+
+/// What [`Flow::Suspend`] was asked for.
+///
+/// A bare unit name until now, because `systemctl edit` was the only
+/// thing in masys that needed the terminal. Every Nix operation needs it
+/// too, and more so: `nixos-rebuild switch` streams for minutes and
+/// `nix store diff-closures` pages, which is why
+/// `masys_platform_nixos::ops` spawns them with stdio inherited rather
+/// than capturing their output.
+///
+/// So the field carries *what to run* rather than one operation's
+/// argument, and [`App::run_suspended`] stays the single place that turns
+/// it into a port call. The alternative - a second `Option` field beside
+/// the first - would let both be `Some` at once, and nothing in the type
+/// would say which of the two the caller was about to run.
+#[derive(Debug, Clone)]
+enum Suspended {
+    EditUnit(String),
+    Nix(NixOp),
 }
 
 impl crate::systemd_buffer::Expanded for HashMap<String, Option<masys_domain::unit::UnitDetail>> {
@@ -70,13 +147,54 @@ pub enum Flow {
     Quit,
     /// The session needs the terminal back before it can go on.
     ///
-    /// Returned when an action has to run a program that owns the screen -
-    /// today only `systemctl edit`, which spawns `$EDITOR`. The caller
+    /// Returned when an action has to run a program that owns the screen:
+    /// `systemctl edit`, which spawns `$EDITOR`, and every Nix operation,
+    /// which streams its own output for as long as it takes. The caller
     /// releases the terminal, calls [`App::run_suspended`], and restores
     /// it. The session cannot do any of that itself: no layer above the
     /// composition root knows what a terminal is, which is the rule that
     /// keeps every crate here testable without one.
+    ///
+    /// What is waiting is `Suspended`, not this variant: a payload here
+    /// would have to be public, and `Flow` is the one thing the binary
+    /// matches on. What comes *back* is [`Aftermath`], because by then
+    /// the command has run and there is a second fact to report.
     Suspend,
+}
+
+/// What the suspended command left on the screen the caller is about to
+/// take back.
+///
+/// The caller cannot work this out for itself and must not guess: it hands
+/// the terminal over blind, and only the session knows whether what ran
+/// there was an editor the operator drove by hand or a command that
+/// printed and exited. `nix store diff-closures` between generations 427
+/// and 438 prints 84 lines and exits in 0.32 s on this host - measured
+/// three times, and through masys itself - so a caller that re-entered the
+/// alternate screen the moment the command returned took the diff with it.
+/// The output survives only in the normal screen's scrollback, which is
+/// invisible while masys is drawing.
+///
+/// A `bool` carries the same two states and is the obvious shape. It is
+/// rejected for what it forces the *caller* to be named after:
+/// the only honest name for a `bool` at that call site is `should_pause`,
+/// and pausing is a terminal decision this crate is not allowed to hold an
+/// opinion about - the rule [`Flow::Suspend`] states. The fact this crate
+/// owns is what became of the output; what to do about it is the
+/// composition root's, and a type named for the fact is what keeps the two
+/// from being written as one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Aftermath {
+    /// The operator has already read whatever is up there.
+    ///
+    /// An editor holds the terminal until it is quit, so by the time it
+    /// returns its screen has been read and dismissed by the person who
+    /// was reading it. Also the answer when nothing ran at all: there is
+    /// no output, so none of it is unread.
+    Seen,
+    /// Output that ends the instant the command does, and that nobody has
+    /// had a chance to read.
+    Unseen,
 }
 
 /// What one tick learned, kept so any buffer can be rebuilt from it
@@ -104,11 +222,177 @@ struct Facts {
     interfaces: Vec<Interface>,
     /// Per-interface throughput, derived the same way disk rates are.
     net_rates: Vec<(String, NetRate)>,
+    /// The seven below come from the declarative port, and every one of
+    /// them is a keep-last-good reading - see `keep_last_good`. They are
+    /// carried across the rebuild of `Facts` in `tick` for that reason,
+    /// the way `journal` is, and they stay at their defaults for the whole
+    /// session on a host that has no such port.
+    ///
+    /// Five of the seven are `Option`, and for one reason rather than
+    /// five: a default that renders as a reading is a reading masys did
+    /// not take. `Vec::new()` renders as `0 system generations . 0 home`,
+    /// `0` as `0 gc roots`, and a bare `None` retention as a gc job that
+    /// keeps nothing - three claims an operator would act on, made on the
+    /// strength of a read that failed. Only `reboot` and `nix_inputs`
+    /// default honestly, because for those two the port documents `None`
+    /// as an answer in its own right.
+    ///
+    /// `None` here means "no read has succeeded yet", never "the host has
+    /// none of these".
+    profiles: Option<Vec<Profile>>,
+    reboot: Option<RebootState>,
+    nix_inputs: Option<Inputs>,
+    /// `None` until a read succeeds, which is not the same fact as
+    /// `Absent`. `Absent` is the port's answer for "home-manager is not
+    /// installed on this host"; a host whose `home_mode` read keeps
+    /// failing has not said that, and must not be recorded as having.
+    home_mode: Option<HomeMode>,
+    nixpkgs_rev: Option<String>,
+    /// Doubly optional, because there are three facts. The outer `None`
+    /// is "not read"; `Some(None)` is the port's own answer that
+    /// `nix-gc.service` declares no `--delete-older-than`. The port's doc
+    /// is explicit that its `Err` must not collapse into that inner
+    /// `None`, and a single `Option` here is exactly that collapse.
+    gc_retention: Option<Option<String>>,
+    /// `Option<u32>` where the port answers `u32`, for the reason the
+    /// port's own doc gives for refusing to answer `0`: `0` reads as
+    /// "nothing is pinning your store". Storing the default would put the
+    /// claim back one layer up.
+    gc_roots: Option<u32>,
+    /// Doubly optional, for `gc_retention`'s reason: the outer `None` is
+    /// "not read", and `Some(None)` is the port's own answer that no
+    /// flake reference resolves - which is a channels host, not a
+    /// failure. Collapsing the two would mark the flake-only rows on a
+    /// host whose read merely failed, and mark them for the wrong reason.
+    flake_ref: Option<Option<String>>,
+    /// And where `<nixos-config>` resolves, doubly optional for the same
+    /// reason. `nixos-option` is the one operation that needs it.
+    nixos_config: Option<Option<String>>,
+}
+
+/// Takes a port's answer, and keeps the last good one where the read
+/// failed.
+///
+/// The rule every declarative read follows, named once rather than
+/// restated seven times. `Err` from these methods means "could not find
+/// out", and storing what `unwrap_or_default` would produce - no
+/// generations, no reboot pending, no gc policy, nothing pinning the
+/// store - turns a read failure into a positive claim about the host.
+/// Every one of those claims is actionable, and every one of them is
+/// wrong.
+///
+/// `Ok(None)` still overwrites, and has to: the port documents `None` as
+/// a real answer wherever it returns one - booted and current are the same
+/// store path, this configuration pins nothing - so holding a stale `Some`
+/// over it would leave a reboot showing as pending after the reboot.
+fn keep_last_good<T>(slot: &mut T, read: Result<T, MasysError>) {
+    if let Ok(reading) = read {
+        *slot = reading;
+    }
+}
+
+/// Whether an operation reads and changes nothing.
+///
+/// The question the confirmation turns on, decided per operation against
+/// what `masys_platform_nixos::ops::argv` runs for each, and matched
+/// exhaustively rather than with a wildcard: a `NixOp` added later must
+/// be looked at here, because the answer a wildcard would give it is the
+/// one nobody would notice being wrong.
+///
+/// The four that only read do so plainly. `nix store diff-closures`
+/// prints two closures' difference; `nixos-option` prints this host's
+/// value for one option; `nix search nixpkgs` prints matches. `nix flake
+/// check` is the one worth arguing about - it *builds* the flake's checks
+/// and so adds store paths - but it activates nothing, changes no
+/// profile, and leaves nothing an operator would have to undo, which is
+/// the line that matters for a prompt.
+fn only_reads(op: &NixOp) -> bool {
+    match op {
+        NixOp::Diff { .. } | NixOp::FlakeCheck | NixOp::OptionValue { .. } | NixOp::SearchPackages { .. } => true,
+        // The rest all change something an operator would have to undo: a
+        // running system and its boot default, the generations a rollback
+        // needs, or the lock file a configuration is pinned by.
+        NixOp::Rebuild(_)
+        | NixOp::Activate { .. }
+        | NixOp::Rollback
+        | NixOp::Clean { .. }
+        | NixOp::DeleteGenerations { .. }
+        | NixOp::FlakeUpdate { .. }
+        | NixOp::ChannelUpdate
+        | NixOp::ChannelRollback
+        | NixOp::HomeSwitch => false,
+    }
+}
+
+/// What a confirmation must say the operation will do, or `None` for an
+/// operation no key produces yet.
+///
+/// `ask_kill` names the signal because "SIGKILL cannot be caught, and the
+/// difference is the whole reason there are two bindings". The same
+/// standard here: activating a generation and deleting a fortnight of
+/// them are different acts, and a prompt that said only "confirm?" would
+/// make them look like one.
+fn prompt_for(op: &NixOp) -> Option<String> {
+    match op {
+        // "and make it the boot default" because that is the second half
+        // of what runs: `switch-to-configuration switch` activates *and*
+        // installs the bootloader entry, where `test` would activate
+        // without touching what boots. An operator who reads this as
+        // "just for now" would be wrong in the way that matters.
+        NixOp::Activate { generation, .. } => Some(format!("activate system generation {generation} and make it the boot default?")),
+        // "in every profile", because that is what happens and it is not
+        // what the row under the cursor suggests. nix-collect-garbage(1)
+        // for nix 2.34.8 on this host: `--delete-older-than` "deletes all
+        // generations of profiles older than the specified amount" across
+        // every profile it finds, not the one the cursor is in - and then
+        // collects. The generation active at that point in time survives,
+        // which is why this does not say "every generation".
+        NixOp::Clean { older_than } => Some(format!("delete generations older than {older_than} in every profile and collect the store?")),
+        // The transient made the rest reachable, so the rest have
+        // sentences now - written here, where there is something to
+        // press, exactly as the note this replaces said they would be.
+        //
+        // Each says what it changes rather than what it is called. A
+        // prompt reading "run switch?" tells an operator who already
+        // pressed `s` nothing they did not know.
+        NixOp::Rebuild(RebuildVerb::Switch) => Some("build this configuration, activate it, and make it the boot default?".to_string()),
+        NixOp::Rebuild(RebuildVerb::Boot) => {
+            Some("build this configuration and make it the boot default, without activating now?".to_string())
+        }
+        // "until you reboot" is the whole of the difference from
+        // `switch`, and it is the reason `test` is the safe one to try.
+        NixOp::Rebuild(RebuildVerb::Test) => Some("build this configuration and activate it until you reboot?".to_string()),
+        // Confirmed although it activates nothing: a build writes to the
+        // store, takes minutes, and is not free to start by accident.
+        NixOp::Rebuild(RebuildVerb::Build) => Some("build this configuration without activating it?".to_string()),
+        NixOp::Rebuild(RebuildVerb::DryActivate) => Some("print what activating this configuration would change?".to_string()),
+        NixOp::Rollback => Some("activate the previous generation and make it the boot default?".to_string()),
+        NixOp::HomeSwitch => Some("build and activate the home-manager configuration?".to_string()),
+        // Names the spec rather than a count, because masys did not count
+        // them: `+5` and `30d` are what `nix-env` was given, and how many
+        // generations that is on this host is a question only `nix-env`
+        // answers. A prompt saying "delete 9 generations" would be a
+        // number nobody measured.
+        NixOp::DeleteGenerations { profile, spec } => Some(format!("delete the generations matching `{spec}` from {profile}?")),
+        // "and re-lock every input" because that is the file that
+        // changes, and the one a rebuild afterwards will build from.
+        NixOp::FlakeUpdate { input: None } => Some("update every flake input and re-lock them?".to_string()),
+        NixOp::FlakeUpdate { input: Some(name) } => Some(format!("update the flake input `{name}` and re-lock it?")),
+        NixOp::ChannelUpdate => Some("update every channel?".to_string()),
+        NixOp::ChannelRollback => Some("roll every channel back to its previous state?".to_string()),
+        // The three that only read reach `run` without passing here.
+        NixOp::Diff { .. } | NixOp::FlakeCheck | NixOp::OptionValue { .. } | NixOp::SearchPackages { .. } => None,
+    }
 }
 
 pub struct App {
     system: Box<dyn SystemService>,
     platform: Box<dyn PlatformService>,
+    /// The declarative port, on the hosts that have one. `None` is the
+    /// ordinary case, and the reason the Nix view is absent rather than
+    /// empty everywhere else - see `crate::buffer::Registry`, which holds
+    /// the other half of that fact and is owned by the keymap.
+    declarative: Option<Box<dyn DeclarativeService>>,
     /// Summing a directory tree, behind a thread. The one source too slow
     /// for the tick's duty cycle - see `masys-scan`.
     scanner: Box<dyn DirScanner>,
@@ -188,6 +472,24 @@ pub struct App {
     /// modal stack: there is exactly one popup today, and a stack with
     /// one slot is structure without a second case to justify it.
     help_open: bool,
+    /// The open transient, if one is. Held rather than rebuilt each draw
+    /// because a switch toggled in it has to survive to the next frame,
+    /// and because the rows it was built from can move under it - see
+    /// `TransientDef`.
+    ///
+    /// Never `Some` at the same time as `pending`: dispatching a row
+    /// closes the transient before the action runs, so the confirmation
+    /// a row raises is answered against the buffer, not through a popup
+    /// that is still covering it.
+    transient: Option<TransientDef>,
+    /// The open input sub-step, if one is.
+    ///
+    /// Its own field rather than a variant inside `transient`, because
+    /// the two are independent: a transient closes when it dispatches the
+    /// row that asked, and the input outlives it. Sharing one field would
+    /// mean the popup that opened the prompt had to stay open behind it
+    /// to hold the prompt's own state.
+    input: Option<InputState>,
     /// Why each failed unit failed, keyed by unit and roughly when.
     failure_reasons: HashMap<(String, u64), Option<String>>,
     /// Whose log the log view is currently showing.
@@ -196,10 +498,10 @@ pub struct App {
     /// pressed because something just happened, and the answer should not
     /// be two thousand lines down.
     log_newest_first: bool,
-    /// The unit an approved `edit` is waiting to run against, held from
-    /// the moment the confirmation is answered until the caller has given
-    /// the terminal up. `None` at every other moment.
-    suspended: Option<String>,
+    /// What an approved action is waiting to run, held from the moment it
+    /// was approved until the caller has given the terminal up. `None` at
+    /// every other moment.
+    suspended: Option<Suspended>,
     /// Where `l` was pressed, so `esc` can go back to it.
     ///
     /// The view *and* the unit, not just the view: the systemd view
@@ -256,6 +558,7 @@ impl App {
         App {
             system,
             platform,
+            declarative: None,
             scanner,
             scan_root: None,
             scan: ScanProgress::default(),
@@ -281,6 +584,8 @@ impl App {
             confirm_prompt: String::new(),
             error: None,
             help_open: false,
+            transient: None,
+            input: None,
             failure_reasons: HashMap::new(),
             unit_log: None,
             log_newest_first: true,
@@ -295,6 +600,41 @@ impl App {
             facts: Facts::default(),
             previous: None,
         }
+    }
+
+    /// The composition root's entry point once a declarative adapter may
+    /// exist. `App::new` keeps its signature and passes `None`, so every
+    /// existing call site is unaffected.
+    ///
+    /// The caller pairs the service with a keymap built against a matching
+    /// registry - `Keymap::for_registry(Registry::new(true))` where a
+    /// service exists - and this is the only moment both are in one hand,
+    /// so it is the only place the pairing can be checked. A mismatch is
+    /// silent otherwise, and silent in both directions: a service with a
+    /// default keymap builds a view no key reaches, and a Nix-bearing
+    /// keymap with no service gives `5` a screen with nothing on it, which
+    /// is the exact failure `Registry` was added to prevent.
+    ///
+    /// `debug_assert` rather than `assert`: the suite and every debug
+    /// build catch it, while a release binary degrades to one wrong view
+    /// rather than refusing to start. A tool for looking at a sick machine
+    /// that will not launch is worse than one missing a screen.
+    pub fn with_declarative(
+        system: Box<dyn SystemService>,
+        platform: Box<dyn PlatformService>,
+        scanner: Box<dyn DirScanner>,
+        hostname: String,
+        keymap: Keymap,
+        declarative: Option<Box<dyn DeclarativeService>>,
+    ) -> Self {
+        let mut app = Self::with_keymap(system, platform, scanner, hostname, keymap);
+        debug_assert_eq!(
+            app.keymap.registry().contains(Buffer::Nix),
+            declarative.is_some(),
+            "the keymap's registry and the declarative service disagree about whether this host has a Nix view"
+        );
+        app.declarative = declarative;
+        app
     }
 
     pub fn buffer(&self) -> Buffer {
@@ -384,13 +724,61 @@ impl App {
             utc_offset_secs: snapshot.utc_offset_secs,
             interfaces: snapshot.interfaces.clone(),
             net_rates,
+            // Carried across, like `journal` above and for a related
+            // reason: these are keep-last-good readings, and the sample
+            // below replaces only the ones that came back. Rebuilding them
+            // from `Default` here would erase the previous tick's answers
+            // before the port had a chance to fail.
+            profiles: self.facts.profiles.take(),
+            reboot: self.facts.reboot.take(),
+            nix_inputs: self.facts.nix_inputs.take(),
+            home_mode: self.facts.home_mode,
+            nixpkgs_rev: self.facts.nixpkgs_rev.take(),
+            gc_retention: self.facts.gc_retention.take(),
+            gc_roots: self.facts.gc_roots,
+            flake_ref: self.facts.flake_ref.take(),
+            nixos_config: self.facts.nixos_config.take(),
         };
+        // Sampled on the ordinary tick, at whatever cadence the caller
+        // runs one - two seconds in the binary.
+        //
+        // The design's table puts a platform read on 60s, and an earlier
+        // draft of this block carried a comment saying so while reading
+        // every tick. Only one of the two could be true, and it is this
+        // one, because the alternative costs more than it saves: `g`,
+        // "refresh now", reaches the session through this same `tick`, so
+        // a 60-second gate here would quietly make the one key that
+        // promises a fresh sample not deliver one. Telling a timed call
+        // from a keyed one means a `tick` signature the composition root
+        // has to thread a flag through, for a read this cheap.
+        // `masys::TICK` records the same decision for the same reason:
+        // one interval for everything until a buffer needs otherwise.
+        //
+        // What it costs, per tick: `canonicalize` on a handful of links, a
+        // `read_dir` of two profile directories and the unit directory, a
+        // `flake.lock` parse, and two small file reads. Closure sizes -
+        // the one genuinely expensive read - are deferred to `enter` on a
+        // row, not read on every tick.
+        if let Some(declarative) = self.declarative.as_ref() {
+            keep_last_good(&mut self.facts.profiles, declarative.profiles().map(Some));
+            keep_last_good(&mut self.facts.reboot, declarative.reboot());
+            keep_last_good(&mut self.facts.nix_inputs, declarative.inputs());
+            keep_last_good(&mut self.facts.home_mode, declarative.home_mode().map(Some));
+            keep_last_good(&mut self.facts.nixpkgs_rev, declarative.running_nixpkgs_rev());
+            keep_last_good(&mut self.facts.gc_retention, declarative.gc_retention().map(Some));
+            keep_last_good(&mut self.facts.gc_roots, declarative.gc_roots().map(Some));
+            keep_last_good(&mut self.facts.flake_ref, declarative.flake_ref().map(Some));
+            keep_last_good(&mut self.facts.nixos_config, declarative.nixos_config().map(Some));
+        }
         // Drained, never waited on: the walk is on its own threads and
         // this is the seam where what it has found so far crosses back.
         if self.scan_root.is_some() {
             self.scan = self.scanner.poll();
         }
-        if self.buffer == Buffer::Systemd {
+        // The Nix view too, now that it has units of its own: an open
+        // detail block that stopped being re-read would sit there showing
+        // the memory figure it had when it was opened.
+        if matches!(self.buffer, Buffer::Systemd | Buffer::Nix) {
             self.refresh_expansions();
         }
         if self.buffer == Buffer::Log
@@ -450,6 +838,39 @@ impl App {
             Buffer::Log => {
                 build_log_rows(&self.facts.journal, self.unit_log.as_deref(), self.facts.utc_offset_secs, self.log_newest_first, collapsed)
             }
+            Buffer::Nix => {
+                // `/nix` where the store has a filesystem of its own,
+                // falling back to `/` where it is a directory on the root
+                // one. `None` where neither could be measured:
+                // `unwrap_or(0.0)` here would draw "0% used, 0 bytes free"
+                // for a store nothing is known about, which is a
+                // fabricated reading in the shape of a real one and the
+                // failure this whole change keeps having to design
+                // against.
+                let mount = |wanted: &str| self.facts.filesystems.iter().find(move |fs| fs.mount_point == wanted);
+                let nix_fs = mount("/nix").or_else(|| mount("/"));
+                build_nix_rows(
+                    self.facts.profiles.as_deref(),
+                    self.facts.reboot.as_ref(),
+                    self.facts.nix_inputs.as_ref(),
+                    // `Absent` for a reading that has not come back, which
+                    // is not the fabrication it looks like. The builder
+                    // uses this for exactly one thing - whether the
+                    // home-manager heading says it is activated by
+                    // `nixos-rebuild` - and `Absent` is its neutral case,
+                    // identical to `Standalone`. The claim, `Module`, is
+                    // only ever made from a read that succeeded.
+                    self.facts.home_mode.unwrap_or(HomeMode::Absent),
+                    self.facts.nixpkgs_rev.as_deref(),
+                    self.facts.gc_roots,
+                    self.last_now_ms,
+                    nix_fs.map(|fs| fs.used_percent),
+                    nix_fs.map(|fs| fs.free_bytes),
+                    self.nix_policy_rows(),
+                    self.nix_unit_rows(),
+                    collapsed,
+                )
+            }
         };
         self.filter_matches = if self.filter().is_empty() {
             // No query, no count. A blank filter line that reported the
@@ -467,6 +888,69 @@ impl App {
         // After the clamp, because what is dimmed depends on the row the
         // cursor ends up on rather than the one it started from.
         self.refresh_actions();
+    }
+
+    /// The declared maintenance policy, as rows.
+    ///
+    /// The schedule comes from the timer units masys already polls; only
+    /// the retention comes from the declarative port. Asking that port for
+    /// a schedule would be it reimplementing systemd, and the two would
+    /// then disagree about a timer the operator had overridden.
+    ///
+    /// A job whose timer unit is not on this host contributes no row.
+    /// Absent is not empty: "nix-optimise is not scheduled" and
+    /// "nix-optimise is scheduled and has never run" send an operator
+    /// looking in two different places.
+    fn nix_policy_rows(&self) -> Vec<Node> {
+        [("gc", "nix-gc.timer"), ("optimise", "nix-optimise.timer")]
+            .into_iter()
+            .filter_map(|(job, unit_name)| {
+                let unit = self.facts.units.iter().find(|unit| unit.name == unit_name)?;
+                let timer = unit.timer.as_ref();
+                Some(Node::NixPolicy {
+                    job: job.to_string(),
+                    unit: unit_name.to_string(),
+                    // Only the gc job has one. Nothing is retained by
+                    // optimising, so a retention on that row would be a
+                    // column borrowed from its neighbour.
+                    // `Some(None)` for optimise, not `None`: optimising
+                    // retains nothing at all, which is a fact about the
+                    // job rather than a reading that failed. `-` would
+                    // say masys could not find out.
+                    retention: if job == "gc" { self.facts.gc_retention.clone() } else { Some(None) },
+                    next_in_ms: timer.and_then(|timer| timer.next_ms).map(|next| next.saturating_sub(self.last_now_ms)),
+                    last_ago_ms: timer.and_then(|timer| timer.last_ms).map(|last| self.last_now_ms.saturating_sub(last)),
+                    enabled: unit.enabled,
+                })
+            })
+            .collect()
+    }
+
+    /// Nix's own units, as rows.
+    ///
+    /// The cheapest section in the view: a filter over the units masys
+    /// already polls every tick, so it costs one predicate and no read.
+    /// It answers what nothing else in this view does - whether the daemon
+    /// is up, whether this boot's home-manager activation actually
+    /// succeeded - which is the running end of declared, realised,
+    /// running.
+    ///
+    /// Built here rather than in `build_nix_rows` for the reason
+    /// `nix_policy_rows` is: this is the layer that holds the poll and the
+    /// map of which units are open.
+    ///
+    /// Worst first, by `systemd_buffer::severity`, so a failed
+    /// `nix-gc.service` is the first row under the heading rather than
+    /// somewhere in an alphabetical six.
+    fn nix_unit_rows(&self) -> Vec<Node> {
+        let mut units: Vec<&masys_domain::unit::Unit> =
+            self.facts.units.iter().filter(|unit| crate::nix_buffer::is_nix_unit(&unit.name)).collect();
+        units.sort_by(|a, b| severity(a.active_state).cmp(&severity(b.active_state)).then_with(|| a.name.cmp(&b.name)));
+        // Flat, at depth 0 and with no `children` marker: the causal tree
+        // the systemd view draws under a socket or a timer would list
+        // `nix-daemon.service` twice in a section of six, once on its own
+        // and once under its socket.
+        units.into_iter().flat_map(|unit| unit_rows(unit, &self.expanded_units, self.last_now_ms, 0, false)).collect()
     }
 
     fn filter(&self) -> &str {
@@ -563,6 +1047,19 @@ impl App {
         if self.typing_filter {
             return self.type_filter(key);
         }
+        // The input sub-step is innermost: it is open only while a
+        // transient row is waiting on a value, and every printable key
+        // belongs to it.
+        if self.input.is_some() {
+            return self.answer_input(key);
+        }
+        // A transient answers its own keys, ahead of the keymap and ahead
+        // of the escape ladder below - the same precedence
+        // `answer_confirm` has, and for the same reason: a popup taking
+        // keystrokes must not let one through to the buffer underneath.
+        if self.transient.is_some() {
+            return self.answer_transient(key);
+        }
         // Escape peels one layer at a time, outermost first: the filter
         // being typed (handled above), then a filter in effect, then a
         // drill-down. Committing a filter with Enter used to leave no way
@@ -580,7 +1077,21 @@ impl App {
             return self.answer_confirm(key);
         }
 
-        match self.keymap.resolve(self.buffer, key) {
+        self.dispatch(self.keymap.resolve(self.buffer, key))
+    }
+
+    /// Performs one resolved action.
+    ///
+    /// Split out of [`App::handle_key`] because a transient row dispatches
+    /// the same `Action` a keypress does - that is what the definition
+    /// carrying its own `Action` buys - and two copies of this match would
+    /// be two answers to "what does this verb do".
+    ///
+    /// Takes an `Option` because `Keymap::resolve` returns one and an
+    /// unbound key is not an error: it does nothing, and doing nothing
+    /// still refreshes the footer.
+    fn dispatch(&mut self, action: Option<Action>) -> Flow {
+        match action {
             Some(Action::MoveDown) => self.step(1),
             Some(Action::MoveUp) => self.step(-1),
             // A page is a fixed jump rather than the rendered height: the
@@ -613,6 +1124,18 @@ impl App {
             Some(Action::Kill(signal)) => self.ask_kill(signal),
             Some(Action::Nice(delta)) => self.nudge_nice(delta),
             Some(Action::Unit(verb)) => self.ask_unit(verb),
+            // Returns rather than falling through to the footer refresh,
+            // for the reason `Action::Quit` does: this is the only
+            // view-local action that can ask for the terminal, and a
+            // `Flow` the match swallowed would leave the caller holding
+            // it. Nothing is lost - `run_suspended` rebuilds once the
+            // command is done, and the next keypress refreshes the offer.
+            Some(Action::Nix(verb)) => {
+                if self.nix(verb) == Flow::Suspend {
+                    return Flow::Suspend;
+                }
+            }
+            Some(Action::Transient) => self.open_row_transient(),
             Some(Action::Logs) => self.show_logs(),
             Some(Action::ToggleOrder) => self.toggle_log_order(),
             Some(Action::GoToUnit) => self.go_to_unit(),
@@ -661,9 +1184,13 @@ impl App {
         }
         let name = match self.rows.get(self.cursor()) {
             Some(Node::ProcGroup { name, .. }) => name.clone(),
-            // Units in the systemd view, days in the log: both are
-            // sections whose rows fold away under their heading.
-            Some(Node::SectionHeader { title, kind: SectionKind::Units | SectionKind::Journal, .. }) => title.clone(),
+            // Units in the systemd view, days in the log, generations and
+            // inputs in the Nix view: all are sections whose rows fold
+            // away under their heading. Which kinds those are, and what
+            // each folds under, both live on `SectionKind` - the two used
+            // to be spelled out here and again in `group_names`, kept in
+            // step by a comment.
+            Some(Node::SectionHeader { title, kind, .. }) if kind.folds() => kind.fold_key(title),
             _ => return self.toggle_detail(),
         };
         // Shutting a section shuts what was open inside it: those rows are
@@ -1023,6 +1550,209 @@ impl App {
     /// Answers a pending confirmation. `y` confirms; anything else does
     /// not - a destructive action should need the one key that means yes,
     /// not merely a key that is not `n`.
+    /// Opens the transient for the row the cursor is on.
+    ///
+    /// Only a unit row has one today. A row that has none opens nothing
+    /// rather than opening an empty popup, which is the same choice
+    /// `crate::buffer` makes about a digit with no buffer behind it: a
+    /// screen that explains why it is empty is worse than a key that does
+    /// nothing.
+    ///
+    /// A failed ownership read is passed on as `None` rather than being
+    /// flattened into `Imperative`. The two are different answers, and
+    /// only one of them was measured.
+    fn open_row_transient(&mut self) {
+        if let Some(unit) = self.selected_unit() {
+            let ownership = self.platform.unit_ownership(&unit).ok();
+            self.transient = Some(unit_transient(&unit, ownership.as_ref()));
+            return;
+        }
+        // The Nix buffer's own popup, on any row of it that is not a
+        // unit. Unlike the unit popup it is not about the row: only its
+        // Generation group is, and that group is simply absent elsewhere.
+        if self.buffer == Buffer::Nix {
+            let generation = self.selected_generation().map(|(generation, _)| generation.id);
+            let retention = self.facts.gc_retention.clone().flatten();
+            self.transient = Some(self.mark_nix(nix_transient(generation, retention.as_deref())));
+        }
+    }
+
+    /// Marks the rows of a Nix transient that cannot act here, and says
+    /// why.
+    ///
+    /// Asked of `nix_offer`, which is also what the footer asks, so a
+    /// marked row and a dim key cannot disagree about the same verb.
+    /// `NixOffer::Asks` is *not* marked: the row is live, and pressing it
+    /// opens the prompt.
+    fn mark_nix(&self, def: TransientDef) -> TransientDef {
+        TransientDef {
+            groups: def
+                .groups
+                .into_iter()
+                .map(|group| DefGroup {
+                    rows: group
+                        .rows
+                        .into_iter()
+                        .map(|row| match row.action {
+                            Action::Nix(verb) => DefRow { dimmed: self.nix_offer(verb) == NixOffer::No, note: self.nix_note(verb), ..row },
+                            _ => row,
+                        })
+                        .collect(),
+                    ..group
+                })
+                .collect(),
+            ..def
+        }
+    }
+
+    /// What to say beside a Nix row - why it will not act, or what it
+    /// will act with.
+    ///
+    /// A note is not the same question as a mark. `clean` is live and
+    /// still worth annotating with the period it will use, because
+    /// "delete old generations" without a number is the row an operator
+    /// should not press.
+    fn nix_note(&self, verb: NixVerb) -> Option<String> {
+        let flake = self.facts.flake_ref.as_ref().and_then(|read| read.as_ref()).is_some();
+        let channels = matches!(self.facts.nix_inputs.as_ref().map(|inputs| &inputs.source), Some(InputSource::Channels));
+        match verb {
+            NixVerb::FlakeUpdate | NixVerb::FlakeCheck if !flake => Some("no flake configured".to_string()),
+            NixVerb::ChannelUpdate | NixVerb::ChannelRollback if !channels => Some("no channels on this host".to_string()),
+            // Names what is missing rather than the paradigm, because a
+            // flake host *can* have one: `nix.nixPath` puts it there, and
+            // then the row is live.
+            NixVerb::OptionValue if self.facts.nixos_config.as_ref().and_then(|read| read.as_ref()).is_none() => {
+                Some("no nixos-config on the search path".to_string())
+            }
+            // The design's own wording. In `Module` there is no
+            // `home-manager` binary at all, so the row is not merely
+            // ineffective - the command does not exist.
+            NixVerb::HomeSwitch => match self.facts.home_mode {
+                Some(HomeMode::Module) => Some("activated by nixos-rebuild switch".to_string()),
+                Some(HomeMode::Absent) => Some("home-manager not installed".to_string()),
+                Some(HomeMode::Standalone) => None,
+                None => Some("home-manager mode unread".to_string()),
+            },
+            // The host's declared retention, on the row that will use it.
+            // Where none is declared the row is marked, and this says
+            // which of the two absences it is - masys refusing to pick a
+            // period is not the same as masys failing to read one.
+            // The privilege reason comes first where it applies. A row
+            // marked `--delete-older-than 14d` reads as one that will do
+            // that, and on an unprivileged masys it will not - the
+            // retention is not why it is marked.
+            NixVerb::Clean => self.unwritable_note().or_else(|| match self.facts.gc_retention.clone() {
+                Some(Some(period)) => Some(format!("--delete-older-than {period}")),
+                Some(None) => Some("no retention declared".to_string()),
+                None => Some("retention unread".to_string()),
+            }),
+            // The three that write a profile. `nix-env` has no elevation
+            // flag - no polkit action to be granted, no `--elevate` to
+            // pass - so the only lever masys has is to say so before the
+            // key is pressed. A marked row with no reason beside it is
+            // the one thing the design's marking rule exists to prevent.
+            NixVerb::Activate => match self.selected_generation() {
+                Some((_, ProfileKind::System)) => self.profile_note(ProfileKind::System),
+                // The second command is the profile's own
+                // `bin/switch-to-configuration`, and only a system
+                // generation has one.
+                Some(_) => Some("only a system generation activates".to_string()),
+                None => None,
+            },
+            NixVerb::DeleteHere => self.selected_generation().and_then(|(_, kind)| self.profile_note(kind)),
+            NixVerb::DeleteGenerations => self.profile_note(ProfileKind::System),
+            // The five rebuild verbs differ only in what they do, and
+            // their names do not say it - `boot` and `test` are nearly
+            // opposites and both are one word. The confirmation's own
+            // sentence is the row's note, so there is one description of
+            // each verb rather than two that can drift apart.
+            NixVerb::Rebuild(_) | NixVerb::Rollback => Some(verb.label().to_string()),
+            _ => None,
+        }
+    }
+
+    /// One keypress against the open transient.
+    ///
+    /// Four things can happen, and the order is the point. An action row
+    /// wins over a switch, so a transient that gives a switch a letter
+    /// its actions already use loses the switch rather than the action.
+    /// Dispatching *closes* the transient first, the way magit's does:
+    /// the action may raise a confirmation, and answering one through a
+    /// popup that is still covering the rows it names is worse than
+    /// having to press the key again.
+    fn answer_transient(&mut self, key: Key) -> Flow {
+        // Escape leaves. Checked before the chords so no transient can
+        // bind its way out of being closeable - the same rule the buffer
+        // escape ladder follows.
+        if key.code == KeyCode::Esc {
+            self.transient = None;
+            self.refresh_actions();
+            return Flow::Continue;
+        }
+        let KeyCode::Char(chord) = key.code else {
+            return Flow::Continue;
+        };
+        let Some(def) = self.transient.as_mut() else {
+            return Flow::Continue;
+        };
+
+        match def.action(chord) {
+            Some(action) => {
+                self.transient = None;
+                self.dispatch(Some(action))
+            }
+            // A switch toggles in place: the popup stays open, because
+            // the point of a switch is to set several before running
+            // anything.
+            None => {
+                def.toggle(chord);
+                Flow::Continue
+            }
+        }
+    }
+
+    /// One keypress against the open input sub-step.
+    ///
+    /// Escape backs out, enter commits, backspace deletes, and every
+    /// other printable character is typed. Nothing else is bound: this is
+    /// a prompt, and a prompt that swallowed a movement key would leave
+    /// the operator unable to tell it from the buffer.
+    ///
+    /// An empty value does not commit. `nix search nixpkgs ""` matches
+    /// every package in nixpkgs, and `nix-env --delete-generations ""`
+    /// is an argument error - neither is what pressing enter on an empty
+    /// prompt meant.
+    fn answer_input(&mut self, key: Key) -> Flow {
+        let Some(state) = self.input.as_mut() else { return Flow::Continue };
+        match key.code {
+            KeyCode::Esc => {
+                self.input = None;
+                self.refresh_actions();
+                Flow::Continue
+            }
+            KeyCode::Backspace => {
+                state.typed.pop();
+                Flow::Continue
+            }
+            KeyCode::Enter => {
+                if state.typed.is_empty() {
+                    return Flow::Continue;
+                }
+                let (verb, typed) = (state.verb, state.typed.clone());
+                self.input = None;
+                match self.nix_op_typed(verb, &typed) {
+                    Some(op) => self.run_nix(op),
+                    None => Flow::Continue,
+                }
+            }
+            KeyCode::Char(typed) => {
+                state.typed.push(typed);
+                Flow::Continue
+            }
+            _ => Flow::Continue,
+        }
+    }
+
     fn answer_confirm(&mut self, key: Key) -> Flow {
         let pending = self.pending.take();
         if key.code == KeyCode::Char('y') {
@@ -1035,7 +1765,15 @@ impl App {
                 // terminal, which the session does not own. It is recorded
                 // and the caller is asked for it.
                 Some(Pending::Unit { unit, verb: UnitVerb::Edit }) => {
-                    self.suspended = Some(unit);
+                    self.suspended = Some(Suspended::EditUnit(unit));
+                    self.rebuild();
+                    return Flow::Suspend;
+                }
+                // Like edit, and for the same reason: every one of these
+                // owns the screen while it runs, so the session records
+                // it and asks the caller for the terminal.
+                Some(Pending::Nix { op }) => {
+                    self.suspended = Some(Suspended::Nix(op));
                     self.rebuild();
                     return Flow::Suspend;
                 }
@@ -1063,7 +1801,7 @@ impl App {
     }
 
     /// Runs whatever `Flow::Suspend` was asked for, with the terminal in
-    /// the caller's hands.
+    /// the caller's hands, and says what it left on the screen.
     ///
     /// Called by the composition root between releasing the terminal and
     /// restoring it. Does nothing if nothing is waiting, so a caller that
@@ -1072,12 +1810,50 @@ impl App {
     ///
     /// A failure is held on the status line like any other action's, and
     /// is worth holding: `systemctl edit` refuses outright where the unit
-    /// directory is read-only, and that refusal is the answer.
-    pub fn run_suspended(&mut self) {
-        let Some(unit) = self.suspended.take() else { return };
-        let result = self.system.edit(&unit);
+    /// directory is read-only, and `nixos-rebuild` exits non-zero on an
+    /// evaluation error. In both cases the command's own message has
+    /// already reached the terminal the caller handed over; what the
+    /// status line adds is that it failed at all, which the operator
+    /// would otherwise lose the moment the screen was redrawn.
+    ///
+    /// The same failure is also why an `Err` is always [`Aftermath::Unseen`],
+    /// including the editor's. `Seen` rests entirely on the editor having
+    /// held the terminal until the operator quit it - and a `systemctl
+    /// edit` that was *refused* never opened one. What is on the screen
+    /// then is a single line of systemctl's own text, in exactly the
+    /// position the diff was in: printed and then swallowed. The two
+    /// mistakes are not the same size either. Pausing where it was not
+    /// needed costs one keypress; not pausing costs the only full account
+    /// of why an operation failed, so this leans toward pausing.
+    pub fn run_suspended(&mut self) -> Aftermath {
+        let Some(suspended) = self.suspended.take() else { return Aftermath::Seen };
+        // Whether the program holds the terminal until the operator leaves
+        // it, or prints and exits. Answered beside the call rather than by
+        // matching on the variant again further down: a third variant
+        // added to `Suspended` cannot then compile without an answer.
+        let (result, interactive) = match suspended {
+            Suspended::EditUnit(unit) => (self.system.edit(&unit), true),
+            Suspended::Nix(op) => {
+                let result = match &self.declarative {
+                    Some(port) => port.run(&op),
+                    // Unreachable as things stand: `with_declarative` asserts
+                    // that the registry and the port agree, so a host without
+                    // one has no Nix view and no key that could queue this.
+                    // An `Err` rather than a panic anyway, on the reasoning
+                    // `ops::spawn` gives for its own unreachable guard - the
+                    // cost of being wrong is masys aborting with the terminal
+                    // already handed away, and a future caller that queues an
+                    // operation from somewhere else should surface as a
+                    // refusal on the status line.
+                    None => Err(MasysError::Platform("this host has no declarative service".to_string())),
+                };
+                (result, false)
+            }
+        };
+        let aftermath = if interactive && result.is_ok() { Aftermath::Seen } else { Aftermath::Unseen };
         self.report(result);
         self.rebuild();
+        aftermath
     }
 
     /// The process under the cursor, if the cursor is on one.
@@ -1096,6 +1872,331 @@ impl App {
         let verb = if signal == Signal::Kill { "SIGKILL" } else { "SIGTERM" };
         self.confirm_prompt = format!("{verb} {name} (pid {pid})?  y / n");
         self.pending = Some(Pending::Kill { pid, signal });
+    }
+
+    /// The generation under the cursor, and which profile it came from.
+    ///
+    /// The profile as well as the generation, because an id alone does not
+    /// identify one: this host's system profile is at generation 438 and
+    /// its home profile at 47, and both numbering schemes start at 1. Every
+    /// operation on a generation needs to know whose it is.
+    fn selected_generation(&self) -> Option<(&Generation, ProfileKind)> {
+        match self.rows.get(self.cursor()) {
+            Some(Node::Generation { generation, kind, .. }) => Some((generation, *kind)),
+            _ => None,
+        }
+    }
+
+    /// The store path a profile is pointing at now.
+    ///
+    /// Read from the facts rather than from the rows: the current
+    /// generation's row can be folded away or filtered out while the
+    /// cursor sits on an old one, and "against current" must not change
+    /// meaning because a section was collapsed.
+    ///
+    /// `None` where no generation is marked current, and - separately -
+    /// where the current one's link could not be resolved. Both are
+    /// unknowns rather than answers, and an operation built on one would
+    /// name a store path masys never read.
+    fn current_store_path(&self, kind: ProfileKind) -> Option<String> {
+        let profiles = self.facts.profiles.as_ref()?;
+        let profile = profiles.iter().find(|profile| profile.kind == kind)?;
+        profile.generations.iter().find(|generation| generation.current)?.store_path.clone()
+    }
+
+    /// One profile, from the last good read.
+    ///
+    /// The whole record rather than just its path, because an operation
+    /// needs two things off it: where the profile lives, and whether this
+    /// process can write it. Both are the adapter's to report rather than
+    /// this crate's to work out - the home profile moved from
+    /// `~/.nix-profile` to `~/.local/state/nix/profiles/profile`, and
+    /// masys-app performs no I/O at all.
+    fn profile(&self, kind: ProfileKind) -> Option<&Profile> {
+        self.facts.profiles.as_ref()?.iter().find(|profile| profile.kind == kind)
+    }
+
+    /// The operation a key means here, or `None` where the key will not
+    /// act - because the row cannot supply the arguments, or because
+    /// masys cannot write what the operation writes.
+    ///
+    /// The one place that turns an intent into arguments, and the same
+    /// one the footer asks whether to dim a key - so a key that is offered
+    /// is a key that will act, and a key that will not act is marked. Two
+    /// answers derived from one function cannot disagree; the version
+    /// where the footer had a rule of its own is exactly how a footer
+    /// comes to advertise a key that does nothing.
+    fn nix_offer(&self, verb: NixVerb) -> NixOffer {
+        match verb {
+            // A bare `nixos-rebuild switch` is the correct command on a
+            // channels host, not a broken one, so the rebuild verbs are
+            // live whether or not a flake reference resolves. The adapter
+            // appends `--flake <ref>` where one does.
+            NixVerb::Rebuild(verb) => NixOffer::Ready(NixOp::Rebuild(verb)),
+            NixVerb::Rollback => NixOffer::Ready(NixOp::Rollback),
+            // Standalone only. In `Module` home-manager is activated by
+            // `nixos-rebuild switch` and there is no `home-manager`
+            // binary to run; `Absent` has no home-manager at all, and an
+            // unread `home_mode` has not said either - none of the three
+            // is a host this can run on.
+            NixVerb::HomeSwitch => match self.facts.home_mode {
+                Some(HomeMode::Standalone) => NixOffer::Ready(NixOp::HomeSwitch),
+                _ => NixOffer::No,
+            },
+            // The flake-only pair. Asked of the *reference*, not of the
+            // paradigm `Inputs::source` reports, because the adapter
+            // builds its argv from the reference: marking a row from one
+            // fact and running it from another is how a popup comes to
+            // mark a row that would have worked.
+            NixVerb::FlakeUpdate => self.with_flake(NixOp::FlakeUpdate { input: None }),
+            NixVerb::FlakeCheck => self.with_flake(NixOp::FlakeCheck),
+            // And its mirror. `nix-channel --update` on a flake host
+            // updates channels the configuration does not read.
+            NixVerb::ChannelUpdate => self.with_channels(NixOp::ChannelUpdate),
+            NixVerb::ChannelRollback => self.with_channels(NixOp::ChannelRollback),
+            // Neither has a source but the operator. A query is not a row
+            // and an option name is not a reading, so these are the two
+            // that would be unreachable without the input sub-step.
+            NixVerb::SearchPackages => NixOffer::Asks { prompt: "search nixpkgs" },
+            // `nixos-option` reads `<nixos-config>` and there is no flag
+            // to hand it one. On a flake host that sets no `nix.nixPath`
+            // it fails with *file 'nixos-config' was not found in the Nix
+            // search path* before it evaluates anything - measured on the
+            // development host, which is exactly that shape.
+            NixVerb::OptionValue => match self.facts.nixos_config.as_ref().and_then(|read| read.as_ref()) {
+                Some(_) => NixOffer::Asks { prompt: "option" },
+                None => NixOffer::No,
+            },
+            // The generation under the cursor supplies the spec, so this
+            // one asks for nothing. The profile still has to be writable
+            // - `nix-env` has no elevation flag, the same reason
+            // `Activate` checks.
+            NixVerb::DeleteHere => {
+                let Some((generation, kind)) = self.selected_generation() else { return NixOffer::No };
+                let Some(profile) = self.profile(kind) else { return NixOffer::No };
+                if profile.writable != Some(true) {
+                    return NixOffer::No;
+                }
+                NixOffer::Ready(NixOp::DeleteGenerations { profile: profile.path.clone(), spec: generation.id.to_string() })
+            }
+            // The escape hatch: `+5`, `30d` and a list of numbers are all
+            // specs and none of them is a row. Offered against the system
+            // profile, which is the one a generation row is about.
+            NixVerb::DeleteGenerations => match self.profile(ProfileKind::System) {
+                Some(profile) if profile.writable == Some(true) => NixOffer::Asks { prompt: "delete generations" },
+                _ => NixOffer::No,
+            },
+            NixVerb::Activate => {
+                let Some((generation, kind)) = self.selected_generation() else { return NixOffer::No };
+                // System generations only, and not out of caution.
+                // `NixOp::Activate`'s second command is the profile's own
+                // `bin/switch-to-configuration switch`, and that script
+                // exists in a system generation and nowhere else -
+                // measured here: `/nix/var/nix/profiles/system/bin` holds
+                // exactly that one file, while
+                // `~/.local/state/nix/profiles/profile/bin` holds no
+                // activation script at all. Offering the key on a home or
+                // channels row would switch the profile and then fail on
+                // a missing file, leaving it moved with nothing
+                // activated. Widening this means teaching
+                // `ops::activation_argv` the other profiles' scripts
+                // first.
+                if kind != ProfileKind::System {
+                    return NixOffer::No;
+                }
+                let Some(profile) = self.profile(kind) else { return NixOffer::No };
+                // The profile directory has to be writable, and this is
+                // the one place in masys where a privilege is checked
+                // ahead of an operation rather than left to the command.
+                // Every other privileged path has a mechanism of its own:
+                // a unit verb shells out to `systemctl`, which triggers
+                // polkit, so an unprivileged masys can be granted the
+                // action; `nixos-rebuild` has `--elevate {none,sudo,run0}`
+                // and can deploy as a non-root user. `nix-env` has
+                // neither - its synopsis carries no such flag - so there
+                // is nothing to grant and nothing to ask.
+                //
+                // Refused rather than attempted, even though this half is
+                // safe on its own: an unprivileged `a` fails at
+                // `nix-env`, changes nothing, and would cost only a
+                // confirmation and an error. It is marked anyway so that
+                // `a` and `c` answer the same question the same way, and
+                // because a key that has never once worked for the
+                // ordinary invocation should say so before it is pressed
+                // and not after. Run masys as root and the directory is
+                // writable and the key is live.
+                if profile.writable != Some(true) {
+                    return NixOffer::No;
+                }
+                NixOffer::Ready(NixOp::Activate { profile: profile.path.clone(), generation: generation.id })
+            }
+            NixVerb::Diff => {
+                let Some((generation, kind)) = self.selected_generation() else { return NixOffer::No };
+                // Both paths must be *known*. A dangling generation link
+                // carries `None`, and `nix store diff-closures` given one
+                // path would either fail or - worse, if the two unknowns
+                // were papered over with a default - diff something
+                // against itself and report no change.
+                let Some(from) = generation.store_path.clone() else { return NixOffer::No };
+                let Some(to) = self.current_store_path(kind) else { return NixOffer::No };
+                // The row under the cursor is the left-hand side and
+                // current is the right, so the output reads forwards:
+                // what changed getting from there to here.
+                NixOffer::Ready(NixOp::Diff { from, to })
+            }
+            // This host's own declared retention, never a number masys
+            // chose. `nix-gc.service` runs `--delete-older-than 14d`
+            // here, and that value is one somebody wrote into their
+            // configuration; a built-in default would be masys deleting
+            // generations on a number nobody chose, which is the
+            // fabrication rule applied to an act instead of to a reading.
+            //
+            // Both `None`s mean the same thing for this purpose and both
+            // dim the key: the outer is "no read has succeeded", the
+            // inner is the port's own answer that the gc job declares no
+            // retention. Neither is a period to delete generations by.
+            NixVerb::Clean => {
+                // Every profile, and this one is not caution - it is the
+                // difference between a refusal and an irreversible half
+                // of an act. nix-collect-garbage(1) for nix 2.34.8 here:
+                // "it looks in a few locations, and acts on all profiles
+                // it finds there", and "Deleting previous configurations
+                // makes rollbacks to them impossible." Run unprivileged
+                // on this host it would delete the operator's own
+                // home-manager generations - `~/.local/state/nix/profiles`
+                // is owned by the operator and world-unwritable - and then
+                // fail on the
+                // root-owned system profile, reporting a non-zero exit
+                // and nothing about what had already gone.
+                //
+                // `nix-collect-garbage`'s synopsis is `[--delete-old]
+                // [-d] [--delete-older-than period] [--max-freed bytes]
+                // [--dry-run]`: no elevation flag, so unlike a unit verb
+                // there is no polkit action to be granted and unlike
+                // `nixos-rebuild` no `--elevate` to pass. Declining to
+                // start it is the only lever masys has.
+                //
+                // `all` over a *non-empty* list. An empty one is
+                // vacuously true, and it means masys found no profile to
+                // check rather than that every profile passed - the same
+                // shape as a fabricated zero, one level up. Nix also
+                // finds profiles masys never reports, per-user ones among
+                // them; this is an approximation, and it is sound in the
+                // direction that matters, because a host where
+                // `/nix/var/nix/profiles` is writable is a host running
+                // as root, where the rest are too.
+                let Some(profiles) = self.facts.profiles.as_ref() else { return NixOffer::No };
+                let all_writable = !profiles.is_empty() && profiles.iter().all(|profile| profile.writable == Some(true));
+                if !all_writable {
+                    return NixOffer::No;
+                }
+                match self.facts.gc_retention.clone().flatten() {
+                    Some(older_than) => NixOffer::Ready(NixOp::Clean { older_than }),
+                    None => NixOffer::No,
+                }
+            }
+        }
+    }
+
+    /// `Ready(op)` where this host has a flake reference, `No` where it
+    /// has none or the read has not come back.
+    fn with_flake(&self, op: NixOp) -> NixOffer {
+        match self.facts.flake_ref.as_ref().and_then(|read| read.as_ref()) {
+            Some(_) => NixOffer::Ready(op),
+            None => NixOffer::No,
+        }
+    }
+
+    /// And its mirror, for the two channel operations.
+    ///
+    /// Asked of `Inputs::source` rather than of "no flake reference",
+    /// because those are not complements: a host can have neither, and
+    /// offering `nix-channel --update` on one that has never had a
+    /// channel would be a row live for want of a flake rather than for
+    /// having channels.
+    fn with_channels(&self, op: NixOp) -> NixOffer {
+        match self.facts.nix_inputs.as_ref().map(|inputs| &inputs.source) {
+            Some(InputSource::Channels) => NixOffer::Ready(op),
+            _ => NixOffer::No,
+        }
+    }
+
+    /// The operation an `Asks` verb means once the operator has typed a
+    /// value. Separate from [`App::nix_offer`] only because the value
+    /// does not exist when the offer is made; every precondition is still
+    /// asked there and nowhere else.
+    fn nix_op_typed(&self, verb: NixVerb, typed: &str) -> Option<NixOp> {
+        match verb {
+            NixVerb::SearchPackages => Some(NixOp::SearchPackages { query: typed.to_string() }),
+            NixVerb::OptionValue => Some(NixOp::OptionValue { name: typed.to_string() }),
+            NixVerb::DeleteGenerations => {
+                let profile = self.profile(ProfileKind::System)?;
+                Some(NixOp::DeleteGenerations { profile: profile.path.clone(), spec: typed.to_string() })
+            }
+            // Every other verb resolved its arguments at offer time.
+            _ => None,
+        }
+    }
+
+    /// Why a profile cannot be written, or `None` where it can.
+    fn profile_note(&self, kind: ProfileKind) -> Option<String> {
+        match self.profile(kind) {
+            Some(profile) if profile.writable == Some(true) => None,
+            Some(_) => Some("profile is read-only - run masys as root".to_string()),
+            None => Some("no profile read".to_string()),
+        }
+    }
+
+    /// The same, for `clean`, which acts on every profile it finds rather
+    /// than the one under the cursor.
+    fn unwritable_note(&self) -> Option<String> {
+        let profiles = self.facts.profiles.as_ref()?;
+        let all_writable = !profiles.is_empty() && profiles.iter().all(|profile| profile.writable == Some(true));
+        (!all_writable).then(|| "every profile must be writable - run masys as root".to_string())
+    }
+
+    /// Runs what the key names, or does nothing where the row under the
+    /// cursor cannot supply the arguments.
+    ///
+    /// Returning early on the wrong row is `ask_kill`'s shape - `k` on a
+    /// group row resolves and then quietly does nothing - and the footer
+    /// dims the key in exactly that case, so quiet is not silent.
+    ///
+    /// What changes the machine asks first, through the same `Pending`
+    /// and `ModalView::Confirm` the ten unit verbs and both signals
+    /// already use. What only reads suspends straight from the keypress:
+    /// a confirmation on an operation that changes nothing teaches the
+    /// operator that confirmations are noise, and the next one they
+    /// dismiss will be a rebuild.
+    fn nix(&mut self, verb: NixVerb) -> Flow {
+        let op = match self.nix_offer(verb) {
+            NixOffer::Ready(op) => op,
+            // The row is live and the value is what is missing, so the
+            // input sub-step opens rather than the operation running.
+            NixOffer::Asks { prompt } => {
+                self.input = Some(InputState { verb, prompt, typed: String::new() });
+                return Flow::Continue;
+            }
+            NixOffer::No => return Flow::Continue,
+        };
+        self.run_nix(op)
+    }
+
+    /// Confirms an operation, or suspends straight into it.
+    fn run_nix(&mut self, op: NixOp) -> Flow {
+        if only_reads(&op) {
+            self.suspended = Some(Suspended::Nix(op));
+            return Flow::Suspend;
+        }
+        // An operation with no sentence is not offered. Unreachable while
+        // `NixVerb` names three - both of the ones that change something
+        // have one below - and the fail-safe direction if a fourth
+        // arrives without one: refusing costs a keypress, while
+        // approving an act nobody could describe costs a machine.
+        let Some(what) = prompt_for(&op) else { return Flow::Continue };
+        self.confirm_prompt = format!("{what}  y / n");
+        self.pending = Some(Pending::Nix { op });
+        Flow::Continue
     }
 
     /// Whether the unit under the cursor has failed.
@@ -1258,11 +2359,15 @@ impl App {
     /// wondering whether they misremembered the binding; a dimmed one in
     /// its usual place answers the question on sight.
     ///
-    /// Today only the persistence guard dims anything: on a host where a
-    /// unit is generated from configuration, enable and disable are
-    /// either refused outright or undone by the next rebuild. The
-    /// judgement is per *unit*, not per host - a hand-placed unit on the
-    /// same machine is genuinely imperative - so it follows the cursor.
+    /// Every guard here asks one question: will this key act on the row
+    /// the cursor is on. A unit verb needs a unit under it, needs the
+    /// manifest not to own that unit where the verb writes to boot - the
+    /// judgement is per *unit*, not per host, because a hand-placed unit
+    /// on a declarative machine is genuinely imperative - and, for reset
+    /// failed, needs a failure. A Nix key needs `nix_op` to be able to
+    /// build its operation - the row supplying the arguments, and the
+    /// profile being writable where the operation writes one - which is
+    /// asked by calling `nix_op` rather than by restating it.
     fn dim_unavailable(&self, actions: Vec<KeyBinding>) -> Vec<KeyBinding> {
         let on_a_unit = self.selected_unit().is_some();
         let declarative = self
@@ -1273,16 +2378,41 @@ impl App {
 
         actions
             .into_iter()
-            .map(|binding| {
-                let Some(Action::Unit(verb)) = self.keymap.action_for(self.buffer, &binding.chord) else {
-                    return binding;
-                };
-                // Two reasons a unit verb will not do what it says: the
-                // manifest owns the unit, or the verb only applies to a
-                // failure that has not happened. Both are marked rather
-                // than removed.
-                let dimmed = (verb.is_persistent() && declarative) || (verb.needs_failure() && on_a_unit && !failed);
-                KeyBinding { dimmed, ..binding }
+            .map(|binding| match self.keymap.action_for(self.buffer, &binding.chord) {
+                // Three reasons a unit verb will not do what it says.
+                // The row under the cursor is not a unit at all, which is
+                // most of the Nix view: these keys resolve there because
+                // that view has a units section, but the cursor spends
+                // its time on generations and inputs, where `ask_unit`
+                // returns without asking anything. Or the manifest owns
+                // the unit. Or the verb applies only to a failure that has
+                // not happened. All three are marked rather than removed.
+                Some(Action::Unit(verb)) => {
+                    let dimmed = !on_a_unit || (verb.is_persistent() && declarative) || (verb.needs_failure() && !failed);
+                    KeyBinding { dimmed, ..binding }
+                }
+                // One question for a Nix key, and it is the same one the
+                // handler asks: can `nix_op` build the operation here.
+                // Asking it rather than restating its conditions is what
+                // keeps the footer from claiming a key the handler will
+                // refuse - and it is why the privilege check needed no
+                // second home in the footer.
+                Some(Action::Nix(verb)) => KeyBinding { dimmed: self.nix_offer(verb) == NixOffer::No, ..binding },
+                // And `l`, which needs a unit whose log to open. Asked of
+                // `log_target` rather than of `selected_unit` because
+                // they differ on a timer row: `l` there opens the log of
+                // the unit the timer *runs*, so the key applies where the
+                // other question would have said it did not.
+                Some(Action::Logs) => KeyBinding { dimmed: self.log_target().is_none(), ..binding },
+                // The transient opens on a unit row and nowhere else yet,
+                // so off one it is dim - and only for that reason. It
+                // does *not* dim because the popup's own rows are dim:
+                // the ownership guard marks `enable` inside the popup,
+                // and a key that refused to open a popup whose rows are
+                // marked would hide the very explanation the mark exists
+                // to give.
+                Some(Action::Transient) => KeyBinding { dimmed: !on_a_unit, ..binding },
+                _ => binding,
             })
             .collect()
     }
@@ -1293,7 +2423,11 @@ impl App {
             .iter()
             .filter_map(|row| match row {
                 Node::ProcGroup { name, .. } => Some(name.clone()),
-                Node::SectionHeader { title, kind: SectionKind::Units | SectionKind::Journal, .. } => Some(title.clone()),
+                // The same two questions `cycle_section` asks, asked of
+                // the same two methods, so collapse-all and one section's
+                // `TAB` cannot disagree about what a section is or about
+                // what it is filed under.
+                Node::SectionHeader { title, kind, .. } if kind.folds() => Some(kind.fold_key(title)),
                 _ => None,
             })
             .collect()
@@ -1349,6 +2483,12 @@ impl App {
                 .collect();
             return Some(ModalView::Keys { groups });
         }
+        if let Some(state) = &self.input {
+            return Some(ModalView::Input { prompt: state.prompt, typed: &state.typed, candidates: None });
+        }
+        if let Some(def) = &self.transient {
+            return Some(def.view());
+        }
         if self.pending.is_some() {
             return Some(ModalView::Confirm { prompt: &self.confirm_prompt });
         }
@@ -1367,6 +2507,7 @@ impl App {
                 Buffer::Systemd => Header::Titled("systemd"),
                 Buffer::Log => Header::Log { unit: self.unit_log.as_deref().unwrap_or("log"), newest_first: self.log_newest_first },
                 Buffer::Io => Header::Titled("IO"),
+                Buffer::Nix => Header::Titled("Nix"),
             },
             rows: &self.rows,
             selected: (!self.rows.is_empty()).then(|| self.cursor()),

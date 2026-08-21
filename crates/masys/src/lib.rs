@@ -1,13 +1,17 @@
-//! Composition root: the only crate that builds a concrete `SystemService`
-//! and `PlatformService`, wires them into `App`, and runs the terminal
-//! event loop. Nothing above this line knows which implementations it is
-//! talking to, and nothing above this line names `ratatui` or `crossterm`.
+//! Composition root: the only crate that builds a concrete `SystemService`,
+//! `PlatformService` and - where the host has one - `DeclarativeService`,
+//! wires them into `App`, and runs the terminal event loop. Nothing above
+//! this line knows which implementations it is talking to, and nothing
+//! above this line names `ratatui` or `crossterm`.
 
+use std::io::Write;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crossterm::event::{self, Event, KeyCode as TermCode, KeyEvent, KeyEventKind, KeyModifiers};
+use masys_app::buffer::Registry;
 use masys_app::keymap::Keymap;
-use masys_app::{App, Flow, Key, KeyCode};
+use masys_app::{Aftermath, App, Flow, Key, KeyCode};
+use masys_domain::declarative::DeclarativeService;
 use masys_domain::service::{PlatformService, SystemService};
 use masys_platform_fallback::FallbackPlatform;
 use masys_platform_nixos::{NixosPlatform, is_nixos};
@@ -49,14 +53,25 @@ pub fn run() -> Result<(), String> {
     let system = SystemdService::connect(FLAPPING_WINDOW_MS)
         .map_err(|e| format!("cannot reach systemd on the system bus - is this a systemd host? ({e})"))?;
 
+    // One read, because three decisions turn on the one fact: which
+    // platform adapter, whether there is a declarative service, and
+    // which views the keymap has. Reading the file once per question
+    // would be three chances for one host to answer the same question
+    // three ways.
+    let os_release = std::fs::read_to_string("/etc/os-release").unwrap_or_default();
+
     // Distro detection, at last with something to choose between. The
     // guard this feeds is not cosmetic: on NixOS a unit's definition
     // lives in the read-only store, so enabling one either fails or is
     // undone by the next rebuild, and the fallback adapter would have
     // reported it as a change that sticks.
-    let platform = select_platform();
+    let platform = select_platform(&os_release);
+    let declarative = select_declarative(&os_release);
 
-    let (keymap, problems) = load_keymap();
+    // The registry follows the service, not the distro name: it is the
+    // presence of an adapter that decides whether `5` exists, and
+    // `App::with_declarative` asserts the two agree.
+    let (keymap, problems) = load_keymap(Registry::new(declarative.is_some()));
     // The retention floor is scaled to the filesystem being scanned, and
     // the largest mounted one is the honest yardstick for a scanner that
     // will be pointed at any of them.
@@ -68,7 +83,7 @@ pub fn run() -> Result<(), String> {
         // nothing.
         None => Box::new(NoScanner),
     };
-    let mut app = App::with_keymap(Box::new(system) as Box<dyn SystemService>, platform, scanner, hostname(), keymap);
+    let mut app = App::with_declarative(Box::new(system) as Box<dyn SystemService>, platform, scanner, hostname(), keymap, declarative);
     // Reported before the terminal is taken over, because a config
     // problem the operator cannot see is a config problem they will not
     // fix - and this is the last moment there is a real terminal to
@@ -171,9 +186,10 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App) -> std::io::Result<
                 match app.handle_key(key) {
                     Flow::Quit => return Ok(()),
                     // An action needs the screen: `systemctl edit` spawns
-                    // `$EDITOR`, which expects to own the terminal. Only
-                    // this crate can give it up, which is why the session
-                    // asks rather than acts.
+                    // `$EDITOR`, and every Nix operation streams its own
+                    // output for as long as it takes. Only this crate can
+                    // give the terminal up, which is why the session asks
+                    // rather than acts.
                     Flow::Suspend => {
                         *terminal = suspended(app)?;
                         next_tick = Instant::now() + TICK;
@@ -215,25 +231,119 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App) -> std::io::Result<
     }
 }
 
-/// Hands the terminal to whatever the session asked to run, then takes it
-/// back.
+/// Hands the terminal to whatever the session asked to run, waits if the
+/// operator still has something to read there, then takes it back.
 ///
 /// `ratatui::restore` leaves raw mode and the alternate screen, so the
-/// editor gets a normal terminal and its own scrollback. Re-initialising
+/// command gets a normal terminal and its own scrollback. Re-initialising
 /// afterwards returns a cleared alternate screen, which is why the frame
-/// after this looks untouched however much the editor drew.
+/// after this looks untouched however much the command drew - and why
+/// output left on the normal screen is *gone* from the operator's point of
+/// view the instant this returns. It is still in the scrollback; the
+/// scrollback is behind the alternate screen masys is drawing on.
 ///
-/// The order matters and only runs one way: release, run, restore. If the
-/// restore fails there is no terminal to report into, so the error goes up
-/// and the loop ends - the alternative is drawing frames nobody can see.
+/// So who waits is split across the seam and neither half could decide it
+/// alone: [`App::run_suspended`] knows what it ran, this crate knows there
+/// is a screen to wait on. `Aftermath::Seen` is the editor's answer -
+/// `$EDITOR` held the terminal until the operator quit it, and pausing
+/// afterwards would demand a keypress to dismiss a screen they just left.
+///
+/// The order matters and only runs one way: release, run, read, restore.
+/// If the restore fails there is no terminal to report into, so the error
+/// goes up and the loop ends - the alternative is drawing frames nobody
+/// can see.
 fn suspended(app: &mut App) -> std::io::Result<DefaultTerminal> {
     ratatui::restore();
-    app.run_suspended();
+    if app.run_suspended() == Aftermath::Unseen {
+        wait_for_key()?;
+    }
     let terminal = ratatui::try_init()?;
     // The unit may have changed under the editor, and the frame drawn next
     // is the first thing the operator sees on coming back.
     let _ = tick(app);
     Ok(terminal)
+}
+
+/// What masys says on the normal screen before it waits there.
+///
+/// Nothing in the tree said "press a key" before this - `grep -rni press`
+/// over `crates/*/src` finds only prose in comments - so this is built out
+/// of the two conventions that do exist. `run` prefixes everything masys
+/// says on a real terminal with `masys: `, which is what tells the
+/// operator this last line is masys and not the eighty-fifth line of
+/// `nix store diff-closures`; and a confirmation reads `{what}  y / n`, a
+/// statement followed by the key that answers it, so this is a statement
+/// followed by the key that answers it.
+const RESUME_PROMPT: &str = "masys: any key returns to the view";
+
+/// Holds the normal screen until the operator has read what is on it.
+///
+/// Raw mode is on for the read and off again immediately. `ratatui::restore`
+/// has already left it, and a cooked terminal is line buffered, so without
+/// this "any key" would mean "any key, then enter" - which is not what the
+/// prompt promises and is a worse prompt than none. `ratatui::try_init`
+/// enables it again a moment later for its own purposes; the two do not
+/// overlap.
+///
+/// The prompt is printed before raw mode goes on, because raw mode drops
+/// the carriage return from `\n` and the line would start under wherever
+/// the command's output ended.
+///
+/// stdout rather than the `eprintln!` `run` uses for config problems:
+/// those are diagnostics that should survive a redirect, this is the
+/// terminal talking to the person in front of it, and stdout is the stream
+/// ratatui and crossterm are driving either side of it.
+fn wait_for_key() -> std::io::Result<()> {
+    println!("\n{RESUME_PROMPT}");
+    std::io::stdout().flush()?;
+    crossterm::terminal::enable_raw_mode()?;
+    let waited = wait_for_press();
+    // Left again whatever the read did. An error path that returned with
+    // raw mode still on would hand the shell back a terminal that does not
+    // echo, and the error message about to be printed would be the last
+    // legible thing on it.
+    let restored = crossterm::terminal::disable_raw_mode();
+    waited.and(restored)
+}
+
+/// Blocks until a key is pressed, discarding anything typed while the
+/// command was still running.
+///
+/// The drain is not defensive tidiness. A key pressed while the child owned
+/// stdin stays in the tty's input queue - the child never read it - and it
+/// survives the switch into raw mode, so `event::read` would find one
+/// waiting and the pause would dismiss itself before the prompt had been on
+/// screen for a frame. Measured through a pty on this host, with `xyz` sent
+/// 20 ms after `d` while `nix store diff-closures` still owned stdin: with
+/// the drain the pause is still up five seconds later, and without it masys
+/// is back in the alternate screen immediately - the `x` answered a prompt
+/// that had not been printed yet. That window is a third of a second for a
+/// diff and minutes for a rebuild, and the operations most worth pausing
+/// after are the long ones.
+///
+/// `Press` only, matching the event loop: a release or a repeat is not
+/// somebody answering the prompt.
+///
+/// ctrl-c is not special here. Raw mode delivers it as a key like any
+/// other, so it dismisses the pause rather than raising SIGINT, and the
+/// loop's own ctrl-c branch takes the next one. Driven through a pty: the
+/// first returns to the view, the second quits. Two presses to leave is
+/// the right cost - the alternative is a key that discards the output the
+/// pause exists to show.
+fn wait_for_press() -> std::io::Result<()> {
+    while event::poll(Duration::ZERO)? {
+        let _ = event::read()?;
+    }
+    loop {
+        // A resize or a mouse event is not a key, and waiting on through
+        // them costs nothing: the screen behind this is the command's own
+        // output, which masys is not redrawing.
+        if let Event::Key(key) = event::read()?
+            && key.kind == KeyEventKind::Press
+        {
+            return Ok(());
+        }
+    }
 }
 
 /// crossterm's event, as masys's own `Key`.
@@ -269,16 +379,28 @@ fn convert(event: KeyEvent) -> Key {
 
 /// The platform adapter for this host.
 ///
-/// One `/etc/os-release` read. An unreadable or unrecognised file gets
-/// the fallback, which answers every distro-specific question with "not
-/// supported" - the design's point being that an unknown distro is a
-/// normal working state rather than an error.
-fn select_platform() -> Box<dyn PlatformService> {
-    let os_release = std::fs::read_to_string("/etc/os-release").unwrap_or_default();
-    if is_nixos(&os_release) {
+/// Given `/etc/os-release`'s text rather than reading it, so that the one
+/// read in `run` settles every question the file answers. An unreadable or
+/// unrecognised file gets the fallback, which answers every distro-specific
+/// question with "not supported" - the design's point being that an unknown
+/// distro is a normal working state rather than an error.
+fn select_platform(os_release: &str) -> Box<dyn PlatformService> {
+    if is_nixos(os_release) {
         return Box::new(NixosPlatform);
     }
     Box::new(FallbackPlatform)
+}
+
+/// The declarative adapter for this host, if it has one.
+///
+/// `None` is the ordinary answer everywhere but NixOS, and it is what
+/// keeps the Nix view off a host that has no generations to show. Absent
+/// rather than empty: an unreadable `/etc/os-release` reads as not-NixOS
+/// here, which is the same answer a Debian box gives, and on a host that
+/// really is NixOS the view going missing is a visible failure rather
+/// than a screen of dashes pretending to be readings.
+fn select_declarative(os_release: &str) -> Option<Box<dyn DeclarativeService>> {
+    is_nixos(os_release).then(|| Box::new(NixosPlatform) as Box<dyn DeclarativeService>)
 }
 
 /// The keymap, with `~/.config/masys/config.toml`'s `[keys]` applied.
@@ -293,19 +415,46 @@ fn select_platform() -> Box<dyn PlatformService> {
 /// one is reported and skipped rather than fatal: masys is a tool you
 /// reach for when something is already wrong, and refusing to start over
 /// a stray bracket in a keymap would be its own small betrayal.
-fn load_keymap() -> (Keymap, Vec<String>) {
+///
+/// Everything past "is there a file, and can it be read" is
+/// `keymap_from`'s decision, not this function's - this is the only half
+/// that touches the filesystem, and the only half `keymap_from`'s tests
+/// do not have to.
+fn load_keymap(registry: Registry) -> (Keymap, Vec<String>) {
     let Some(path) = config_path() else {
-        return (Keymap::default(), Vec::new());
+        return keymap_from(registry, "", None);
     };
-    let Ok(text) = std::fs::read_to_string(&path) else {
-        return (Keymap::default(), Vec::new());
+    let text = std::fs::read_to_string(&path).ok();
+    keymap_from(registry, &path.to_string_lossy(), text.as_deref())
+}
+
+/// Every decision `load_keymap` makes once the filesystem has answered
+/// its one question: is there a config file, and what does it say.
+///
+/// `text` folds two of the five paths - no config file, and a file that
+/// exists but could not be read - into the same `None`: both already
+/// produced the same answer, so there is nothing here for them to
+/// disagree about. `path` is only ever read back into the one problem
+/// that needs to name a file - an unparseable `text` - so a caller with
+/// no real path to offer may pass an empty one.
+///
+/// `registry` is threaded through every return rather than any of them
+/// falling back to `Keymap::default()`. Which views a host has is a fact
+/// about the host, not about its config file: a NixOS box with no
+/// `~/.config/masys/config.toml` still has generations to show, and a
+/// default keymap on that host would drop `5` while the service that
+/// feeds it exists - the exact disagreement `App::with_declarative`
+/// asserts against.
+fn keymap_from(registry: Registry, path: &str, text: Option<&str>) -> (Keymap, Vec<String>) {
+    let Some(text) = text else {
+        return (Keymap::for_registry(registry), Vec::new());
     };
     let table: toml::Table = match text.parse() {
         Ok(table) => table,
-        Err(e) => return (Keymap::default(), vec![format!("{}: {e}", path.display())]),
+        Err(e) => return (Keymap::for_registry(registry), vec![format!("{path}: {e}")]),
     };
     let Some(keys) = table.get("keys").and_then(|keys| keys.as_table()) else {
-        return (Keymap::default(), Vec::new());
+        return (Keymap::for_registry(registry), Vec::new());
     };
 
     let mut overrides = Vec::new();
@@ -316,7 +465,7 @@ fn load_keymap() -> (Keymap, Vec<String>) {
             None => problems.push(format!("`keys.{action}` must be a string")),
         }
     }
-    let (keymap, mut rejected) = Keymap::with_overrides(&overrides);
+    let (keymap, mut rejected) = Keymap::with_overrides_for(registry, &overrides);
     problems.append(&mut rejected);
     (keymap, problems)
 }
@@ -364,3 +513,7 @@ impl masys_domain::scan::DirScanner for NoScanner {
     }
     fn cancel(&self) {}
 }
+
+#[cfg(test)]
+#[path = "keymap_tests.rs"]
+mod keymap_tests;

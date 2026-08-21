@@ -1,6 +1,20 @@
-use masys_app::buffer::Buffer;
+use masys_app::buffer::{Buffer, Registry};
 use masys_app::key::{Key, KeyCode};
-use masys_app::keymap::{Action, Keymap, Sort};
+use masys_app::keymap::{Action, Keymap, Sort, UnitVerb};
+
+/// The two hosts masys has to be right on: one with a declarative service
+/// and one without.
+///
+/// Every claim about which digits exist has to hold on both, because the
+/// answer differs between them - and that difference is the whole reason
+/// the registry exists. A test that only ever built the default keymap
+/// would be checking the Debian answer and calling it the rule.
+fn hosts() -> [(Registry, Keymap); 2] {
+    [false, true].map(|declarative| {
+        let registry = Registry::new(declarative);
+        (registry.clone(), Keymap::for_registry(registry))
+    })
+}
 
 /// No `hjkl` yet: which letters mean movement is unsettled, and binding
 /// them would both prejudge that and spend four letters from the
@@ -85,11 +99,12 @@ fn the_protected_set_follows_the_layout() {
 /// key wearing a global's clothes.
 #[test]
 fn every_global_means_the_same_thing_in_every_view() {
-    let keymap = Keymap::default();
-    for key in globals() {
-        let meaning = keymap.base_action(key).unwrap_or_else(|| panic!("{key:?} is listed global but bound to nothing"));
-        for buffer in Buffer::ALL {
-            assert_eq!(keymap.resolve(*buffer, key), Some(meaning), "{key:?} means something else in {buffer:?}");
+    for (registry, keymap) in hosts() {
+        for key in globals(&registry) {
+            let meaning = keymap.base_action(key).unwrap_or_else(|| panic!("{key:?} is listed global but bound to nothing"));
+            for buffer in Buffer::ALL {
+                assert_eq!(keymap.resolve(*buffer, key), Some(meaning), "{key:?} means something else in {buffer:?}");
+            }
         }
     }
 }
@@ -99,12 +114,13 @@ fn every_global_means_the_same_thing_in_every_view() {
 /// globals like any other and no view may claim them.
 #[test]
 fn the_protected_set_is_exactly_the_globals() {
-    let keymap = Keymap::default();
-    for key in globals() {
-        assert!(keymap.is_protected(key), "{key:?} is global and must be protected");
-    }
-    for key in [Key::char('r'), Key::char('c'), Key::char('m'), Key::char('l')] {
-        assert!(!keymap.is_protected(key), "{key:?} belongs to a view, not to everyone");
+    for (registry, keymap) in hosts() {
+        for key in globals(&registry) {
+            assert!(keymap.is_protected(key), "{key:?} is global and must be protected");
+        }
+        for key in [Key::char('r'), Key::char('c'), Key::char('m'), Key::char('l')] {
+            assert!(!keymap.is_protected(key), "{key:?} belongs to a view, not to everyone");
+        }
     }
 }
 
@@ -113,17 +129,22 @@ fn the_protected_set_is_exactly_the_globals() {
 /// *within* a view; they were a menu, and a menu is what digits are for.
 #[test]
 fn a_digit_opens_its_view_and_no_bare_letter_does() {
-    let keymap = Keymap::default();
-    for (index, spec) in masys_app::buffer::BUFFERS.iter().enumerate() {
-        let _ = index;
-        let Some(digit) = spec.key else { continue };
-        assert_eq!(keymap.resolve(Buffer::Status, Key::char(digit)), Some(Action::Open(spec.buffer)), "{digit} opens {:?}", spec.buffer);
-    }
-    for letter in ['s', 't', 'u', 'j', 'd'] {
-        assert!(
-            !matches!(keymap.resolve(Buffer::Status, Key::char(letter)), Some(Action::Open(_))),
-            "`{letter}` still opens a view; it belongs to the views now"
-        );
+    for (registry, keymap) in hosts() {
+        for spec in registry.specs() {
+            let Some(digit) = spec.key else { continue };
+            assert_eq!(
+                keymap.resolve(Buffer::Status, Key::char(digit)),
+                Some(Action::Open(spec.buffer)),
+                "{digit} opens {:?}",
+                spec.buffer
+            );
+        }
+        for letter in ['s', 't', 'u', 'j', 'd'] {
+            assert!(
+                !matches!(keymap.resolve(Buffer::Status, Key::char(letter)), Some(Action::Open(_))),
+                "`{letter}` still opens a view; it belongs to the views now"
+            );
+        }
     }
 }
 
@@ -138,8 +159,9 @@ fn section_jumping_stays_global_because_it_means_one_thing() {
     }
 }
 
-/// The globals, as the design doc lists them.
-fn globals() -> Vec<Key> {
+/// The globals, as the design doc lists them, for a host with `registry`'s
+/// views.
+fn globals(registry: &Registry) -> Vec<Key> {
     let mut keys = vec![
         Key::new(KeyCode::Down),
         Key::new(KeyCode::Up),
@@ -155,8 +177,10 @@ fn globals() -> Vec<Key> {
         Key::char('?'),
         Key::char('q'),
     ];
-    // The digits actually in the ring - the log view has none.
-    keys.extend(masys_app::buffer::BUFFERS.iter().filter_map(|spec| spec.key).map(Key::char));
+    // The digits actually in the ring on this host - the log view has
+    // none, and a view the host does not have is not a global because it
+    // is not anything.
+    keys.extend(registry.specs().iter().filter_map(|spec| spec.key).map(Key::char));
     keys
 }
 
@@ -228,19 +252,23 @@ fn the_top_processes_toggle_is_gone() {
 /// entry is the only thing that changes as you move.
 #[test]
 fn the_footer_lists_every_view_and_marks_the_current_one() {
-    for buffer in Buffer::ALL {
-        let hints = Keymap::default().hints(*buffer);
-        let views: Vec<&masys_view::KeyBinding> = hints.iter().filter(|h| h.chord.chars().all(|c| c.is_ascii_digit())).collect();
-        let in_ring = masys_app::buffer::BUFFERS.iter().filter(|s| s.key.is_some()).count();
-        assert_eq!(views.len(), in_ring, "every view in the ring is listed in {buffer:?}");
+    for (registry, keymap) in hosts() {
+        for buffer in Buffer::ALL {
+            let hints = keymap.hints(*buffer);
+            let views: Vec<&masys_view::KeyBinding> = hints.iter().filter(|h| h.chord.chars().all(|c| c.is_ascii_digit())).collect();
+            let ring: Vec<Buffer> = registry.specs().iter().filter(|s| s.key.is_some()).map(|s| s.buffer).collect();
+            assert_eq!(views.len(), ring.len(), "every view in the ring is listed in {buffer:?}");
 
-        // The log view is a drill-down and not in the ring, so standing in
-        // it marks nothing - which is honest: no digit would take you back.
-        let active: Vec<&str> = views.iter().filter(|h| h.active).map(|h| h.label.as_str()).collect();
-        let expected = usize::from(*buffer != Buffer::Log);
-        assert_eq!(active.len(), expected, "in {buffer:?}: {active:?}");
-        if expected == 1 {
-            assert_eq!(active[0], buffer.title().to_lowercase(), "and it is the one you are in");
+            // The log view is a drill-down and not in the ring, so standing
+            // in it marks nothing - which is honest: no digit would take you
+            // back. Nor does a view this host does not have, for the plainer
+            // reason that you cannot be standing in one.
+            let active: Vec<&str> = views.iter().filter(|h| h.active).map(|h| h.label.as_str()).collect();
+            let expected = usize::from(ring.contains(buffer));
+            assert_eq!(active.len(), expected, "in {buffer:?}: {active:?}");
+            if expected == 1 {
+                assert_eq!(active[0], buffer.title().to_lowercase(), "and it is the one you are in");
+            }
         }
     }
 }
@@ -334,26 +362,44 @@ fn the_help_lists_every_key_the_base_map_binds() {
     for (name, action) in masys_app::keymap::ACTIONS {
         // Per-buffer actions live in the open buffer's own group and are
         // covered by the overlay test below.
-        if masys_app::keymap::Keymap::default().base_action(key_for(*action)).is_none() {
+        // An action with no key of its own is reached from a transient,
+        // and a transient's rows are not the base map's business.
+        let Some(key) = key_for(*action) else { continue };
+        if masys_app::keymap::Keymap::default().base_action(key).is_none() {
             continue;
         }
-        assert!(
-            listed.contains(&key_for(*action).spelling()),
-            "`{name}` is bound to `{}` but the help never lists it",
-            key_for(*action).spelling()
-        );
+        assert!(listed.contains(&key.spelling()), "`{name}` is bound to `{}` but the help never lists it", key.spelling());
     }
 }
 
-/// The default binding for an action, as the table spells it.
-fn key_for(action: Action) -> Key {
+/// The default binding for an action, as the table spells it, or `None`
+/// for an action that has no key of its own because a transient is where
+/// it is reached - `unit_enable` since the transient engine landed.
+fn key_for(action: Action) -> Option<Key> {
     let name = action.name().expect("every action has a config name");
-    let spelling = masys_app::keymap::DEFAULT_BINDINGS
-        .iter()
-        .find(|(n, _)| *n == name)
-        .map(|(_, k)| *k)
-        .unwrap_or_else(|| panic!("`{name}` has no default binding"));
-    Key::parse(spelling).expect("a parseable default")
+    let spelling = masys_app::keymap::DEFAULT_BINDINGS.iter().find(|(n, _)| *n == name).map(|(_, k)| *k)?;
+    Some(Key::parse(spelling).expect("a parseable default"))
+}
+
+/// Every action any transient offers on a row of its own.
+///
+/// Built from a real definition rather than a list written out here,
+/// which is what keeps this honest: a verb dropped from the popup stops
+/// counting as reachable the moment it is dropped.
+fn actions_in_transients() -> Vec<Action> {
+    let ownership = masys_domain::platform::Ownership::Imperative;
+    // The Nix popup with a generation under the cursor, because the
+    // Generation group is contextual and its three verbs are reachable
+    // only there.
+    [
+        masys_app::systemd_buffer::unit_transient("sshd.service", Some(&ownership)),
+        masys_app::nix_buffer::nix_transient(Some(436), Some("14d")),
+    ]
+    .iter()
+    .flat_map(|def| &def.groups)
+    .flat_map(|group| &group.rows)
+    .map(|row| row.action)
+    .collect()
 }
 
 /// A buffer missing from the registry compiles fine and is simply
@@ -361,9 +407,13 @@ fn key_for(action: Action) -> Key {
 /// shared, so its cursor collides with every other unregistered buffer's.
 /// That is exactly the bug this test exists to catch, having already
 /// happened once.
+///
+/// Against the catalogue and the host that has every view in it: the claim
+/// is that no buffer was left out of the table, and a host that omits one
+/// deliberately cannot answer that.
 #[test]
 fn every_buffer_is_registered_and_reachable() {
-    let keymap = Keymap::default();
+    let keymap = Keymap::for_registry(Registry::new(true));
     for buffer in Buffer::ALL {
         let spec = masys_app::buffer::BUFFERS
             .iter()
@@ -401,11 +451,12 @@ fn no_two_buffers_share_a_title() {
 /// Single-letter jumps - the only way to switch buffers.
 #[test]
 fn a_bare_letter_opens_its_buffer() {
-    let keymap = Keymap::default();
-    for spec in masys_app::buffer::BUFFERS {
-        let Some(key) = spec.key else { continue };
-        assert_eq!(keymap.resolve(Buffer::Status, Key::char(key)), Some(Action::Open(spec.buffer)), "{key} opens {:?}", spec.buffer);
-        assert_eq!(keymap.resolve_buffer(Key::char(key)), Some(spec.buffer));
+    for (registry, keymap) in hosts() {
+        for spec in registry.specs() {
+            let Some(key) = spec.key else { continue };
+            assert_eq!(keymap.resolve(Buffer::Status, Key::char(key)), Some(Action::Open(spec.buffer)), "{key} opens {:?}", spec.buffer);
+            assert_eq!(keymap.resolve_buffer(Key::char(key)), Some(spec.buffer));
+        }
     }
 }
 
@@ -413,12 +464,13 @@ fn a_bare_letter_opens_its_buffer() {
 /// repurpose one - the same rule that protects `q` and `g`.
 #[test]
 fn buffer_letters_are_protected_from_overlays() {
-    let keymap = Keymap::default();
-    for spec in masys_app::buffer::BUFFERS {
-        let Some(key) = spec.key else { continue };
-        assert!(keymap.is_protected(Key::char(key)), "{key} must be protected");
-        for buffer in Buffer::ALL {
-            assert_eq!(keymap.resolve(*buffer, Key::char(key)), Some(Action::Open(spec.buffer)), "{buffer:?} must not shadow {key}");
+    for (registry, keymap) in hosts() {
+        for spec in registry.specs() {
+            let Some(key) = spec.key else { continue };
+            assert!(keymap.is_protected(Key::char(key)), "{key} must be protected");
+            for buffer in Buffer::ALL {
+                assert_eq!(keymap.resolve(*buffer, Key::char(key)), Some(Action::Open(spec.buffer)), "{buffer:?} must not shadow {key}");
+            }
         }
     }
 }
@@ -478,8 +530,11 @@ fn no_overlay_binding_is_silently_shadowed_in_any_layout() {
 /// another one opens it.
 #[test]
 fn the_registry_and_the_binding_table_agree_on_every_buffer_key() {
-    let keymap = Keymap::default();
-    for spec in masys_app::buffer::BUFFERS {
+    // The host that has every view: the claim is about the two tables, and
+    // a host missing one of them has nothing to say about that row.
+    let registry = Registry::new(true);
+    let keymap = Keymap::for_registry(registry.clone());
+    for spec in registry.specs() {
         let bound = masys_app::keymap::DEFAULT_BINDINGS
             .iter()
             .find(|(name, _)| Action::from_name(name) == Some(Action::Open(spec.buffer)))
@@ -497,35 +552,59 @@ fn the_registry_and_the_binding_table_agree_on_every_buffer_key() {
     }
 }
 
-/// Every action in the table must have a default binding, or it is an
-/// action nothing can reach.
+/// Every action in the table must be *reachable*, or it is an action
+/// nothing can run.
+///
+/// A key was the only way to reach one until the transient engine landed,
+/// and this test asked for a default binding. That is now too narrow:
+/// `unit_enable` gave `e` up to the transient and lives on the popup's
+/// Persistence row, which is a way to reach it and not a key. So the
+/// question is reachability, and a popup row answers it.
 #[test]
-fn every_named_action_has_a_default_binding() {
-    for (name, _) in masys_app::keymap::ACTIONS {
-        assert!(
-            masys_app::keymap::DEFAULT_BINDINGS.iter().any(|(bound, _)| bound == name),
-            "`{name}` is configurable but has no default binding"
-        );
+fn every_named_action_is_reachable() {
+    let in_transients = actions_in_transients();
+    for (name, action) in masys_app::keymap::ACTIONS {
+        let bound = masys_app::keymap::DEFAULT_BINDINGS.iter().any(|(bound, _)| bound == name);
+        assert!(bound || in_transients.contains(action), "`{name}` is configurable but nothing can reach it");
     }
+}
+
+/// And the one action that gave up its key really is in a transient, so
+/// the test above cannot pass by finding an empty popup.
+#[test]
+fn enable_is_reachable_from_the_transient_that_took_its_key() {
+    assert!(masys_app::keymap::DEFAULT_BINDINGS.iter().all(|(name, _)| *name != "unit_enable"), "`e` went to the transient");
+    assert!(actions_in_transients().contains(&Action::Unit(masys_app::keymap::UnitVerb::Enable)), "and enable went with it");
 }
 
 /// And no two actions may default to the same key in the same scope,
 /// which would make one of them unreachable.
+///
+/// Asked of `describe`, which is every binding available in a buffer -
+/// the base map's groups plus that buffer's own overlay. The version
+/// before this walked `DEFAULT_BINDINGS` and skipped any binding whose
+/// key did not `resolve` back to it, which is exactly the loser of a
+/// collision: two actions on one key left one of them filtered out, and
+/// the check could never fire for the case it is named for. Confirmed by
+/// binding `nix_activate` to `r`, which `unit_restart` already holds in
+/// the same overlay - the old test stayed green, this one names both.
+///
+/// Cross-buffer reuse is still fine and is not what this asks about: `a`
+/// sorts by name in Procs and activates a generation in Nix, in two
+/// different overlays, and `describe` is per buffer.
 #[test]
 fn no_two_default_bindings_collide() {
-    let keymap = Keymap::default();
-    for buffer in Buffer::ALL {
-        let mut seen: Vec<(String, &str)> = Vec::new();
-        for (name, key) in masys_app::keymap::DEFAULT_BINDINGS {
-            let Some(action) = Action::from_name(name) else { continue };
-            // Only what actually resolves in this buffer can collide here.
-            if keymap.resolve(*buffer, Key::parse(key).expect("a parseable default")) != Some(action) {
-                continue;
+    for (_, keymap) in hosts() {
+        for buffer in Buffer::ALL {
+            let mut seen: Vec<(String, String)> = Vec::new();
+            for group in keymap.describe(*buffer) {
+                for binding in group.bindings {
+                    if let Some((_, other)) = seen.iter().find(|(chord, _)| *chord == binding.chord) {
+                        panic!("{buffer:?}: `{}` is both `{other}` and `{}`", binding.chord, binding.label);
+                    }
+                    seen.push((binding.chord, binding.label));
+                }
             }
-            if let Some((_, other)) = seen.iter().find(|(k, _)| k == key) {
-                panic!("{buffer:?}: `{key}` is both `{other}` and `{name}`");
-            }
-            seen.push(((*key).to_string(), name));
         }
     }
 }
@@ -569,6 +648,61 @@ fn a_per_buffer_action_can_be_rebound() {
     assert!(problems.is_empty(), "{problems:?}");
     assert_eq!(keymap.resolve(Buffer::Systemd, Key::char('z')), Some(Action::Unit(masys_app::keymap::UnitVerb::Restart)));
     assert_eq!(keymap.resolve(Buffer::Procs, Key::char('z')), None, "still only in its own buffer");
+}
+
+/// The Nix units section exists because these keys were supposed to reach
+/// it. `owner` filed them under Systemd alone, so they did not.
+#[test]
+fn a_unit_verb_resolves_in_the_nix_view_as_well_as_the_systemd_one() {
+    let keymap = Keymap::for_registry(Registry::new(true));
+
+    for buffer in [Buffer::Systemd, Buffer::Nix] {
+        assert_eq!(keymap.resolve(buffer, Key::char('r')), Some(Action::Unit(UnitVerb::Restart)), "{buffer:?}");
+        assert_eq!(keymap.resolve(buffer, Key::char('l')), Some(Action::Logs), "{buffer:?}");
+    }
+}
+
+/// The `r` collision, decided in the table rather than in the handler.
+///
+/// `r` is `unit_restart`, and it resolves in the Nix view because that
+/// view shows units. The Nix view's own operations took letters of their
+/// own rather than a second meaning for that one: the footer and the `?`
+/// help both build their labels from the *action* a key resolves to, so a
+/// key whose action depended on the row under the cursor would be a key
+/// neither of them could state.
+///
+/// `a`, `d` and `c` cost three letters while they existed. They are gone
+/// now - the transient holds all thirteen operations and `r` still means
+/// restart here - so what is left to pin is that the Nix buffer took
+/// *no* top-level letters and gave none of them a second meaning.
+#[test]
+fn the_nix_operations_took_their_own_letters_and_left_r_to_units() {
+    let keymap = Keymap::for_registry(Registry::new(true));
+
+    assert_eq!(keymap.resolve(Buffer::Nix, Key::char('r')), Some(Action::Unit(UnitVerb::Restart)));
+    for chord in ['a', 'd', 'c'] {
+        assert!(
+            !matches!(keymap.resolve(Buffer::Nix, Key::char(chord)), Some(Action::Nix(_))),
+            "`{chord}` was a Nix operation and is now a row in the transient"
+        );
+    }
+    assert_eq!(keymap.resolve(Buffer::Nix, Key::char('e')), Some(Action::Transient), "which `e` opens");
+
+    // And they are this view's alone. In Procs the same two letters are
+    // the sort keys they have always been, which is what a per-buffer
+    // overlay is for - and why `no_two_default_bindings_collide` asks its
+    // question per buffer.
+    assert_eq!(keymap.resolve(Buffer::Procs, Key::char('a')), Some(Action::SortBy(Sort::Name)));
+    assert_eq!(keymap.resolve(Buffer::Procs, Key::char('c')), Some(Action::SortBy(Sort::Cpu)));
+    assert_eq!(keymap.resolve(Buffer::Procs, Key::char('d')), None);
+}
+
+/// And nowhere else - a unit verb in the IO view would be a key with
+/// nothing to act on.
+#[test]
+fn a_unit_verb_does_not_resolve_in_a_view_with_no_units() {
+    let keymap = Keymap::for_registry(Registry::new(true));
+    assert_eq!(keymap.resolve(Buffer::Io, Key::char('r')), None);
 }
 
 /// Rebinding a movement key moves the protection with it, since the
@@ -635,4 +769,85 @@ fn ctrl_round_trips_through_its_spelling() {
     assert_eq!(key, Key::ctrl(KeyCode::Char('r')));
     assert_eq!(key.spelling(), "ctrl+r");
     assert_eq!(Key::parse("Ctrl+r"), Some(Key::ctrl(KeyCode::Char('r'))), "case does not matter for the modifier");
+}
+
+/// The footer, the `?` help and the digit itself are three answers to one
+/// question - which views does this host have - and they have to be the
+/// same answer.
+///
+/// The registry's own tests cannot catch a disagreement here: they ask the
+/// registry, and the registry is right. What drifts is everything that
+/// prints or resolves a digit *without* asking it, which is how a Debian
+/// host came to advertise `[5] nix` in a footer where `5` did nothing.
+#[test]
+fn the_footer_and_the_help_list_exactly_the_buffers_the_digits_reach() {
+    for (registry, keymap) in hosts() {
+        let declarative = registry.contains(Buffer::Nix);
+        let expected: Vec<String> = registry.specs().iter().filter_map(|spec| spec.key).map(|key| key.to_string()).collect();
+        let digits =
+            |chords: Vec<String>| -> Vec<String> { chords.into_iter().filter(|chord| chord.chars().all(|c| c.is_ascii_digit())).collect() };
+
+        let footer = digits(keymap.hints(Buffer::Status).into_iter().map(|hint| hint.chord).collect());
+        assert_eq!(footer, expected, "the footer offers a view this host does not have (declarative: {declarative})");
+
+        let help = digits(keymap.describe(Buffer::Status).into_iter().flat_map(|group| group.bindings).map(|b| b.chord).collect());
+        assert_eq!(help, expected, "the ? help lists a view this host does not have (declarative: {declarative})");
+
+        let opens: Vec<String> = ('1'..='9')
+            .filter(|d| matches!(keymap.resolve(Buffer::Status, Key::char(*d)), Some(Action::Open(_))))
+            .map(|d| d.to_string())
+            .collect();
+        assert_eq!(opens, expected, "a digit opens a view this host does not have (declarative: {declarative})");
+
+        let named: Vec<String> = ('1'..='9').filter(|d| keymap.resolve_buffer(Key::char(*d)).is_some()).map(|d| d.to_string()).collect();
+        assert_eq!(named, expected, "resolve_buffer names a view this host does not have (declarative: {declarative})");
+    }
+}
+
+/// A host with no Nix view has no Nix keys anywhere in the keymap, not
+/// merely no way to reach the buffer they sit in.
+///
+/// `Registry` is the one owner of which views a host has, and an overlay
+/// for a view it does not have is a second answer to that question kept
+/// somewhere else. It had no user-visible effect - nothing can put the
+/// cursor in an unregistered buffer - which is exactly why it is worth
+/// removing rather than leaving: the same shape, one buffer over, is how
+/// a Debian host came to advertise `[5] nix` in a footer where `5` did
+/// nothing.
+#[test]
+fn a_host_with_no_nix_view_carries_no_nix_keys_at_all() {
+    for (registry, keymap) in hosts() {
+        let declarative = registry.contains(Buffer::Nix);
+        let nix_keys: Vec<String> = keymap
+            .actions(Buffer::Nix)
+            .into_iter()
+            .filter(|binding| matches!(keymap.action_for(Buffer::Nix, &binding.chord), Some(Action::Nix(_))))
+            .map(|binding| binding.chord)
+            .collect();
+
+        // No host carries a top-level Nix key any more - the operations
+        // are rows in the transient. The claim worth keeping is the one
+        // about a host *without* the view, which is what this test is
+        // named for.
+        if declarative {
+            assert!(nix_keys.is_empty(), "the Nix operations moved into the transient: {nix_keys:?}");
+            assert_eq!(keymap.action_for(Buffer::Nix, "e"), Some(Action::Transient), "and a Nix host reaches them through the popup");
+        } else {
+            assert!(nix_keys.is_empty(), "a host with no Nix view built {nix_keys:?} into a Nix overlay");
+        }
+    }
+}
+
+/// And a config file that names one is still not an error. A single
+/// config shared between a NixOS box and a Debian one is not wrong for
+/// mentioning the Nix view; it is describing a view this host does not
+/// have, which is why the override is dropped silently rather than
+/// reported.
+#[test]
+fn rebinding_a_nix_key_on_a_host_without_the_view_is_dropped_not_refused() {
+    let registry = Registry::new(false);
+    let (keymap, problems) = Keymap::with_overrides_for(registry, &[("nix_clean".to_string(), "C".to_string())]);
+
+    assert!(problems.is_empty(), "{problems:?}");
+    assert_eq!(keymap.resolve(Buffer::Nix, Key::char('C')), None);
 }

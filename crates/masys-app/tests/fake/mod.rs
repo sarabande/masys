@@ -6,10 +6,11 @@
 //! whatever the test configured. Methods `tick()` never calls stay
 //! `unimplemented!()`, same convention as the domain crate's fake.
 
+use masys_domain::declarative::{DeclarativeService, HomeMode, Inputs, NixOp, Profile, RebootState};
 use masys_domain::error::MasysError;
 use masys_domain::journal::Entry;
 use masys_domain::platform::{BootPressure, Ownership, Package, PendingReboot, PlatformId, UpdateStatus};
-use masys_domain::sample::Snapshot;
+use masys_domain::sample::{Snapshot, SystemState};
 use masys_domain::service::{IoNiceClass, PlatformService, Signal, SystemService};
 use masys_domain::unit::Unit;
 
@@ -143,14 +144,17 @@ impl SystemService for FakeSystemService {
         self.detail_queries.borrow_mut().push(pid);
         Ok(self.proc_details.get(&pid).cloned().unwrap_or_default())
     }
-    fn start(&self, _unit: &str) -> Result<(), MasysError> {
-        unimplemented!("no App method dispatches unit actions yet")
+    fn start(&self, unit: &str) -> Result<(), MasysError> {
+        self.calls.borrow_mut().push(format!("start {unit}"));
+        self.outcome()
     }
-    fn stop(&self, _unit: &str) -> Result<(), MasysError> {
-        unimplemented!("no App method dispatches unit actions yet")
+    fn stop(&self, unit: &str) -> Result<(), MasysError> {
+        self.calls.borrow_mut().push(format!("stop {unit}"));
+        self.outcome()
     }
-    fn restart(&self, _unit: &str) -> Result<(), MasysError> {
-        unimplemented!("no App method dispatches unit actions yet")
+    fn restart(&self, unit: &str) -> Result<(), MasysError> {
+        self.calls.borrow_mut().push(format!("restart {unit}"));
+        self.outcome()
     }
     fn reload(&self, unit: &str) -> Result<(), MasysError> {
         self.calls.borrow_mut().push(format!("reload {unit}"));
@@ -202,6 +206,7 @@ impl SystemService for FakeSystemService {
     }
 }
 
+#[derive(Default)]
 pub struct FakePlatformService {
     pub boot_pressure: Option<BootPressure>,
     pub pending_reboot: Option<PendingReboot>,
@@ -246,4 +251,140 @@ impl masys_domain::scan::DirScanner for NoScanner {
         masys_domain::scan::ScanProgress::default()
     }
     fn cancel(&self) {}
+}
+
+/// A machine with nothing measurable on it, for the tests whose subject
+/// is not the sample.
+///
+/// Written out rather than reached for through a `Default` on `Snapshot`
+/// itself. Several of those fields are `Option` precisely so a reading
+/// that was never taken cannot be confused with a real one, and deriving
+/// `Default` in the domain crate would put `Snapshot::default()` in front
+/// of every adapter - where a machine with no processes, no units and no
+/// filesystems is the shape of a failed read rather than of a fixture.
+/// Here the shape is asked for by name, which is the difference.
+pub fn bare_snapshot() -> Snapshot {
+    Snapshot {
+        taken_at_ms: 0,
+        procs: Vec::new(),
+        pressure: None,
+        filesystems: Vec::new(),
+        disks: Vec::new(),
+        clock_synced: true,
+        utc_offset_secs: 0,
+        interfaces: Vec::new(),
+        oom_kills: Vec::new(),
+        system_state: SystemState::Running,
+        clock_ticks_per_sec: 100,
+        machine: None,
+        load: None,
+        uptime_secs: None,
+        memory: None,
+    }
+}
+
+/// A `DeclarativeService` that hands back whatever the test configured -
+/// the same convention as `FakeSystemService`. Nothing here touches a
+/// filesystem, so the Nix view's tests run on any host.
+#[derive(Default)]
+pub struct FakeDeclarative {
+    pub profiles: Vec<Profile>,
+    pub reboot: Option<RebootState>,
+    pub inputs: Option<Inputs>,
+    pub home_mode: Option<HomeMode>,
+    pub running_nixpkgs_rev: Option<String>,
+    pub gc_retention: Option<String>,
+    pub gc_roots: u32,
+    /// Every operation this fake was asked to perform, in order.
+    ///
+    /// Shared out through an `Rc` for the reason `FakeSystemService::calls`
+    /// is: the session holds a `Box<dyn DeclarativeService>` and a test
+    /// cannot reach back into the fake it handed over. The question these
+    /// answer is the one `Pending` exists for - that an operation reached
+    /// the port only after it was confirmed, and never before.
+    pub ops: std::rc::Rc<std::cell::RefCell<Vec<NixOp>>>,
+    /// While set, every read fails.
+    ///
+    /// Shared and interior-mutable for the same reason `FakeSystemService`
+    /// shares its `calls`: the session owns the fake behind a
+    /// `Box<dyn DeclarativeService>` and a test cannot reach back into it.
+    /// A read that fails on the *second* tick is the case the session's
+    /// keep-last-good rule exists for, and there is no way to stage it
+    /// without a switch the test still holds.
+    pub failing: std::rc::Rc<std::cell::Cell<bool>>,
+    /// This host's flake reference, or `None` for a channels host.
+    ///
+    /// Defaulted to `None` rather than to a stand-in path: the rows that
+    /// consult it are the flake-only ones, and a fake that invented a
+    /// reference would leave every test asserting they are live without
+    /// any test having said the host has a flake.
+    pub flake_ref: Option<String>,
+    /// Where `<nixos-config>` resolves, for the one row that needs it.
+    /// `None` by default, for `flake_ref`'s reason.
+    pub nixos_config: Option<String>,
+}
+
+impl FakeDeclarative {
+    fn outcome(&self) -> Result<(), MasysError> {
+        match self.failing.get() {
+            true => Err(MasysError::Platform("declarative read refused".to_string())),
+            false => Ok(()),
+        }
+    }
+}
+
+impl DeclarativeService for FakeDeclarative {
+    fn profiles(&self) -> Result<Vec<Profile>, MasysError> {
+        self.outcome()?;
+        Ok(self.profiles.clone())
+    }
+    fn reboot(&self) -> Result<Option<RebootState>, MasysError> {
+        self.outcome()?;
+        Ok(self.reboot.clone())
+    }
+    fn flake_ref(&self) -> Result<Option<String>, MasysError> {
+        self.outcome()?;
+        Ok(self.flake_ref.clone())
+    }
+    fn nixos_config(&self) -> Result<Option<String>, MasysError> {
+        self.outcome()?;
+        Ok(self.nixos_config.clone())
+    }
+    /// `Absent` where the test set nothing, which is the port's own answer
+    /// for a host without home-manager rather than a stand-in for one.
+    fn home_mode(&self) -> Result<HomeMode, MasysError> {
+        self.outcome()?;
+        Ok(self.home_mode.unwrap_or(HomeMode::Absent))
+    }
+    fn inputs(&self) -> Result<Option<Inputs>, MasysError> {
+        self.outcome()?;
+        Ok(self.inputs.clone())
+    }
+    fn running_nixpkgs_rev(&self) -> Result<Option<String>, MasysError> {
+        self.outcome()?;
+        Ok(self.running_nixpkgs_rev.clone())
+    }
+    fn gc_retention(&self) -> Result<Option<String>, MasysError> {
+        self.outcome()?;
+        Ok(self.gc_retention.clone())
+    }
+    fn gc_roots(&self) -> Result<u32, MasysError> {
+        self.outcome()?;
+        Ok(self.gc_roots)
+    }
+    /// Records the operation rather than performing it.
+    ///
+    /// The commands these name activate system configurations and collect
+    /// the store, so a fake that ran anything would make `cargo test`
+    /// dangerous on the machine running it - the same reason
+    /// `masys-platform-nixos`'s own suite asserts on `argv` and never
+    /// spawns.
+    ///
+    /// Fails while `failing` is set, like every read here: a rebuild that
+    /// exits non-zero is the ordinary case, and the session has to hold
+    /// the failure rather than swallow it.
+    fn run(&self, op: &NixOp) -> Result<(), MasysError> {
+        self.ops.borrow_mut().push(op.clone());
+        self.outcome()
+    }
 }

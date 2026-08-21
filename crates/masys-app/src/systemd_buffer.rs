@@ -13,9 +13,13 @@
 //! failed unit sorts to the top of its own type and keeps its `x` glyph,
 //! and the status view still leads with failures, which is its job.
 
+use masys_domain::platform::Ownership;
 use masys_domain::unit::{ActiveState, Unit, UnitDetail, UnitKind};
 use masys_view::{Node, SectionKind};
 use std::collections::HashSet;
+
+use crate::keymap::{Action, UnitVerb};
+use crate::transient::{DefGroup, DefRow, TransientDef};
 
 /// What the session knows about the open units.
 ///
@@ -44,7 +48,10 @@ impl Expanded for HashSet<String> {
 /// the buffer needs: a unit only moves when it actually changes state,
 /// where ordering by anything live - a rate, a timestamp - would shuffle
 /// rows under the cursor every two seconds.
-fn severity(state: ActiveState) -> u8 {
+///
+/// `pub` so the Nix view's own section of units sorts by the same rule.
+/// Two orderings for "a list of units" would be two habits to learn.
+pub fn severity(state: ActiveState) -> u8 {
     match state {
         ActiveState::Failed => 0,
         ActiveState::Activating => 1,
@@ -80,9 +87,12 @@ pub fn build_unit_rows<E: Expanded>(
         let title = kind.plural();
         rows.push(Node::SectionHeader { title: title.to_string(), kind: SectionKind::Units, count: Some(members.len() as u32) });
 
-        // Collapsing keys on the section title, which is unique here
-        // because a unit has exactly one type.
-        if !collapsed.contains(title) {
+        // Through `fold_key` rather than straight past it, even though
+        // it hands back the title for this kind: the key a builder looks
+        // up and the key `App::cycle_section` inserts have to come from
+        // one place, which is the property the Nix view's folds lost by
+        // deriving them separately.
+        if !collapsed.contains(&SectionKind::Units.fold_key(title)) {
             match kind {
                 // A timer's own state answers the wrong question - it is
                 // `active` while the job it runs is broken - so its row
@@ -236,7 +246,7 @@ fn slice_tree<E: Expanded>(
 }
 
 /// One unit's row, and its detail row when the unit is open.
-fn unit_rows<E: Expanded>(unit: &Unit, expanded: &E, now_ms: u64, depth: u32, children: bool) -> Vec<Node> {
+pub fn unit_rows<E: Expanded>(unit: &Unit, expanded: &E, now_ms: u64, depth: u32, children: bool) -> Vec<Node> {
     let open = expanded.is_open(&unit.name);
     let mut rows = vec![Node::Unit {
         // 0 is systemd's "no transition recorded", not 1970.
@@ -250,4 +260,67 @@ fn unit_rows<E: Expanded>(unit: &Unit, expanded: &E, now_ms: u64, depth: u32, ch
         rows.push(Node::UnitDetail { unit: unit.clone(), detail: expanded.detail(&unit.name).map(Box::new) });
     }
     rows
+}
+
+/// The unit popup the design mocked up and nothing had ever built.
+///
+/// Runtime, Persistence and Inspect, with the ownership guard marking the
+/// three verbs that write under `/etc/systemd/system`. A marked row is
+/// **still listed and still runnable** - the mark says the effect will
+/// not last, not that the key is dead.
+///
+/// `ownership` is `None` when the read *failed*, which is deliberately
+/// not the same as `Some(Imperative)`. A platform that could not answer
+/// must not be reported as one that answered "nothing else owns this":
+/// the popup marks the rows and says it could not tell, rather than
+/// promising a persistence it never checked.
+///
+/// The chords are the popup's own, from the design's mockup, and they are
+/// not the top-level bindings - `s` starts here where `S` starts outside.
+/// That is what a transient is: its letters are chosen to read together
+/// in one small list, the way magit's are.
+pub fn unit_transient(unit: &str, ownership: Option<&Ownership>) -> TransientDef {
+    let declarative = match ownership {
+        Some(Ownership::Declarative { .. }) | None => true,
+        Some(Ownership::Imperative) => false,
+    };
+    let row_note = match ownership {
+        Some(Ownership::Declarative { reverted_by, .. }) => Some(format!("reverts on {reverted_by}")),
+        None => Some("persistence unknown".to_string()),
+        Some(Ownership::Imperative) => None,
+    };
+    // The `!` is written here rather than by the renderer, because only
+    // this function knows the annotation is a warning - the Nix
+    // transient's `policy: weekly, keep 14d` is not.
+    let group_note = match ownership {
+        Some(Ownership::Declarative { note, .. }) => Some(format!("! {note}")),
+        None => Some("! could not read who owns this unit".to_string()),
+        Some(Ownership::Imperative) => None,
+    };
+
+    let persistence = [('e', "enable", UnitVerb::Enable), ('d', "disable", UnitVerb::Disable), ('m', "mask", UnitVerb::Mask)]
+        .into_iter()
+        .map(|(chord, label, verb)| DefRow { chord, label, note: row_note.clone(), dimmed: declarative, action: Action::Unit(verb) })
+        .collect();
+
+    TransientDef {
+        title: format!("Unit . {unit}"),
+        switches: Vec::new(),
+        groups: vec![
+            DefGroup { heading: "Runtime".to_string(), note: None, rows: runtime_rows() },
+            DefGroup { heading: "Persistence".to_string(), note: group_note, rows: persistence },
+            DefGroup {
+                heading: "Inspect".to_string(),
+                note: None,
+                rows: vec![DefRow { chord: 'l', label: "logs", note: None, dimmed: false, action: Action::Logs }],
+            },
+        ],
+    }
+}
+
+fn runtime_rows() -> Vec<DefRow> {
+    [('s', "start", UnitVerb::Start), ('S', "stop", UnitVerb::Stop), ('r', "restart", UnitVerb::Restart), ('R', "reload", UnitVerb::Reload)]
+        .into_iter()
+        .map(|(chord, label, verb)| DefRow { chord, label, note: None, dimmed: false, action: Action::Unit(verb) })
+        .collect()
 }

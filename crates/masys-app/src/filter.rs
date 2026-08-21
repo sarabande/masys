@@ -58,6 +58,31 @@ fn text_of(node: &Node) -> Option<String> {
         // row you would search for: it is one block of machine facts,
         // always present, and narrowing to it answers nothing.
         Node::Overview(_) => None,
+        // A generation is found by its number or its version: `437` and
+        // `26.11` are both things you would type to reach one, and the
+        // number is what the rollback action names.
+        Node::Generation { generation, .. } => Some(format!("{} {}", generation.id, generation.label.clone().unwrap_or_default())),
+        Node::Input { input, .. } => Some(format!("{} {}", input.name, input.origin.clone().unwrap_or_default())),
+        // The job and the unit behind it, because either is a reasonable
+        // thing to search for: `gc` is what it does, `nix-gc.timer` is
+        // what the systemd view calls it.
+        Node::NixPolicy { job, unit, .. } => Some(format!("{job} {unit}")),
+        // A block of machine facts rather than a row you would search
+        // for, the same judgement `Overview` gets above: it is always
+        // present - the Nix buffer's equivalent of the Status buffer's
+        // System section - and narrowing to it answers nothing.
+        Node::NixStore { .. } => None,
+        // Not a fact block like `NixStore`: this row exists only when
+        // `DeclarativeService::reboot()` returned `Some`, the same
+        // conditional-alert shape as `Finding::ClockUnsynchronized` and
+        // `Finding::SystemDegraded` above, so it gets the same kind of
+        // real search text they do.
+        Node::RebootPending { kernel_changed, initrd_changed, .. } => Some(match (*kernel_changed, *initrd_changed) {
+            (true, true) => "reboot pending kernel initrd changed".to_string(),
+            (true, false) => "reboot pending kernel changed".to_string(),
+            (false, true) => "reboot pending initrd changed".to_string(),
+            (false, false) => "reboot pending".to_string(),
+        }),
         // Structure, or a row whose text belongs to another row: neither
         // is matched on its own. `apply` decides what happens to them.
         Node::UnitDetail { .. } | Node::ProcDetail { .. } | Node::SectionHeader { .. } | Node::Spacer => None,

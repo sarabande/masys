@@ -6,6 +6,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use unicode_width::UnicodeWidthStr;
 
+use masys_domain::declarative::{Generation, Input, kernel_version};
 use masys_domain::finding::{Finding, PressureResource};
 use masys_domain::journal::{Entry, Priority};
 use masys_domain::proc_detail::{Fd, FdTarget, ProcDetail};
@@ -51,6 +52,19 @@ pub fn local_datetime(ms: u64) -> String {
     match local_fields(ms) {
         Some(tm) => format!("{:04}-{:02}-{:02} {:02}:{:02}", tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min),
         None => String::new(),
+    }
+}
+
+/// `YYYY-MM-DD` in local time, for a row where the hour says nothing - an
+/// input's upstream commit is a day, not a minute.
+///
+/// `-` rather than an empty column for a timestamp that cannot be
+/// represented, the same shrug the rest of this module prints for a
+/// reading it does not have.
+fn local_date(ms: u64) -> String {
+    match local_fields(ms) {
+        Some(tm) => format!("{:04}-{:02}-{:02}", tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday),
+        None => "-".to_string(),
     }
 }
 
@@ -1376,4 +1390,314 @@ pub fn overview_lines(overview: &Overview, theme: &Theme) -> Vec<Line<'static>> 
         .filter(|segments| !segments.is_empty())
         .map(|segments| Line::from(Span::styled(format!(". {}", segments.join("  .  ")), Style::default().fg(theme.info))))
         .collect()
+}
+
+/// One generation's row, lifted out of its `Node` so a whole section can
+/// be measured before any of it is drawn. Same shape as `UnitRow`, and
+/// for the same reason: `Node` is not `Clone`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GenerationRow {
+    pub generation: Generation,
+    /// How long ago it was created. `None` where the profile link's mtime
+    /// could not be read, which renders `-`: dating it from the epoch
+    /// would print `20684d`, and a `0` would be a reading rather than an
+    /// admission that there is none.
+    pub age_ms: Option<u64>,
+}
+
+/// Widest a generation's version column is allowed to grow. Nothing
+/// bounds a label - it is whatever the store path carries - and the
+/// system profile's are already 22 columns
+/// (`26.11.20260804.e72e4f2`), so an unusual one must not push the
+/// kernel off the right edge for every other row.
+const GENERATION_LABEL_WIDTH: usize = 24;
+
+/// The three variable columns of a generations section, measured across
+/// the whole section.
+///
+/// Three, where `unit_lines` measures one: the id, the role and the
+/// version all vary, and the profiles differ in every one of them - the
+/// system profile's ids are already three digits wide, with a 22-column
+/// version label, while the home profile's are narrower and carry no
+/// version at all. Neither high-water mark bounds the other, and both
+/// only ever climb, which is why this is measured rather than constant -
+/// the same reason the Nix view's columns are sized the way the systemd
+/// view's one keypress away are.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct GenerationColumns {
+    pub id: usize,
+    pub role: usize,
+    pub label: usize,
+}
+
+impl GenerationColumns {
+    pub fn measure(rows: &[GenerationRow]) -> Self {
+        GenerationColumns {
+            id: rows.iter().map(|row| row.generation.id.to_string().width()).max().unwrap_or(0),
+            role: rows.iter().map(|row| generation_role(&row.generation).width()).max().unwrap_or(0),
+            label: rows
+                .iter()
+                .map(|row| row.generation.label.as_deref().unwrap_or_default().width())
+                .max()
+                .unwrap_or(0)
+                .min(GENERATION_LABEL_WIDTH),
+        }
+    }
+}
+
+/// Which of the two questions this generation answers. Both, on a host
+/// with no reboot pending, which is why they are one column and not two
+/// flags.
+fn generation_role(generation: &Generation) -> &'static str {
+    match (generation.current, generation.booted) {
+        (true, true) => "current, booted",
+        (true, false) => "current",
+        (false, true) => "booted",
+        (false, false) => "",
+    }
+}
+
+/// One generation: which it is, how old, what version, and which kernel.
+///
+/// The marker column carries `*` for current and the role column names
+/// `booted` where it differs, because "which one am I running" and "which
+/// one will I get at the next boot" are two questions and a single
+/// asterisk answers only one of them.
+pub fn generation_line(generation: &Generation, age_ms: Option<u64>, theme: &Theme, columns: GenerationColumns) -> Line<'static> {
+    let GenerationColumns { id: id_width, role: role_width, label: label_width } = columns;
+    let marker = if generation.current { "*" } else { " " };
+    let role = generation_role(generation);
+    // The age, not the timestamp: every other row in masys that carries a
+    // time says how long ago, and `age_ms` arrives precomputed because
+    // nothing in this module is allowed a clock. `-` for a link whose
+    // mtime could not be read - the same shrug `disk_line` prints for a
+    // rate it has not measured, and not a `0` that would read as one.
+    let age = age_ms.map(human_duration).unwrap_or_else(|| "-".to_string());
+    let label = generation.label.clone().unwrap_or_default();
+    let kernel = generation.kernel.as_deref().and_then(kernel_version).unwrap_or_default();
+    // A generation that booted but is no longer current is what the
+    // reboot notice at the top of the buffer is about, so it wears the
+    // same tier here: the list says which row the notice means.
+    let role_style = if generation.booted && !generation.current {
+        Style::default().fg(theme.severity_warning)
+    } else {
+        Style::default().fg(theme.info)
+    };
+    Line::from(vec![
+        Span::styled(format!("{marker} {:>id_width$}  ", generation.id), Style::default().fg(theme.section_header)),
+        Span::styled(format!("{role:<role_width$}  "), role_style),
+        Span::styled(format!("{age:>8}  "), Style::default().fg(theme.info)),
+        // Truncated by the format precision, which counts chars rather
+        // than columns - as in `unit_line`, and sound for the same
+        // reason: a store path's name is ASCII by construction.
+        Span::raw(format!("{label:<label_width$.label_width$}  ")),
+        Span::styled(kernel, Style::default().fg(theme.info)),
+    ])
+}
+
+/// A section's generations, every column sized to the widest of them.
+pub fn generation_lines(rows: &[GenerationRow], theme: &Theme) -> Vec<Line<'static>> {
+    let columns = GenerationColumns::measure(rows);
+    rows.iter().map(|row| generation_line(&row.generation, row.age_ms, theme, columns)).collect()
+}
+
+/// The pending-reboot block.
+///
+/// Two lines, and the second is the one that matters: every other tool on
+/// the host prints "reboot required", and what an operator actually needs
+/// to know is whether it can wait until Friday.
+///
+/// Un-indented, unlike every other row in the buffer, because it stands
+/// where a section header would - `build_nix_rows` gives it no header to
+/// sit under.
+pub fn reboot_lines(node: &Node, theme: &Theme) -> Vec<Line<'static>> {
+    let Node::RebootPending { booted, current, kernel_changed, initrd_changed } = node else {
+        return Vec::new();
+    };
+    // `?` for a store path that matched no generation on the profile - a
+    // booted generation can be deleted out from under the running system,
+    // and inventing a number for it would be worse than admitting the gap.
+    let number = |id: &Option<u64>| id.map(|id| id.to_string()).unwrap_or_else(|| "?".to_string());
+    // What differs, then what that means, on two lines rather than one:
+    // together they run past the right edge of an 80-column terminal,
+    // and the half that would be clipped is the half worth reading.
+    let differs = match (*kernel_changed, *initrd_changed) {
+        (true, true) => "kernel and initrd changed",
+        (true, false) => "kernel changed",
+        (false, true) => "kernel unchanged, initrd changed",
+        (false, false) => "kernel unchanged",
+    };
+    let consequence = match (*kernel_changed, *initrd_changed) {
+        (true, _) => "a reboot is needed to run the current kernel",
+        (false, true) => "the initrd is loaded at boot - a reboot is needed to pick it up",
+        (false, false) => "activation-only - no kernel or initrd change, this can wait",
+    };
+    // The distinction the row exists for, in the colour as well as the
+    // words: an activation-only difference is not the alarm that a kernel
+    // which is not the one running is.
+    let tier = if *kernel_changed || *initrd_changed { theme.severity_urgent } else { theme.severity_warning };
+    vec![
+        Line::from(Span::styled("! reboot pending", Style::default().fg(tier))),
+        Line::from(Span::styled(
+            format!("    booted {} . current {} . {differs}", number(booted), number(current)),
+            Style::default().fg(theme.info),
+        )),
+        Line::from(Span::styled(format!("    {consequence}"), Style::default().fg(theme.info))),
+    ]
+}
+
+/// How far behind an input has to be before its row is marked. Roughly
+/// half a release cycle: NixOS releases every six months and supports one
+/// for about seven, so an input this old predates the current release's
+/// own point updates.
+///
+/// Display only - it marks a row, it does not raise a finding, which is
+/// why it lives here rather than in `masys_domain::finding::Thresholds`.
+const STALE_INPUT_DAYS: u32 = 90;
+
+/// Widest an input's name column grows. Flake input names are short by
+/// convention but nothing enforces it.
+const INPUT_NAME_WIDTH: usize = 24;
+
+/// One pinned input: how old it is, when it was last modified upstream,
+/// and where it came from.
+///
+/// A transitive input is dimmed rather than hidden. A 235-day-old
+/// `flake-compat` inherited through another flake is not the same finding
+/// as a stale `nixpkgs` - one is somebody else's decision and the other
+/// is this configuration's - and the row has to say which it is.
+pub fn input_line(input: &Input, age_days: Option<u32>, theme: &Theme, name_width: usize) -> Line<'static> {
+    // Unknown age is not a stale one: a channel records no upstream
+    // timestamp at all, and marking it would be a finding invented out of
+    // a missing reading.
+    let stale = age_days.is_some_and(|days| days >= STALE_INPUT_DAYS);
+    let (glyph, color) = if stale { ("^", theme.severity_warning) } else { (" ", theme.info) };
+    let age = age_days.map(|days| format!("{days}d")).unwrap_or_else(|| "-".to_string());
+    // Seconds, from the lock. `-` where the lock records none, for the
+    // same reason the age column shrugs rather than printing 1970.
+    let date = input.last_modified_secs.map(|secs| local_date(secs.saturating_mul(1000))).unwrap_or_else(|| "-".to_string());
+    let origin = input.origin.clone().unwrap_or_else(|| "-".to_string());
+    let style = if input.direct { Style::default() } else { Style::default().fg(theme.info) };
+    Line::from(vec![
+        Span::styled(format!("{glyph} "), Style::default().fg(color)),
+        // Truncated by char count, as in `unit_line`: an input name comes
+        // from a flake's attribute set and is ASCII by construction.
+        Span::styled(format!("{:<name_width$.name_width$}  {age:>5}  {date:<10}  {origin}", input.name), style),
+    ])
+}
+
+/// A section's inputs, names padded to a common width.
+pub fn input_lines(rows: &[(Input, Option<u32>)], theme: &Theme) -> Vec<Line<'static>> {
+    let name_width = rows.iter().map(|(input, _)| input.name.width()).max().unwrap_or(0).min(INPUT_NAME_WIDTH);
+    rows.iter().map(|(input, age_days)| input_line(input, *age_days, theme, name_width)).collect()
+}
+
+/// The store block: how full `/nix` is, and what is holding it that way.
+///
+/// This view's equivalent of the Status buffer's System section - always
+/// drawn, and carrying facts rather than a complaint - so it reads like
+/// `overview_lines`: `.`-joined, in the same quiet tier, and several
+/// lines in one block rather than a row apiece.
+pub fn nix_store_lines(node: &Node, theme: &Theme) -> Vec<Line<'static>> {
+    let Node::NixStore { used_percent, free_bytes, system_generations, home_generations, gc_roots } = node else {
+        return Vec::new();
+    };
+    // `-` until `/nix` has been matched among the sampled filesystems. A
+    // store at `0%` with `0B` free is a reading; this is the absence of
+    // one, and the two must not print the same.
+    let used = used_percent.map(|percent| format!("{percent:.0}%")).unwrap_or_else(|| "-".to_string());
+    let free = free_bytes.map(human_bytes).unwrap_or_else(|| "-".to_string());
+    // And `-` for the three counts, for the same reason and against the
+    // sharper version of the same mistake: `0 gc roots` and
+    // `0 system generations` are not merely uninformative, they are
+    // findings - nothing is pinning the store, there is nothing to roll
+    // back to - and a read that never came back has not earned either.
+    let count = |value: &Option<u32>| value.map(|count| count.to_string()).unwrap_or_else(|| "-".to_string());
+    let retained = [
+        format!("{} system generations", count(system_generations)),
+        format!("{} home", count(home_generations)),
+        format!("{} gc roots", count(gc_roots)),
+    ];
+    vec![
+        Line::from(Span::styled(format!("/nix {used}  .  {free} free"), Style::default().fg(theme.info))),
+        Line::from(Span::styled(retained.join("  .  "), Style::default().fg(theme.info))),
+    ]
+}
+
+/// One declared maintenance job's row, lifted out of its `Node` so the
+/// section can be measured. Same shape as `TimerRow`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NixPolicyRow {
+    pub job: String,
+    pub unit: String,
+    /// Three states - see `Node::NixPolicy::retention`, which this
+    /// mirrors field for field.
+    pub retention: Option<Option<String>>,
+    pub next_in_ms: Option<u64>,
+    pub last_ago_ms: Option<u64>,
+    pub enabled: bool,
+}
+
+/// What a job keeps, as a column.
+///
+/// Blank for a job that was read and retains nothing. That is a real
+/// answer, not a missing reading: nothing is retained by optimising at
+/// all, and a `nix-gc.service` with no `--delete-older-than` has genuinely
+/// been given no retention. The row then states the schedule without
+/// claiming a policy.
+///
+/// `-` is reserved for the reading masys could not take, and the two must
+/// not print the same. Blank says "this job keeps nothing", which is a
+/// finding somebody would act on - it is why the column exists - and a
+/// failed read has not earned it.
+fn retention_text(retention: Option<Option<&str>>) -> String {
+    match retention {
+        Some(Some(keep)) => format!("keep {keep}"),
+        Some(None) => String::new(),
+        None => "-".to_string(),
+    }
+}
+
+/// One maintenance job: what it keeps, when it last ran and when it runs
+/// next.
+///
+/// The schedule comes from the job's timer unit and the retention from
+/// the configuration, which is the whole reason the Nix view has this
+/// section rather than pointing at the Timers one.
+pub fn nix_policy_line(row: &NixPolicyRow, theme: &Theme, job_width: usize, retention_width: usize) -> Line<'static> {
+    // A gc timer that is switched off is what this row exists to surface:
+    // nothing else on the host reports that the store will now grow until
+    // the disk fills.
+    let (glyph, color) = if row.enabled { (".", theme.info) } else { ("~", theme.severity_warning) };
+    let retention = retention_text(row.retention.as_ref().map(|keep| keep.as_deref()));
+    // The same words the Timers section uses for the same two absences,
+    // so a schedule reads the same in both views.
+    let last = match row.last_ago_ms {
+        Some(ago) => format!("last {} ago", human_duration(ago)),
+        None => "never run".to_string(),
+    };
+    let next = match row.next_in_ms {
+        Some(left) => format!("next in {}", human_duration(left)),
+        None => "not scheduled".to_string(),
+    };
+    // Named only when it is not the obvious one, the same rule
+    // `timer_line` applies to the unit a timer activates.
+    let tail = if row.unit == format!("nix-{}.timer", row.job) { String::new() } else { format!("  {}", row.unit) };
+    let disabled = if row.enabled { "" } else { "  disabled" };
+    Line::from(vec![
+        Span::styled(format!("{glyph} "), Style::default().fg(color)),
+        Span::styled(
+            format!("{:<job_width$}  {retention:<retention_width$}  {last:<18}{next:<18}{tail}{disabled}", row.job),
+            if row.enabled { Style::default() } else { Style::default().fg(theme.severity_warning) },
+        ),
+    ])
+}
+
+/// The declared policy, job and retention columns sized to the widest of
+/// them.
+pub fn nix_policy_lines(rows: &[NixPolicyRow], theme: &Theme) -> Vec<Line<'static>> {
+    let job_width = rows.iter().map(|row| row.job.width()).max().unwrap_or(0);
+    let retention_width =
+        rows.iter().map(|row| retention_text(row.retention.as_ref().map(|keep| keep.as_deref())).width()).max().unwrap_or(0);
+    rows.iter().map(|row| nix_policy_line(row, theme, job_width, retention_width)).collect()
 }

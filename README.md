@@ -21,7 +21,7 @@ A healthy machine produces a nearly empty screen:
 
  --------------------------------------------------------------------------
  [/] filter
- [1] status  [2] procs  [3] systemd  [4] io  [g] refresh  [?] keys  [q] quit
+ [1] status  [2] procs  [3] systemd  [4] io  [5] nix  [g] refresh  [?] keys  [q] quit
 ```
 
 An unhealthy one puts the problems under it, worst first:
@@ -41,20 +41,69 @@ An unhealthy one puts the problems under it, worst first:
    ^ /  91%   82G free   .  412 generations
 ```
 
-## Views
+## Buffers
 
-| Key | View | What it answers |
-|-----|------|-----------------|
+| Key | Buffer | What it answers |
+|-----|--------|-----------------|
 | `1` | Status | What needs attention right now |
 | `2` | Procs | What is running, grouped by the cgroup that owns it |
 | `3` | systemd | What the units are doing, why, and what to do about it |
 | `4` | IO | What the disks, filesystems and links are carrying |
+| `5` | Nix | What the running system and its declared configuration disagree about |
 | `l` | Log | What one unit said — reached from a unit, left with `esc` |
+
+`5` exists only on a host with a declarative platform adapter — NixOS
+today. On Debian or Arch it is unbound and `?` does not list it: there is
+no declared configuration for the buffer to compare the machine against, so
+there is nothing there for a digit to open.
+
+It carries the same triage thesis as the top of this file: a host with no
+pending reboot, a fresh lock and a healthy store reduces to four quiet
+lists. This one has a reboot pending, and says whether it can wait:
+
+```
+ Nix
+
+ ! reboot pending
+     booted 427 . current 438 . kernel unchanged
+     activation-only - no kernel or initrd change, this can wait
+
+ Store
+   /nix 83%  .  155G free
+   37 system generations  .  5 home  .  77 gc roots
+   . gc        keep 14d  last 4d 13h ago   next in 2d 2h
+   . optimise            last 13h 30m ago  next in 6h 10m
+
+ System generations (37)
+   * 438  current       38m  26.11.20260804.e72e4f2  6.18.42
+     427  booted      4d 1h  26.11.20260804.e72e4f2  6.18.42
+
+ Inputs (6)  lock e72e4f2 . running e72e4f2 . in sync
+     nixpkgs         17d  2026-08-04  NixOS/nixpkgs
+   ^ flake-compat   235d  2025-12-29  edolstra/flake-compat
+```
+
+masys reads the profile symlinks and the flake lock directly, and shows
+what they say. `e` opens the operations on what it found — the eighteen
+`nixos-rebuild`, `nix`, `nix-env` and `nix-channel` invocations worth
+having, grouped, with the generation under the cursor named in the group
+that acts on it.
+
+Rows that cannot act here are **marked and still listed**, each with the
+reason: `no channels on this host` on a flake machine, `activated by
+nixos-rebuild switch` where home-manager is a module, `profile is
+read-only - run masys as root` where it is. Nothing is hidden, because a
+row that vanishes teaches nothing and a row that says why teaches
+something true about the machine.
+
+Anything that changes the system asks first, and anything that takes the
+terminal gets it: a rebuild streams its own output for as long as it
+runs, rather than being captured and shown once it has finished.
 
 Keys are global only when they mean the same thing everywhere: `n`/`p`
 move between sections, `tab` folds, `/` filters, `g` refreshes, `q` quits.
-Everything else belongs to the view under the cursor, so `r` can mean
-restart in one view without being spent in the others.
+Everything else belongs to the buffer under the cursor, so `r` can mean
+restart in one buffer without being spent in the others.
 
 Press `?` for the full map, which is generated from the live keymap rather
 than written out — a key that has been rebound shows its new chord.
@@ -103,8 +152,17 @@ cargo build --release
 ```
 
 Runs unprivileged. Everything it can read without privileges, it reads;
-anything it cannot is reported as absent rather than as an error, and the
-actions that need root will say so when they are refused.
+anything it cannot is reported as absent rather than as an error.
+
+Acting is a different question, and masys answers it per action. Unit
+verbs shell out to `systemctl`, which raises polkit, so an ordinary user
+can be granted them. The NixOS operations that write a root-owned profile
+- activating a generation, collecting the store - have no such mechanism:
+`nix-env` and `nix-collect-garbage` take no elevation flag and raise no
+polkit action. masys checks whether the profile directories can be
+written and marks those keys in the footer where they cannot, rather than
+starting a command that would delete some generations and then fail
+partway. Run masys as root to use them.
 
 ### Optional: following logs live
 

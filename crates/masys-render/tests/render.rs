@@ -8,14 +8,19 @@ mod fake;
 
 use fake::{FakePlatformService, FakeSystemService};
 use masys_app::App;
+use masys_domain::declarative::{Generation, Input, ProfileKind};
 use masys_domain::finding::{Finding, PressureResource};
 use masys_domain::sample::{Pressure, Snapshot, SystemState};
 use masys_domain::unit::{ActiveState, Unit, UnitKind};
 use masys_render::render;
 use masys_render::theme::Theme;
-use masys_view::{Header, KeyBinding, KeyGroup, ModalView, Node, Overview, SectionKind, StatusLine, View};
+use masys_view::{
+    ActionGroup, ActionRow, CandidateList, Header, KeyBinding, KeyGroup, ModalView, Node, Overview, SectionKind, StatusLine, SwitchRow,
+    View,
+};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
+use ratatui::style::Modifier;
 use unicode_width::UnicodeWidthStr;
 
 const WIDTH: u16 = 80;
@@ -892,4 +897,509 @@ fn a_cursor_landing_on_a_detail_row_still_draws_the_buffer() {
     let rows = opened_process(60);
     let lines = draw_rows(&rows, Some(1));
     assert!(lines.iter().any(|l| l.contains("cmdline")), "{lines:#?}");
+}
+
+/// `row_item` returns `Line::default()` for every variant `build_items`
+/// batches - `Generation`, `Input` and `NixPolicy` among them - because
+/// the real text is built by `view::generation_lines` and friends, called
+/// only from `build_items`' own batching arm. Delete that arm (or blank
+/// `row_item`'s `RebootPending` dispatch, which is not batched at all)
+/// and every one of these rows renders as an empty line while
+/// `tests/view.rs` - which calls `view::generation_lines` et al. directly
+/// - stays entirely green. Only a real frame proves the row actually
+/// gets there.
+///
+/// The same hole exists for `Unit`, `Timer`, `Disk` and `Filesystem`, and
+/// is out of scope here: this closes it for the Nix view alone.
+#[test]
+fn every_nix_row_type_reaches_the_frame() {
+    let rows = vec![
+        // Un-indented and headerless, so it also proves the one row that
+        // is not batched at all still reaches `row_item`'s real arm.
+        Node::RebootPending { booted: Some(41), current: Some(42), kernel_changed: true, initrd_changed: false },
+        Node::Spacer,
+        header("Store", SectionKind::NixStore, None),
+        Node::NixStore {
+            used_percent: Some(62.0),
+            free_bytes: Some(120_000_000_000),
+            system_generations: Some(5),
+            home_generations: Some(2),
+            gc_roots: Some(3),
+        },
+        Node::NixPolicy {
+            job: "gc".to_string(),
+            unit: "nix-gc.timer".to_string(),
+            retention: Some(Some("14d".to_string())),
+            next_in_ms: Some(3_600_000),
+            last_ago_ms: Some(7_200_000),
+            enabled: true,
+        },
+        Node::Spacer,
+        header("System generations", SectionKind::Generations(ProfileKind::System), Some(1)),
+        Node::Generation {
+            generation: Generation {
+                id: 42,
+                created_ms: Some(0),
+                store_path: Some("/nix/store/42-nixos-system".to_string()),
+                label: Some("26.11.20260804.abc1234".to_string()),
+                kernel: None,
+                current: true,
+                booted: false,
+            },
+            kind: ProfileKind::System,
+            age_ms: Some(3_600_000),
+        },
+        Node::Spacer,
+        header("Inputs", SectionKind::Inputs, Some(1)),
+        Node::Input {
+            input: Input {
+                name: "nixpkgs".to_string(),
+                origin: Some("NixOS/nixpkgs".to_string()),
+                rev: Some("abc1234".to_string()),
+                last_modified_secs: Some(1_700_000_000),
+                direct: true,
+            },
+            age_days: Some(10),
+        },
+    ];
+
+    let lines = draw("nixbox", &rows, StatusLine::Hints);
+
+    assert!(lines.iter().any(|l| l.contains("reboot pending")), "RebootPending never reached the frame: {lines:#?}");
+    assert!(lines.iter().any(|l| l.contains("booted 41") && l.contains("current 42")), "{lines:#?}");
+    assert!(lines.iter().any(|l| l.contains("/nix 62%")), "NixStore never reached the frame: {lines:#?}");
+    assert!(lines.iter().any(|l| l.contains("5 system generations")), "{lines:#?}");
+    assert!(lines.iter().any(|l| l.contains("gc") && l.contains("keep 14d")), "NixPolicy never reached the frame: {lines:#?}");
+    assert!(lines.iter().any(|l| l.contains("42") && l.contains("26.11.20260804")), "Generation never reached the frame: {lines:#?}");
+    assert!(lines.iter().any(|l| l.contains("nixpkgs") && l.contains("NixOS/nixpkgs")), "Input never reached the frame: {lines:#?}");
+}
+/// The unit popup the design mocks up, drawn for real. Every assertion
+/// here is about *placement*, because a transient's whole claim is that
+/// it can be read by position: the same action sits in the same place
+/// whether or not it applies here.
+fn unit_popup(ownership_note: Option<&str>) -> ModalView<'static> {
+    ModalView::Transient {
+        title: "Unit . restic-backup.service".to_string(),
+        switches: Vec::new(),
+        groups: vec![
+            ActionGroup {
+                heading: "Runtime".to_string(),
+                note: None,
+                rows: vec![
+                    ActionRow { chord: 's', label: "start", note: None, dimmed: false },
+                    ActionRow { chord: 'S', label: "stop", note: None, dimmed: false },
+                    ActionRow { chord: 'r', label: "restart", note: None, dimmed: false },
+                    ActionRow { chord: 'R', label: "reload", note: None, dimmed: false },
+                ],
+            },
+            ActionGroup {
+                heading: "Persistence".to_string(),
+                note: ownership_note.map(str::to_string),
+                rows: ['e', 'd', 'm']
+                    .into_iter()
+                    .zip(["enable", "disable", "mask"])
+                    .map(|(chord, label)| ActionRow {
+                        chord,
+                        label,
+                        note: ownership_note.map(|_| "reverts on nixos-rebuild".to_string()),
+                        dimmed: ownership_note.is_some(),
+                    })
+                    .collect(),
+            },
+            ActionGroup {
+                heading: "Inspect".to_string(),
+                note: None,
+                rows: vec![
+                    ActionRow { chord: 'l', label: "logs", note: None, dimmed: false },
+                    ActionRow { chord: 'p', label: "properties", note: None, dimmed: false },
+                ],
+            },
+        ],
+    }
+}
+
+fn draw_modal_frame(modal: ModalView<'_>, width: u16, height: u16) -> Vec<String> {
+    let theme = Theme::default();
+    let hints: [KeyBinding; 0] = [];
+    let rows = system_section();
+    let model = View {
+        header: Header::Status { hostname: "devbox", timestamp: TIMESTAMP },
+        rows: &rows,
+        selected: None,
+        status: StatusLine::Hints,
+        modal: Some(modal),
+        hints: &hints,
+        actions: &[],
+        filter: None,
+        typing: false,
+        filter_matches: None,
+        auto_refresh_paused: false,
+    };
+    let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("a test terminal");
+    terminal
+        .draw(|frame| {
+            render(frame, &model, &theme);
+        })
+        .expect("a drawn frame");
+    buffer_lines(&terminal)
+}
+
+/// The transient renders at all. It returned `(0, 0)` and drew nothing
+/// until this change, so the first thing worth pinning is that its
+/// groups, chords and title reach the cells.
+#[test]
+fn a_transient_draws_its_title_groups_and_chords() {
+    let lines = draw_modal_frame(unit_popup(None), WIDTH, HEIGHT);
+
+    assert!(lines.iter().any(|l| l.contains("Unit . restic-backup.service")), "the popup names its subject: {lines:#?}");
+    for heading in ["Runtime", "Persistence", "Inspect"] {
+        assert!(lines.iter().any(|l| l.contains(heading)), "{heading} is missing: {lines:#?}");
+    }
+    for label in ["start", "stop", "restart", "reload", "enable", "disable", "mask", "logs", "properties"] {
+        assert!(lines.iter().any(|l| l.contains(label)), "{label} is missing: {lines:#?}");
+    }
+    for line in &lines {
+        assert!(UnicodeWidthStr::width(line.as_str()) <= WIDTH as usize, "{line:?} runs past the frame");
+    }
+}
+
+/// The design draws `s start` and `S stop` on one line. A group with no
+/// notes pairs its rows, which is what makes a four-action group two
+/// lines rather than four.
+#[test]
+fn a_group_with_no_notes_pairs_its_rows_two_to_a_line() {
+    let lines = draw_modal_frame(unit_popup(None), WIDTH, HEIGHT);
+
+    let paired = lines.iter().find(|l| l.contains("start")).expect("a start row");
+    assert!(paired.contains("stop"), "start and stop share a line: {paired:?}");
+    let second = lines.iter().find(|l| l.contains("restart")).expect("a restart row");
+    assert!(second.contains("reload"), "restart and reload share a line: {second:?}");
+    assert!(lines.iter().find(|l| l.contains("logs")).is_some_and(|l| l.contains("properties")), "a two-row group is one line: {lines:#?}");
+}
+
+/// The ownership guard, drawn. A group note trails its heading and each
+/// dimmed row keeps its own note - and, crucially, every row is still
+/// *there*: masys marks an action it cannot make persist, it never drops
+/// it.
+#[test]
+fn the_ownership_guard_notes_the_group_and_keeps_every_row() {
+    let lines = draw_modal_frame(unit_popup(Some("! declared in nix")), WIDTH, HEIGHT);
+
+    let heading = lines.iter().find(|l| l.contains("Persistence")).expect("a Persistence heading");
+    assert!(heading.contains("! declared in nix"), "the group note trails the heading, marker and all: {heading:?}");
+    for label in ["enable", "disable", "mask"] {
+        let row = lines.iter().find(|l| l.contains(label)).unwrap_or_else(|| panic!("{label} is still listed: {lines:#?}"));
+        assert!(row.contains("reverts on nixos-rebuild"), "{label} says why it is dimmed: {row:?}");
+    }
+}
+
+/// An annotated group goes one row to a line, so a note always sits
+/// beside the row it belongs to. Paired, `enable`'s note would sit next
+/// to `disable` and read as `disable`'s.
+#[test]
+fn an_annotated_group_goes_one_row_to_a_line() {
+    let lines = draw_modal_frame(unit_popup(Some("! declared in nix")), WIDTH, HEIGHT);
+
+    let enable = lines.iter().find(|l| l.contains("enable")).expect("an enable row");
+    assert!(!enable.contains("disable"), "a noted row does not share its line: {enable:?}");
+}
+
+/// Dimming is a style, not an omission. The cells say so: a dimmed row
+/// carries `Modifier::DIM` and a live one does not, while both occupy a
+/// real position in the popup.
+#[test]
+fn a_dimmed_row_is_styled_dim_and_a_live_one_is_not() {
+    let theme = Theme::default();
+    let hints: [KeyBinding; 0] = [];
+    let rows = system_section();
+    let model = View {
+        header: Header::Status { hostname: "devbox", timestamp: TIMESTAMP },
+        rows: &rows,
+        selected: None,
+        status: StatusLine::Hints,
+        modal: Some(unit_popup(Some("! declared in nix"))),
+        hints: &hints,
+        actions: &[],
+        filter: None,
+        typing: false,
+        filter_matches: None,
+        auto_refresh_paused: false,
+    };
+    let mut terminal = Terminal::new(TestBackend::new(WIDTH, HEIGHT)).expect("a test terminal");
+    terminal
+        .draw(|frame| {
+            render(frame, &model, &theme);
+        })
+        .expect("a drawn frame");
+
+    let buffer = terminal.backend().buffer();
+    let dim_at = |needle: &str| {
+        let (x, y) = (0..buffer.area.height)
+            .find_map(|y| {
+                let line: String = (0..buffer.area.width).map(|x| buffer[(x, y)].symbol()).collect();
+                line.find(needle).map(|x| (x as u16, y))
+            })
+            .unwrap_or_else(|| panic!("{needle} is drawn somewhere"));
+        buffer[(x, y)].style().add_modifier.contains(Modifier::DIM)
+    };
+
+    assert!(dim_at("mask"), "a row the guard dims is drawn dim");
+    assert!(!dim_at("restart"), "a row the guard does not dim is drawn normally");
+}
+
+/// Switches lead, grouped, with their state already resolved into a box
+/// the reader can see. An unsupported switch is listed and dimmed rather
+/// than dropped, for the same reason a dimmed action row is.
+#[test]
+fn switches_are_drawn_above_the_actions_with_their_state_resolved() {
+    let modal = ModalView::Transient {
+        title: "Rebuild".to_string(),
+        switches: vec![
+            SwitchRow { group: "Arguments", chord: "-v", label: "verbose", supported: true, on: true },
+            SwitchRow { group: "Arguments", chord: "-n", label: "dry run", supported: true, on: false },
+            SwitchRow { group: "Arguments", chord: "-i", label: "impure", supported: false, on: false },
+        ],
+        groups: vec![ActionGroup {
+            heading: "Rebuild".to_string(),
+            note: None,
+            rows: vec![ActionRow { chord: 's', label: "switch", note: None, dimmed: false }],
+        }],
+    };
+    let lines = draw_modal_frame(modal, WIDTH, HEIGHT);
+
+    let verbose = lines.iter().position(|l| l.contains("verbose")).expect("a verbose switch");
+    let switch = lines.iter().position(|l| l.contains("switch")).expect("a switch action");
+    assert!(verbose < switch, "switches are read before the actions they change: {lines:#?}");
+
+    assert!(lines[verbose].contains("[x]"), "an enabled switch is ticked: {:?}", lines[verbose]);
+    assert!(lines.iter().any(|l| l.contains("dry run") && l.contains("[ ]")), "a disabled switch is empty: {lines:#?}");
+    assert!(lines.iter().any(|l| l.contains("impure")), "an unsupported switch is still listed: {lines:#?}");
+}
+
+/// A transient longer than the terminal reports what it got and what it
+/// wanted, which is what `Metrics` is for and what a scrolling modal will
+/// read. Phase 3's Nix transient is the long one.
+///
+/// Asserted on `Metrics` rather than on cells because the cells cannot
+/// tell: ratatui 0.30 clips a `Block` to the buffer itself, so an
+/// unclamped popup draws the same frame as a clamped one. The height is
+/// still worth clamping - `modal_height` is documented as the height the
+/// popup *got*, and an unclamped one reports a height that was never
+/// drawn.
+#[test]
+fn a_transient_taller_than_the_frame_reports_what_it_could_not_show() {
+    let theme = Theme::default();
+    let hints: [KeyBinding; 0] = [];
+    let rows = system_section();
+    let model = View {
+        header: Header::Status { hostname: "devbox", timestamp: TIMESTAMP },
+        rows: &rows,
+        selected: None,
+        status: StatusLine::Hints,
+        modal: Some(ModalView::Transient {
+            title: "Everything".to_string(),
+            switches: Vec::new(),
+            groups: (0..12)
+                .map(|group| ActionGroup {
+                    heading: format!("Group {group}"),
+                    note: None,
+                    rows: vec![ActionRow { chord: 'a', label: "an action", note: Some("a note".to_string()), dimmed: false }],
+                })
+                .collect(),
+        }),
+        hints: &hints,
+        actions: &[],
+        filter: None,
+        typing: false,
+        filter_matches: None,
+        auto_refresh_paused: false,
+    };
+    const SHORT: u16 = 12;
+    let mut terminal = Terminal::new(TestBackend::new(WIDTH, SHORT)).expect("a test terminal");
+    let mut metrics = None;
+    terminal
+        .draw(|frame| {
+            metrics = Some(render(frame, &model, &theme));
+        })
+        .expect("a drawn frame");
+    let metrics = metrics.expect("a drawn frame reports its metrics");
+
+    assert!(metrics.modal_height <= SHORT, "the popup is never taller than the frame: {metrics:?}");
+    assert!(metrics.modal_content > metrics.modal_height, "and it says how much it could not show: {metrics:?}");
+
+    let lines = buffer_lines(&terminal);
+    assert!(!lines.iter().any(|l| l.contains("Group 11")), "content past the frame is clipped, not grown into: {lines:#?}");
+    for line in &lines {
+        assert!(UnicodeWidthStr::width(line.as_str()) <= WIDTH as usize, "{line:?} runs past the frame");
+    }
+}
+
+/// The `Input` sub-step draws its prompt, what has been typed, and its
+/// candidates - the last of which was dropped on the floor until now.
+#[test]
+fn an_input_draws_its_prompt_typed_text_and_candidates() {
+    let lines = draw_modal_frame(
+        ModalView::Input {
+            prompt: "retention",
+            typed: "30",
+            candidates: Some(CandidateList { matches: vec!["30d", "60d", "90d"], selected: 1 }),
+        },
+        WIDTH,
+        HEIGHT,
+    );
+
+    assert!(lines.iter().any(|l| l.contains("retention: 30")), "the prompt and the typed text: {lines:#?}");
+    for candidate in ["30d", "60d", "90d"] {
+        assert!(lines.iter().any(|l| l.contains(candidate)), "{candidate} is offered: {lines:#?}");
+    }
+    assert!(lines.iter().any(|l| l.contains("input")), "the popup is titled for what it is: {lines:#?}");
+}
+
+/// The highlighted candidate is reversed, which is what a cursor looks
+/// like everywhere else in masys. Without it the popup lists three
+/// choices and gives no way to tell which one enter would take.
+#[test]
+fn the_selected_candidate_is_the_only_one_reversed() {
+    let theme = Theme::default();
+    let hints: [KeyBinding; 0] = [];
+    let rows = system_section();
+    let model = View {
+        header: Header::Status { hostname: "devbox", timestamp: TIMESTAMP },
+        rows: &rows,
+        selected: None,
+        status: StatusLine::Hints,
+        modal: Some(ModalView::Input {
+            prompt: "retention",
+            typed: "30",
+            candidates: Some(CandidateList { matches: vec!["30d", "60d", "90d"], selected: 1 }),
+        }),
+        hints: &hints,
+        actions: &[],
+        filter: None,
+        typing: false,
+        filter_matches: None,
+        auto_refresh_paused: false,
+    };
+    let mut terminal = Terminal::new(TestBackend::new(WIDTH, HEIGHT)).expect("a test terminal");
+    terminal
+        .draw(|frame| {
+            render(frame, &model, &theme);
+        })
+        .expect("a drawn frame");
+
+    let buffer = terminal.backend().buffer();
+    let reversed = |needle: &str| {
+        let (x, y) = (0..buffer.area.height)
+            .find_map(|y| {
+                let line: String = (0..buffer.area.width).map(|x| buffer[(x, y)].symbol()).collect();
+                line.find(needle).map(|x| (x as u16, y))
+            })
+            .unwrap_or_else(|| panic!("{needle} is drawn somewhere"));
+        buffer[(x, y)].style().add_modifier.contains(Modifier::REVERSED)
+    };
+
+    assert!(reversed("60d"), "the selected candidate carries the cursor");
+    assert!(!reversed("30d"), "an unselected candidate does not");
+    assert!(!reversed("90d"), "and neither does the one after it");
+}
+
+/// A picker with nothing to offer says so. Drawn as blank space, an empty
+/// match set reads as a picker still thinking.
+#[test]
+fn a_picker_with_no_matches_says_so() {
+    let lines = draw_modal_frame(
+        ModalView::Input { prompt: "package", typed: "zzz", candidates: Some(CandidateList { matches: Vec::new(), selected: 0 }) },
+        WIDTH,
+        HEIGHT,
+    );
+
+    assert!(lines.iter().any(|l| l.contains("no matches")), "{lines:#?}");
+}
+
+/// An input that takes free text rather than a choice carries no
+/// candidate list at all, and draws as one line.
+#[test]
+fn an_input_with_no_candidates_draws_only_its_prompt() {
+    let lines = draw_modal_frame(ModalView::Input { prompt: "query", typed: "ripgrep", candidates: None }, WIDTH, HEIGHT);
+
+    assert!(lines.iter().any(|l| l.contains("query: ripgrep")), "{lines:#?}");
+    assert!(!lines.iter().any(|l| l.contains("no matches")), "nothing is invented to fill the space: {lines:#?}");
+}
+
+/// A group note is drawn as written. The Nix transient's `Store` group is
+/// annotated `policy: weekly, keep 14d`, which is a fact rather than a
+/// warning - a renderer that decorated every note with `!` would report
+/// a retention policy as an alarm.
+#[test]
+fn a_group_note_is_drawn_as_written_without_an_invented_marker() {
+    let modal = ModalView::Transient {
+        title: "Nix ops".to_string(),
+        switches: Vec::new(),
+        groups: vec![ActionGroup {
+            heading: "Store".to_string(),
+            note: Some("policy: weekly, keep 14d".to_string()),
+            rows: vec![ActionRow { chord: 'o', label: "optimise", note: None, dimmed: false }],
+        }],
+    };
+    let lines = draw_modal_frame(modal, WIDTH, HEIGHT);
+
+    let heading = lines.iter().find(|l| l.contains("Store")).expect("a Store heading");
+    assert!(heading.contains("policy: weekly, keep 14d"), "{heading:?}");
+    assert!(!heading.contains('!'), "the renderer adds no marker of its own: {heading:?}");
+}
+
+/// The whole path, for the transient: a real session opens the popup on a
+/// real unit row and a real frame draws it. Every other transient test
+/// here hand-builds its `ModalView`, which cannot catch a `TransientDef`
+/// whose projection and the renderer disagree.
+#[test]
+fn app_key_to_render_draws_the_unit_popup_on_a_real_frame() {
+    let (system, platform) = degraded_host();
+    let mut app = App::new(Box::new(system), Box::new(platform), Box::new(fake::NoScanner), "devbox".to_string());
+    app.tick(10_800_000, TIMESTAMP.to_string()).expect("tick");
+
+    // Into the systemd buffer, then off its section header onto a unit.
+    app.handle_key(masys_app::Key::char('3'));
+    app.handle_key(masys_app::Key::new(masys_app::KeyCode::Down));
+    app.handle_key(masys_app::Key::char('e'));
+
+    let theme = Theme::default();
+    let mut terminal = Terminal::new(TestBackend::new(WIDTH, HEIGHT)).expect("a test terminal");
+    terminal
+        .draw(|frame| {
+            render(frame, &app.view(), &theme);
+        })
+        .expect("a drawn frame");
+    let lines = buffer_lines(&terminal);
+
+    assert!(lines.iter().any(|l| l.contains("Unit .")), "the popup names its unit: {lines:#?}");
+    for expected in ["Runtime", "start", "stop", "Persistence", "enable", "Inspect", "logs"] {
+        assert!(lines.iter().any(|l| l.contains(expected)), "{expected:?} is missing from {lines:#?}");
+    }
+    for line in &lines {
+        assert!(UnicodeWidthStr::width(line.as_str()) <= WIDTH as usize, "{line:?} runs past the frame");
+    }
+}
+
+/// A popup wider in its title than in its rows is sized to the title. A
+/// transient names the thing it acts on, and that name is routinely
+/// longer than `start` or `stop` - sized to the rows alone, the border
+/// clipped the one part of the popup that says what you are about to act
+/// on.
+#[test]
+fn a_popup_is_wide_enough_for_its_title() {
+    let modal = ModalView::Transient {
+        title: "Unit . a-very-long-unit-name.service".to_string(),
+        switches: Vec::new(),
+        groups: vec![ActionGroup {
+            heading: "Runtime".to_string(),
+            note: None,
+            rows: vec![ActionRow { chord: 's', label: "start", note: None, dimmed: false }],
+        }],
+    };
+    let lines = draw_modal_frame(modal, WIDTH, HEIGHT);
+
+    let title = lines.iter().find(|l| l.contains("a-very-long-unit-name.service")).expect("a titled popup");
+    assert!(title.contains("a-very-long-unit-name.service "), "the title keeps the padding it was written with: {title:?}");
+    assert!(title.ends_with('\u{2510}'), "and the border closes after it: {title:?}");
 }

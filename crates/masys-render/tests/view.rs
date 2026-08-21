@@ -1,3 +1,4 @@
+use masys_domain::declarative::{Generation, Input};
 use masys_domain::finding::{Finding, PressureResource};
 use masys_domain::journal::{Entry, Priority};
 use masys_domain::platform::PendingReboot;
@@ -7,8 +8,10 @@ use masys_domain::sample::{Filesystem, Proc, ProcState, SystemState};
 use masys_domain::unit::{ActiveState, Unit, UnitKind};
 use masys_render::theme::Theme;
 use masys_render::view::{
-    ProcColumns, ProcRow, filesystem_lines, finding_line, finding_lines, gauge, human_bytes, human_duration, interface_line, journal_lines,
-    overview_lines, proc_columns_header, proc_detail_lines, proc_group_line, proc_lines, section_header_line, unit_lines,
+    GenerationColumns, GenerationRow, NixPolicyRow, ProcColumns, ProcRow, filesystem_lines, finding_line, finding_lines, gauge,
+    generation_line, generation_lines, human_bytes, human_duration, input_lines, interface_line, journal_lines, nix_policy_lines,
+    nix_store_lines, overview_lines, proc_columns_header, proc_detail_lines, proc_group_line, proc_lines, reboot_lines,
+    section_header_line, unit_lines,
 };
 use masys_view::{Node, Overview};
 use ratatui::style::{Color, Modifier};
@@ -1331,4 +1334,409 @@ fn a_unit_row_is_coloured_by_its_state() {
     assert_eq!(colour(ActiveState::Reloading), Some(theme.severity_warning));
     assert_eq!(colour(ActiveState::Inactive), Some(theme.info), "inactive recedes");
     assert_eq!(colour(ActiveState::Active), None, "and a healthy unit is plain text, so the others stand out");
+}
+
+/// A system-profile generation: numbered, versioned, and with a kernel.
+/// The home profile carries neither of the last two, which
+/// `a_bare_generation` is for.
+fn a_generation(id: u64, current: bool, booted: bool, label: &str) -> Generation {
+    Generation {
+        id,
+        created_ms: Some(1_700_000_000_000),
+        store_path: Some(format!("/nix/store/g{id}-nixos-system")),
+        label: Some(label.to_string()),
+        kernel: Some("/nix/store/k1-linux-6.18.42/bzImage".to_string()),
+        current,
+        booted,
+    }
+}
+
+/// A generation with no version and no kernel, as the home profile's are.
+fn a_bare_generation(id: u64, current: bool, booted: bool) -> Generation {
+    Generation { label: None, kernel: None, ..a_generation(id, current, booted, "") }
+}
+
+fn generation_row(generation: Generation, age_ms: Option<u64>) -> GenerationRow {
+    GenerationRow { generation, age_ms }
+}
+
+fn an_input(name: &str, origin: Option<&str>, last_modified_secs: Option<u64>, direct: bool) -> Input {
+    Input { name: name.to_string(), origin: origin.map(str::to_string), rev: None, last_modified_secs, direct }
+}
+
+/// `retention` is the *read* answer: `None` here is the port saying this
+/// job declares none, which is the blank column. The unread state has its
+/// own test.
+fn a_policy(job: &str, retention: Option<&str>, enabled: bool) -> NixPolicyRow {
+    NixPolicyRow {
+        job: job.to_string(),
+        unit: format!("nix-{job}.timer"),
+        retention: Some(retention.map(str::to_string)),
+        next_in_ms: Some(187_200_000),
+        last_ago_ms: Some(345_600_000),
+        enabled,
+    }
+}
+
+/// A row's text with its right-hand padding dropped, which is what the
+/// terminal shows: `render`'s own test helper trims the cells the same way.
+fn trimmed(line: &Line) -> String {
+    text(line).trim_end().to_string()
+}
+
+/// A whole block, joined - for the two Nix rows that are several lines.
+fn block(lines: &[Line]) -> String {
+    lines.iter().map(trimmed).collect::<Vec<_>>().join("\n")
+}
+
+#[test]
+fn the_current_generation_is_marked_and_the_booted_one_is_named() {
+    let theme = Theme::default();
+    let columns = GenerationColumns::measure(&[]);
+    let current = text(&generation_line(&a_generation(437, true, false, "26.11"), Some(3_600_000), &theme, columns));
+    let booted = text(&generation_line(&a_generation(427, false, true, "26.11"), Some(3_600_000), &theme, columns));
+
+    assert!(current.contains("437") && current.contains("current"), "{current:?}");
+    assert!(booted.contains("427") && booted.contains("booted"), "{booted:?}");
+    // The asterisk answers "which will I get at the next boot"; only the
+    // word answers "which am I running".
+    assert!(current.starts_with('*'), "{current:?}");
+    assert!(!booted.starts_with('*'), "{booted:?}");
+    assert!(!booted.contains("current"), "and the row that is not current does not say it is: {booted:?}");
+}
+
+#[test]
+fn a_generation_shows_its_version_and_kernel() {
+    let theme = Theme::default();
+    let rows = [generation_row(a_generation(437, true, false, "26.11.20260804.e72e4f2"), Some(3_600_000))];
+    let line = text(&generation_lines(&rows, &theme)[0]);
+    assert!(line.contains("26.11.20260804.e72e4f2"), "{line:?}");
+    assert!(line.contains("6.18.42"), "the version out of the kernel store path, not the path: {line:?}");
+    assert!(!line.contains("/nix/store"), "{line:?}");
+}
+
+/// The kernel column is parsed out of a store path, so a path that is not
+/// one has to come back empty rather than confidently wrong.
+#[test]
+fn a_kernel_path_that_names_no_version_leaves_the_column_blank() {
+    let theme = Theme::default();
+    let mut generation = a_generation(437, true, false, "26.11");
+    generation.kernel = Some("/nix/store/h4sh-not-a-kernel/bzImage".to_string());
+    let line = trimmed(&generation_lines(&[generation_row(generation, Some(3_600_000))], &theme)[0]);
+    assert!(line.ends_with("26.11"), "nothing follows the version: {line:?}");
+
+    let mut none = a_generation(437, true, false, "26.11");
+    none.kernel = None;
+    let line = trimmed(&generation_lines(&[generation_row(none, Some(3_600_000))], &theme)[0]);
+    assert!(line.ends_with("26.11"), "{line:?}");
+}
+
+/// `None` is not a zero and not an epoch date. A profile link whose mtime
+/// could not be read has no age, and the row says so in the age column
+/// rather than dating the generation to 1970 - the same `-`
+/// `masys_domain::rate` prints for a rate it has not measured twice.
+#[test]
+fn a_generation_with_no_readable_mtime_shows_a_dash_rather_than_an_age() {
+    let theme = Theme::default();
+    let rows = [
+        generation_row(a_generation(437, true, false, "26.11.20260804.e72e4f2"), Some(187_200_000)),
+        generation_row(a_generation(427, false, true, "26.11.20260804.e72e4f2"), None),
+    ];
+    let lines = generation_lines(&rows, &theme);
+    let known = text(&lines[0]);
+    let unknown = text(&lines[1]);
+
+    assert!(known.contains("2d 4h"), "{known:?}");
+    assert!(!unknown.contains("0m"), "a zero would be a reading: {unknown:?}");
+    assert!(!unknown.contains("20684d"), "and an epoch date would be a fabrication: {unknown:?}");
+    assert!(unknown.contains('-'), "{unknown:?}");
+    // The dash sits in the age column rather than the row losing it, so
+    // everything to the right still lines up with the row above.
+    assert_eq!(known.width(), unknown.width(), "{known:?} vs {unknown:?}");
+}
+
+/// The columns are measured across the section, not padded to constants:
+/// the system profile runs to three-digit ids with a 22-column version,
+/// and the home profile to one digit with no version at all. Padding
+/// either to the other's shape is what a hardcoded width would do.
+#[test]
+fn a_generations_section_measures_its_own_columns() {
+    let theme = Theme::default();
+    let system = generation_lines(
+        &[
+            generation_row(a_generation(437, true, false, "26.11.20260804.e72e4f2"), Some(187_200_000)),
+            generation_row(a_generation(9, false, true, "26.11.20260101.aaaaaaa"), None),
+        ],
+        &theme,
+    );
+    assert_eq!(trimmed(&system[0]), "* 437  current     2d 4h  26.11.20260804.e72e4f2  6.18.42");
+    assert_eq!(trimmed(&system[1]), "    9  booted          -  26.11.20260101.aaaaaaa  6.18.42");
+
+    let home = generation_lines(&[generation_row(a_bare_generation(7, true, true), Some(3_600_000))], &theme);
+    assert_eq!(
+        trimmed(&home[0]),
+        "* 7  current, booted        1h",
+        "a one-digit profile with no versions wears neither the system profile's id column nor its version column"
+    );
+}
+
+/// The distinction the whole reboot row exists for.
+#[test]
+fn an_unchanged_kernel_is_stated_rather_than_a_bare_reboot_required() {
+    let theme = Theme::default();
+    let node = Node::RebootPending { booted: Some(427), current: Some(437), kernel_changed: false, initrd_changed: false };
+    let rendered = block(&reboot_lines(&node, &theme));
+
+    assert!(rendered.contains("427") && rendered.contains("437"), "{rendered:?}");
+    assert!(rendered.contains("kernel unchanged"), "{rendered:?}");
+    assert!(rendered.contains("this can wait"), "{rendered:?}");
+    assert!(!rendered.to_lowercase().contains("reboot required"), "{rendered:?}");
+}
+
+#[test]
+fn a_changed_kernel_says_so() {
+    let theme = Theme::default();
+    let node = Node::RebootPending { booted: Some(427), current: Some(437), kernel_changed: true, initrd_changed: false };
+    let rendered = block(&reboot_lines(&node, &theme));
+    assert!(rendered.contains("kernel changed"), "{rendered:?}");
+    assert!(!rendered.contains("kernel unchanged"), "{rendered:?}");
+    assert!(!rendered.contains("can wait"), "{rendered:?}");
+}
+
+/// An initrd change needs the same reboot a kernel change does - the
+/// initrd is loaded by the bootloader too - so it must not be reported as
+/// the activation-only case just because the kernel matched.
+#[test]
+fn a_changed_initrd_is_not_the_activation_only_case() {
+    let theme = Theme::default();
+    let node = Node::RebootPending { booted: Some(427), current: Some(437), kernel_changed: false, initrd_changed: true };
+    let rendered = block(&reboot_lines(&node, &theme));
+    assert!(rendered.contains("initrd changed"), "{rendered:?}");
+    assert!(!rendered.contains("can wait"), "{rendered:?}");
+}
+
+/// The sentence that says whether the reboot can wait is the reason the
+/// row exists, so it has to survive the narrowest terminal masys draws
+/// on. On one line with the generation comparison it ran to 80 columns
+/// and the frame clipped exactly that half.
+#[test]
+fn the_reboot_block_fits_an_eighty_column_terminal() {
+    let theme = Theme::default();
+    for (kernel_changed, initrd_changed) in [(true, true), (true, false), (false, true), (false, false)] {
+        let node = Node::RebootPending { booted: Some(427), current: Some(437), kernel_changed, initrd_changed };
+        for line in reboot_lines(&node, &theme) {
+            // Two columns for the frame's own margins, which `render`
+            // adds around every row.
+            assert!(trimmed(&line).width() <= 78, "{:?} is {} columns", trimmed(&line), trimmed(&line).width());
+        }
+    }
+}
+
+/// The colour carries the same distinction the words do: an
+/// activation-only reboot is not the alarm that running a kernel which is
+/// not the current one is.
+#[test]
+fn the_reboot_notice_is_toned_by_what_actually_changed() {
+    let theme = Theme::default();
+    let tone = |kernel_changed, initrd_changed| {
+        let node = Node::RebootPending { booted: Some(427), current: Some(437), kernel_changed, initrd_changed };
+        reboot_lines(&node, &theme)[0].spans[0].style.fg
+    };
+    assert_eq!(tone(true, false), Some(theme.severity_urgent));
+    assert_eq!(tone(false, true), Some(theme.severity_urgent));
+    assert_eq!(tone(false, false), Some(theme.severity_warning), "activation-only can wait, and does not shout");
+}
+
+/// A booted store path that matches no generation on the profile - it can
+/// be deleted out from under the running system - is admitted rather than
+/// given a number.
+#[test]
+fn a_reboot_whose_generation_is_unknown_prints_no_number_for_it() {
+    let theme = Theme::default();
+    let node = Node::RebootPending { booted: None, current: Some(437), kernel_changed: true, initrd_changed: false };
+    let rendered = block(&reboot_lines(&node, &theme));
+    assert!(rendered.contains("booted ?"), "{rendered:?}");
+    assert!(!rendered.contains("booted 0"), "a zero would name generation 0: {rendered:?}");
+}
+
+#[test]
+fn a_measured_store_prints_its_percentage_and_what_is_retained() {
+    let theme = Theme::default();
+    let node = Node::NixStore {
+        used_percent: Some(83.0),
+        free_bytes: Some(160 * (1 << 30)),
+        system_generations: Some(36),
+        home_generations: Some(5),
+        gc_roots: Some(156),
+    };
+    assert_eq!(block(&nix_store_lines(&node, &theme)), "/nix 83%  .  160G free\n36 system generations  .  5 home  .  156 gc roots");
+}
+
+/// Absent is not empty. Before `/nix` has been matched among the sampled
+/// filesystems there is no reading, and a store drawn at `0%` with `0B`
+/// free would be a measurement masys never took.
+#[test]
+fn an_unmeasured_store_reads_as_unknown_rather_than_as_zero() {
+    let theme = Theme::default();
+    let node = Node::NixStore {
+        used_percent: None,
+        free_bytes: None,
+        system_generations: Some(36),
+        home_generations: Some(5),
+        gc_roots: Some(156),
+    };
+    let lines = nix_store_lines(&node, &theme);
+    assert_eq!(trimmed(&lines[0]), "/nix -  .  - free");
+    assert!(!trimmed(&lines[0]).contains("0%"), "{:?}", trimmed(&lines[0]));
+    assert!(!trimmed(&lines[0]).contains("0B"), "{:?}", trimmed(&lines[0]));
+    // The counts beside them are real readings and still print as numbers.
+    assert_eq!(trimmed(&lines[1]), "36 system generations  .  5 home  .  156 gc roots");
+}
+
+/// The same rule for the three counts, against the sharper version of the
+/// same mistake: `0` here is not merely uninformative, it is a finding.
+/// `0 gc roots` says nothing is pinning the store and `0 system
+/// generations` says there is nothing to roll back to, and a read that
+/// never came back has earned neither.
+///
+/// A measured zero still prints as `0` - that is a reading, and the row
+/// beneath this one is what distinguishes the two.
+#[test]
+fn counts_that_were_never_read_print_as_unknown_rather_than_as_zero() {
+    let theme = Theme::default();
+    let unread =
+        Node::NixStore { used_percent: Some(83.0), free_bytes: None, system_generations: None, home_generations: None, gc_roots: None };
+    assert_eq!(trimmed(&nix_store_lines(&unread, &theme)[1]), "- system generations  .  - home  .  - gc roots");
+
+    let measured = Node::NixStore {
+        used_percent: Some(83.0),
+        free_bytes: None,
+        system_generations: Some(0),
+        home_generations: Some(0),
+        gc_roots: Some(0),
+    };
+    assert_eq!(trimmed(&nix_store_lines(&measured, &theme)[1]), "0 system generations  .  0 home  .  0 gc roots");
+}
+
+/// `^` is the warning tier's glyph everywhere in masys, and an input most
+/// of a release cycle behind is what it means here.
+#[test]
+fn a_stale_input_is_marked_and_a_transitive_one_recedes() {
+    let theme = Theme::default();
+    let rows = [
+        (an_input("nixpkgs", Some("NixOS/nixpkgs"), Some(1_754_265_600), true), Some(17)),
+        (an_input("flake-compat", Some("edolstra/flake-compat"), Some(1_735_430_400), false), Some(235)),
+    ];
+    let lines = input_lines(&rows, &theme);
+
+    assert_eq!(tier(&lines[0]), ("  ".to_string(), Some(theme.info)), "a fresh input is not marked");
+    assert_eq!(tier(&lines[1]), ("^ ".to_string(), Some(theme.severity_warning)));
+    assert_eq!(lines[0].spans[1].style.fg, None, "an input this configuration names itself reads as ordinary text");
+    assert_eq!(
+        lines[1].spans[1].style.fg,
+        Some(theme.info),
+        "a transitive one recedes: somebody else's stale input is not this configuration's finding"
+    );
+    assert!(text(&lines[0]).contains("NixOS/nixpkgs"));
+    assert!(text(&lines[0]).contains("17d"));
+}
+
+/// A channel records no upstream timestamp at all. That is an absent
+/// reading, not a fresh input and not a stale one.
+#[test]
+fn an_input_with_no_upstream_timestamp_shows_dashes_rather_than_1970() {
+    let theme = Theme::default();
+    let line = &input_lines(&[(an_input("nixos", None, None, true), None)], &theme)[0];
+    let rendered = trimmed(line);
+    assert!(!rendered.contains("1970"), "{rendered:?}");
+    assert!(!rendered.contains("0d"), "{rendered:?}");
+    assert_eq!(rendered, "  nixos      -  -           -", "age, date and origin all shrug");
+    assert_eq!(tier(line), ("  ".to_string(), Some(theme.info)), "and a missing reading is never marked stale");
+}
+
+/// The name column is measured, so a section of short names does not wear
+/// the spacing of one with a long name in it.
+#[test]
+fn input_names_are_padded_to_the_widest_in_the_section() {
+    let theme = Theme::default();
+    let short = [(an_input("nixpkgs", Some("NixOS/nixpkgs"), Some(1_754_265_600), true), Some(17))];
+    let mixed = [
+        (an_input("nixpkgs", Some("NixOS/nixpkgs"), Some(1_754_265_600), true), Some(17)),
+        (an_input("nixos-hardware", Some("NixOS/nixos-hardware"), Some(1_754_265_600), true), Some(17)),
+    ];
+    let column = |lines: &[Line]| text(&lines[0]).find("17d").expect("an age column");
+
+    let narrow = column(&input_lines(&short, &theme));
+    let wide = column(&input_lines(&mixed, &theme));
+    assert!(wide > narrow, "the long name pushes the section's columns right: {wide} vs {narrow}");
+    let lines = input_lines(&mixed, &theme);
+    assert_eq!(text(&lines[0]).find("17d"), text(&lines[1]).find("17d"), "and within a section both rows put the age in the same column");
+}
+
+/// `keep 14d` comes from the configuration and the schedule from the
+/// timer unit, which is the whole reason this section exists rather than
+/// pointing at the Timers view.
+#[test]
+fn a_maintenance_job_shows_its_retention_and_its_schedule() {
+    let theme = Theme::default();
+    let line = trimmed(&nix_policy_lines(&[a_policy("gc", Some("14d"), true)], &theme)[0]);
+    assert_eq!(line, ". gc  keep 14d  last 4d ago       next in 2d 4h");
+}
+
+/// Blank, not `-`. Nothing is retained by optimising and a
+/// `nix-gc.service` with no `--delete-older-than` has genuinely been
+/// given no retention, so the row states the schedule and claims nothing.
+/// `-` here would report a reading masys failed to take.
+#[test]
+fn a_job_with_no_retention_claims_none_rather_than_reporting_one_missing() {
+    let theme = Theme::default();
+    let line = trimmed(&nix_policy_lines(&[a_policy("optimise", None, true)], &theme)[0]);
+    assert!(!line.contains("keep"), "{line:?}");
+    assert!(!line.contains('-'), "an absent policy is not an unread one: {line:?}");
+    assert!(line.contains("last 4d ago") && line.contains("next in 2d 4h"), "{line:?}");
+}
+
+/// And the state the blank column was standing in for until now: a
+/// retention masys could not read at all.
+///
+/// The two used to print the same, which made the finding - a gc job that
+/// keeps nothing - indistinguishable from a read that was refused. `-` is
+/// what every other unmeasured reading in masys prints, and this is one.
+#[test]
+fn a_retention_that_was_never_read_prints_as_unknown() {
+    let theme = Theme::default();
+    let unread = NixPolicyRow { retention: None, ..a_policy("gc", Some("14d"), true) };
+    let line = trimmed(&nix_policy_lines(&[unread], &theme)[0]);
+    assert!(line.contains('-'), "an unread policy is not an absent one: {line:?}");
+    assert!(!line.contains("keep"), "{line:?}");
+    assert!(line.contains("last 4d ago") && line.contains("next in 2d 4h"), "the schedule is a different reading: {line:?}");
+}
+
+/// A gc timer that is switched off is what this row is for: nothing else
+/// on the host reports that the store will now grow until the disk fills.
+#[test]
+fn a_disabled_maintenance_job_is_marked() {
+    let theme = Theme::default();
+    let line = &nix_policy_lines(&[a_policy("gc", Some("14d"), false)], &theme)[0];
+    assert_eq!(tier(line), ("~ ".to_string(), Some(theme.severity_warning)));
+    assert_eq!(line.spans[1].style.fg, Some(theme.severity_warning), "the row carries it, not only the glyph");
+    assert!(trimmed(line).contains("disabled"), "{:?}", trimmed(line));
+}
+
+/// The job and retention columns are measured across the section, the
+/// same way the units view measures its name column.
+#[test]
+fn the_policy_columns_are_measured_across_the_section() {
+    let theme = Theme::default();
+    let both = nix_policy_lines(&[a_policy("gc", Some("14d"), true), a_policy("optimise", None, true)], &theme);
+    assert_eq!(trimmed(&both[0]), ". gc        keep 14d  last 4d ago       next in 2d 4h");
+    assert_eq!(trimmed(&both[1]), ". optimise            last 4d ago       next in 2d 4h");
+    assert_eq!(text(&both[0]).find("last"), text(&both[1]).find("last"), "both rows put the schedule in the same column");
+
+    let alone = nix_policy_lines(&[a_policy("gc", Some("14d"), true)], &theme);
+    assert_eq!(
+        trimmed(&alone[0]),
+        ". gc  keep 14d  last 4d ago       next in 2d 4h",
+        "a section of one is not padded to a job it does not have"
+    );
 }

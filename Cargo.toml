@@ -21,5 +21,9 @@ edition = "2024"
 version = "0.1.0"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/sarabande/masys"
-# `let ... else`, let-chains in stable position, and edition 2024 itself.
-rust-version = "1.85"
+# masys's own code needs 1.85: `let ... else`, let-chains in stable
+# position, and edition 2024 itself. The effective floor is higher and
+# set by dependencies - ratatui 0.30.2 declares 1.88.0, zbus 5.19
+# declares 1.87 - so claiming 1.85 was a promise the tree could not
+# keep: no stable ratatui 0.30.x builds on it.
+rust-version = "1.88"

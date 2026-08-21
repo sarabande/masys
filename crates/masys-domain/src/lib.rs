@@ -1,3 +1,4 @@
+pub mod declarative;
 pub mod error;
 pub mod finding;
 pub mod journal;
@@ -11,6 +12,7 @@ pub mod triage;
 pub mod unit;
 pub mod unit_actions;
 
+pub use declarative::*;
 pub use error::MasysError;
 pub use finding::*;
 pub use journal::*;

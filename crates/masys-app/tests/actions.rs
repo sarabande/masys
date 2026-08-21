@@ -2,7 +2,7 @@ mod fake;
 
 use fake::{FakePlatformService, FakeSystemService, proc};
 use masys_app::key::{Key, KeyCode};
-use masys_app::{App, Buffer, Flow};
+use masys_app::{Aftermath, App, Buffer, Flow};
 use masys_domain::sample::{Pressure, Snapshot, SystemState};
 use masys_view::{ModalView, Node, StatusLine};
 
@@ -560,7 +560,7 @@ fn enabling_warns_and_says_how_the_change_fails() {
         note: "refused now - the unit directory is read-only".to_string(),
         reverted_by: "nixos-rebuild switch".to_string(),
     });
-    press(&mut app, "e");
+    press(&mut app, "ee");
     let Some(ModalView::Confirm { prompt }) = app.view().modal else { panic!("no confirmation") };
     assert!(prompt.contains("enable sshd.service"), "{prompt}");
     // The note says *how* it fails, which is the operator's actual
@@ -575,7 +575,7 @@ fn enabling_warns_and_says_how_the_change_fails() {
 #[test]
 fn enabling_says_nothing_extra_when_the_change_persists() {
     let (mut app, _) = units_app(masys_domain::platform::Ownership::Imperative);
-    press(&mut app, "e");
+    press(&mut app, "ee");
     let Some(ModalView::Confirm { prompt }) = app.view().modal else { panic!("no confirmation") };
     assert!(!prompt.contains("reverts"), "{prompt}");
 }
@@ -598,7 +598,7 @@ fn starting_does_not_consult_the_ownership_guard() {
 #[test]
 fn a_confirmed_unit_verb_reaches_the_port() {
     let (mut app, calls) = units_app(masys_domain::platform::Ownership::Imperative);
-    press(&mut app, "e");
+    press(&mut app, "ee");
     press(&mut app, "y");
     assert_eq!(*calls.borrow(), vec!["enable sshd.service".to_string()]);
 }
@@ -980,16 +980,62 @@ fn enable_and_disable_dim_where_the_manifest_owns_the_unit() {
     let dimming = action_dimming(&app);
 
     for (chord, dimmed) in &dimming {
-        // `E` joins enable and disable: `systemctl edit` writes a drop-in
-        // under `/etc/systemd/system`, which on this host resolves into a
+        // `E` joins disable: `systemctl edit` writes a drop-in under
+        // `/etc/systemd/system`, which on this host resolves into a
         // read-only store. `M` and `U` write a symlink to the same place.
         // `F` dims for its own reason - the unit is healthy, so there is
         // no failure to reset.
-        let expected = matches!(chord.as_str(), "e" | "D" | "E" | "F" | "M" | "U");
+        //
+        // `e` is not in the set: it opens the transient now, and the
+        // guard marks `enable` on the popup's own row. A key that dimmed
+        // because the popup it opens contains a dim row would be hiding
+        // the explanation the mark exists to give.
+        let expected = matches!(chord.as_str(), "D" | "E" | "F" | "M" | "U");
         assert_eq!(*dimmed, expected, "{chord} dimmed={dimmed}, expected {expected}: {dimming:?}");
     }
     // Still present, still in position - dimmed is not hidden.
-    assert!(dimming.iter().any(|(c, _)| c == "e"), "{dimming:?}");
+    assert!(dimming.iter().any(|(c, _)| c == "D"), "{dimming:?}");
+}
+
+/// The guard did not go away when `enable` moved into the transient - it
+/// moved with it. This is the assertion the footer can no longer make,
+/// and the one the design's mockup actually draws.
+#[test]
+fn the_ownership_guard_marks_enable_inside_the_transient() {
+    let (mut app, _) = units_app(masys_domain::platform::Ownership::Declarative {
+        source: "configuration.nix".to_string(),
+        note: "refused now - the unit directory is read-only".to_string(),
+        reverted_by: "nixos-rebuild switch".to_string(),
+    });
+    press(&mut app, "e");
+    let Some(ModalView::Transient { title, groups, .. }) = app.view().modal else { panic!("no transient") };
+
+    assert!(title.contains("sshd.service"), "the popup names its unit: {title}");
+    let persistence = groups.iter().find(|g| g.heading == "Persistence").expect("a Persistence group");
+    assert_eq!(persistence.note.as_deref(), Some("! refused now - the unit directory is read-only"));
+    for row in &persistence.rows {
+        assert!(row.dimmed, "{} is marked: {persistence:?}", row.label);
+        assert_eq!(row.note.as_deref(), Some("reverts on nixos-rebuild switch"), "{}", row.label);
+    }
+    assert_eq!(persistence.rows.iter().map(|r| r.label).collect::<Vec<_>>(), vec!["enable", "disable", "mask"]);
+
+    // And the runtime verbs are untouched, which is the whole point of a
+    // guard that asks about persistence rather than about writing.
+    let runtime = groups.iter().find(|g| g.heading == "Runtime").expect("a Runtime group");
+    assert!(runtime.rows.iter().all(|row| !row.dimmed), "{runtime:?}");
+    assert_eq!(runtime.note, None);
+}
+
+/// On a host where enablement sticks, nothing in the popup is marked.
+#[test]
+fn an_imperative_host_marks_nothing_in_the_transient() {
+    let (mut app, _) = units_app(masys_domain::platform::Ownership::Imperative);
+    press(&mut app, "e");
+    let Some(ModalView::Transient { groups, .. }) = app.view().modal else { panic!("no transient") };
+
+    let persistence = groups.iter().find(|g| g.heading == "Persistence").expect("a Persistence group");
+    assert_eq!(persistence.note, None);
+    assert!(persistence.rows.iter().all(|row| !row.dimmed && row.note.is_none()), "{persistence:?}");
 }
 
 /// Starting a unit writes nothing and contradicts no manifest, so it is
@@ -1037,10 +1083,19 @@ fn dimming_follows_the_cursor_rather_than_the_host() {
         matches!(app.view().rows.get(app.view().selected.unwrap_or(0)), Some(Node::SectionHeader { .. })),
         "the cursor moved off the unit"
     );
-    // No unit verb applies to anything here, so nothing is marked - and
-    // the point is that the answer was recomputed on the keypress rather
-    // than frozen from the last tick.
-    assert!(action_dimming(&app).iter().all(|(_, d)| !d), "{:?}", action_dimming(&app));
+    // Every unit key is marked here, because not one of them will do
+    // anything: `ask_unit` and `show_logs` both open by asking for the
+    // row's unit and returning when there is not one. The point is that
+    // the answer was recomputed on the keypress rather than frozen from
+    // the last tick.
+    //
+    // This asserted the opposite until the Nix view got operations of its
+    // own. Nothing was marked on a heading, so the footer offered eleven
+    // unit verbs against a row that had no unit - which is the same
+    // footer-disagrees-with-the-key failure that has twice been fixed
+    // here, sitting in the mechanism built to prevent it.
+    let lit: Vec<String> = action_dimming(&app).into_iter().filter(|(_, dimmed)| !dimmed).map(|(chord, _)| chord).collect();
+    assert_eq!(lit, vec!["/".to_string()], "only the filter applies to a section header");
 }
 
 /// The footer and the help must not disagree about whether a key applies.
@@ -1055,8 +1110,9 @@ fn the_help_dims_the_same_keys_as_the_footer() {
     let Some(ModalView::Keys { groups }) = app.view().modal else { panic!("no help") };
     let dimmed: Vec<String> = groups.iter().flat_map(|g| g.bindings.iter()).filter(|b| b.dimmed).map(|b| b.chord.clone()).collect();
     // `E` because editing writes where the manifest owns; `F` because the
-    // unit is healthy and there is nothing to reset.
-    assert_eq!(dimmed, vec!["e".to_string(), "D".to_string(), "F".to_string(), "E".to_string(), "M".to_string(), "U".to_string()]);
+    // unit is healthy and there is nothing to reset. `e` opens the
+    // transient and is never dimmed on a unit row.
+    assert_eq!(dimmed, vec!["D".to_string(), "F".to_string(), "E".to_string(), "M".to_string(), "U".to_string()]);
 }
 
 /// A tick two seconds after `l` used to re-fetch the whole system's
@@ -1276,6 +1332,75 @@ fn editing_asks_first_and_then_asks_for_the_terminal() {
     // What the binary does once it has restored the terminal.
     app.run_suspended();
     assert_eq!(calls.borrow().as_slice(), ["edit sshd.service"]);
+}
+
+/// An editor is the one suspended thing that needs no pause afterwards.
+///
+/// `$EDITOR` holds the terminal until the operator quits it, so its screen
+/// has already been read by the person who was reading it, and stopping to
+/// ask for a keypress would be asking them to dismiss a screen they just
+/// left. Every other suspended command prints and exits, which is the
+/// opposite shape - `Aftermath` is how the composition root tells them
+/// apart without knowing what either one runs.
+#[test]
+fn an_editor_leaves_nothing_unread_because_the_operator_was_reading_it() {
+    let (mut app, calls) = units_app(masys_domain::platform::Ownership::Imperative);
+    press(&mut app, "E");
+    app.handle_key(Key::char('y'));
+
+    assert_eq!(app.run_suspended(), Aftermath::Seen);
+    assert_eq!(calls.borrow().as_slice(), ["edit sshd.service"], "the editor really ran");
+}
+
+/// A refused edit is read like any other output, because there was no
+/// editor.
+///
+/// `systemctl edit` refuses outright where the unit directory is
+/// read-only, and what reaches the terminal then is one line of
+/// systemctl's own text - printed and exited, in exactly the position
+/// `nix store diff-closures` output is in. The reason an editor needs no
+/// pause is that it held the screen, and an editor that never opened held
+/// nothing.
+#[test]
+fn an_edit_that_was_refused_leaves_its_refusal_unread() {
+    let calls: Calls = Default::default();
+    let system = FakeSystemService {
+        snapshot: snapshot(),
+        units: vec![unit("sshd.service", masys_domain::unit::ActiveState::Active)],
+        calls: calls.clone(),
+        fails_with: Some("Failed to edit sshd.service: Read-only file system".to_string()),
+        journal: Vec::new(),
+        appended: Default::default(),
+        journal_queries: Default::default(),
+        queued: Default::default(),
+        proc_details: Default::default(),
+        detail_queries: Default::default(),
+    };
+    let mut app = App::new(
+        Box::new(system),
+        Box::new(Owned(masys_domain::platform::Ownership::Imperative)),
+        Box::new(fake::NoScanner),
+        "devbox".to_string(),
+    );
+    app.tick(1_000, "t".to_string()).expect("tick");
+    press(&mut app, "3");
+    app.handle_key(Key::new(KeyCode::Down));
+    press(&mut app, "E");
+    app.handle_key(Key::char('y'));
+
+    assert_eq!(app.run_suspended(), Aftermath::Unseen);
+    assert_eq!(calls.borrow().as_slice(), ["edit sshd.service"], "it was attempted");
+    let StatusLine::Error(message) = app.view().status else { panic!("the refusal was not held on the status line") };
+    assert!(message.contains("Read-only"), "{message}");
+}
+
+/// Nothing queued leaves nothing to read - so a composition root that
+/// calls this unconditionally never pauses on an empty screen.
+#[test]
+fn a_suspension_that_was_never_asked_for_leaves_nothing_unread() {
+    let (mut app, calls) = units_app(masys_domain::platform::Ownership::Imperative);
+    assert_eq!(app.run_suspended(), Aftermath::Seen);
+    assert!(calls.borrow().is_empty(), "{:?}", calls.borrow());
 }
 
 /// Declining leaves the terminal alone. An editor that opens because you
@@ -1893,4 +2018,110 @@ fn units_app_following(journal: Vec<masys_domain::journal::Entry>) -> (App, Appe
     press(&mut app, "3");
     app.handle_key(Key::new(KeyCode::Down));
     (app, appended)
+}
+
+/// Escape closes a transient, and closes only the transient. Checked
+/// before any chord so no definition can bind its way out of being
+/// closeable - the same rule the buffer escape ladder follows.
+#[test]
+fn escape_closes_the_transient_and_leaves_the_buffer_alone() {
+    let (mut app, calls) = units_app(masys_domain::platform::Ownership::Imperative);
+    let before = app.view().selected;
+
+    press(&mut app, "e");
+    assert!(matches!(app.view().modal, Some(ModalView::Transient { .. })), "it opened");
+
+    app.handle_key(Key::new(KeyCode::Esc));
+    assert!(app.view().modal.is_none(), "and closed");
+    assert_eq!(app.view().selected, before, "the cursor did not move");
+    assert!(calls.borrow().is_empty(), "and nothing ran");
+}
+
+/// A transient takes every key. Without that, a chord it does not bind
+/// falls through to the buffer underneath and the popup becomes a way to
+/// run something you cannot see.
+#[test]
+fn a_transient_swallows_keys_the_buffer_would_have_taken() {
+    let (mut app, _) = units_app(masys_domain::platform::Ownership::Imperative);
+    press(&mut app, "e");
+
+    // `3` opens the systemd buffer and `q` quits, from anywhere - except
+    // under a popup.
+    press(&mut app, "2");
+    assert!(matches!(app.view().modal, Some(ModalView::Transient { .. })), "still open");
+    assert_eq!(app.handle_key(Key::char('q')), Flow::Continue, "and `q` did not quit");
+    assert!(matches!(app.view().modal, Some(ModalView::Transient { .. })), "still open");
+}
+
+/// Dispatching closes the transient before the action runs, so the
+/// confirmation a row raises is answered against the rows it names
+/// rather than through a popup still covering them.
+#[test]
+fn dispatching_a_row_closes_the_transient_before_the_action_runs() {
+    let (mut app, calls) = units_app(masys_domain::platform::Ownership::Imperative);
+    press(&mut app, "e");
+    press(&mut app, "s");
+
+    let Some(ModalView::Confirm { prompt }) = app.view().modal else { panic!("the transient gave way to a confirmation") };
+    assert!(prompt.contains("start sshd.service"), "{prompt}");
+
+    press(&mut app, "y");
+    assert_eq!(*calls.borrow(), vec!["start sshd.service".to_string()]);
+    assert!(app.view().modal.is_none(), "and nothing is left open");
+}
+
+/// A marked row runs. The ownership guard says the effect will not last;
+/// it does not say the key is dead, and a popup that refused to dispatch
+/// its dim rows would make the mark mean something the design never said.
+#[test]
+fn a_marked_row_still_runs() {
+    let (mut app, calls) = units_app(masys_domain::platform::Ownership::Declarative {
+        source: "configuration.nix".to_string(),
+        note: "generated from configuration".to_string(),
+        reverted_by: "nixos-rebuild switch".to_string(),
+    });
+    press(&mut app, "e");
+    let Some(ModalView::Transient { groups, .. }) = app.view().modal else { panic!("no transient") };
+    assert!(groups.iter().flat_map(|g| &g.rows).find(|r| r.chord == 'e').is_some_and(|r| r.dimmed), "enable is marked on this host");
+
+    press(&mut app, "e");
+    press(&mut app, "y");
+    assert_eq!(*calls.borrow(), vec!["enable sshd.service".to_string()], "and ran anyway");
+}
+
+/// A chord the definition does not bind does nothing and leaves the popup
+/// open, rather than closing it on a typo.
+#[test]
+fn an_unbound_chord_leaves_the_transient_open() {
+    let (mut app, calls) = units_app(masys_domain::platform::Ownership::Imperative);
+    press(&mut app, "e");
+    press(&mut app, "z");
+
+    assert!(matches!(app.view().modal, Some(ModalView::Transient { .. })), "still open");
+    assert!(calls.borrow().is_empty(), "and nothing ran");
+}
+
+/// The transient opens on a unit row and nowhere else yet. A row with no
+/// transient opens nothing rather than an empty popup - the same choice
+/// `crate::buffer` makes about a digit with no buffer behind it.
+#[test]
+fn a_row_with_no_transient_opens_nothing() {
+    let (mut app, _) = units_app(masys_domain::platform::Ownership::Imperative);
+    // Back onto the section header the cursor started above.
+    app.handle_key(Key::new(KeyCode::Up));
+    press(&mut app, "e");
+
+    assert!(app.view().modal.is_none(), "no popup, and no empty one either");
+}
+
+/// The popup lists the design's groups in the design's order: what runs
+/// now, what survives a reboot, what to look at.
+#[test]
+fn the_unit_popup_lists_the_designs_groups_in_order() {
+    let (mut app, _) = units_app(masys_domain::platform::Ownership::Imperative);
+    press(&mut app, "e");
+    let Some(ModalView::Transient { groups, .. }) = app.view().modal else { panic!("no transient") };
+
+    assert_eq!(groups.iter().map(|g| g.heading.as_str()).collect::<Vec<_>>(), vec!["Runtime", "Persistence", "Inspect"]);
+    assert_eq!(groups[0].rows.iter().map(|r| r.label).collect::<Vec<_>>(), vec!["start", "stop", "restart", "reload"]);
 }

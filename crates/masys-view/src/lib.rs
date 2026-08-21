@@ -15,7 +15,7 @@ pub use node::{Node, SectionKind};
 
 /// What the renderer measured while drawing, handed back so the session
 /// can size its paging.
-#[derive(Default, Clone, Copy)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct Metrics {
     pub list_height: u16,
     pub modal_height: u16,
@@ -222,7 +222,14 @@ pub enum ModalView<'a> {
     /// A transient's switch rows and action columns - the unit popup's
     /// Runtime/Persistence/Inspect groups, kill's signal picker, and so
     /// on.
-    Transient { title: &'static str, switches: Vec<SwitchRow>, groups: Vec<ActionGroup> },
+    ///
+    /// `title` is a `String` rather than the `&'static str` this spec
+    /// carried while it was unimplemented, because every transient the
+    /// design draws names the thing it acts on: the unit popup's title is
+    /// `Unit . restic-backup.service`. A static title could only have said
+    /// `unit`, and a popup that does not name its subject is one you can
+    /// open on the wrong row without noticing.
+    Transient { title: String, switches: Vec<SwitchRow>, groups: Vec<ActionGroup> },
     /// A transient's open text-entry or picker sub-step (e.g. renice's
     /// typed value), which replaces the switch/action display while
     /// active.
@@ -235,6 +242,7 @@ pub enum ModalView<'a> {
 /// One toggleable switch, with its current state already resolved - the
 /// renderer shouldn't have to cross-reference a separate set of enabled
 /// chords to decide between `[x]` and `[ ]`.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SwitchRow {
     pub group: &'static str,
     pub chord: &'static str,
@@ -247,8 +255,13 @@ pub struct SwitchRow {
 
 /// One bucket of action rows in a transient popup, e.g. `Runtime` or
 /// `Persistence`.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActionGroup {
-    pub heading: &'static str,
+    /// A `String` for the same reason `Transient`'s title is one, and the
+    /// same reason `KeyGroup`'s already was: the Nix transient's
+    /// generation group names its generation (`Generation 436`), so the
+    /// heading is contextual and cannot be `&'static str`.
+    pub heading: String,
     /// A group-level annotation, e.g. `declared in nix` - the
     /// persistence-ownership guard's `Ownership::Declarative` note.
     /// `None` for a group with nothing to flag.
@@ -257,6 +270,7 @@ pub struct ActionGroup {
 }
 
 /// One action row within an `ActionGroup`.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActionRow {
     pub chord: char,
     pub label: &'static str,
@@ -271,6 +285,7 @@ pub struct ActionRow {
 }
 
 /// A picker's live-filtered candidates and which one is highlighted.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CandidateList<'a> {
     pub matches: Vec<&'a str>,
     pub selected: usize,
