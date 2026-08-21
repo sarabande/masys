@@ -1,0 +1,19 @@
+[package]
+name = "masys-scan"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Parallel directory sizing for masys - what is using the disk."
+categories = ["command-line-utilities", "os::linux-apis"]
+
+[dependencies]
+masys-domain = { path = "../masys-domain", version = "0.1.0" }
+# The only reason this crate exists as its own crate: a work-stealing
+# pool, kept out of the rest of the workspace. `dust` walks the same
+# trees 3x faster than `du` this way, measured - not by being cleverer
+# but by spending five cores instead of one.
+rayon = "1"
+# st_dev, for refusing to cross a mount boundary.
+libc = "0.2"

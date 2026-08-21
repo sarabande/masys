@@ -1,0 +1,19 @@
+[package]
+name = "masys-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Session state, keymap and outline building for masys."
+categories = ["command-line-utilities", "os::linux-apis"]
+
+[dependencies]
+masys-domain = { path = "../masys-domain", version = "0.1.0" }
+masys-view = { path = "../masys-view", version = "0.1.0" }
+
+# No dev-dependencies: masys-app's tests run against stub SystemService/
+# PlatformService doubles (tests/fake/mod.rs), same reasoning as
+# masys-domain's own "no dev-dependencies" comment - no D-Bus, no
+# systemctl, no /proc, no dependency on infrastructure that doesn't exist
+# yet (masys-systemd is a later plan).

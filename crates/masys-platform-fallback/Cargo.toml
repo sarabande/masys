@@ -1,0 +1,12 @@
+[package]
+name = "masys-platform-fallback"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Platform facts for a host masys has no specific adapter for."
+categories = ["command-line-utilities", "os::linux-apis"]
+
+[dependencies]
+masys-domain = { path = "../masys-domain", version = "0.1.0" }

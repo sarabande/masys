@@ -1,0 +1,12 @@
+[package]
+name = "masys-view"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "The plain-data row model masys renders. No decisions, no ratatui."
+categories = ["command-line-utilities", "os::linux-apis"]
+
+[dependencies]
+masys-domain = { path = "../masys-domain", version = "0.1.0" }

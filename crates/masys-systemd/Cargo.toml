@@ -1,0 +1,25 @@
+[package]
+name = "masys-systemd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "The systemd, /proc and journal adapter for masys."
+categories = ["command-line-utilities", "os::linux-apis"]
+
+[dependencies]
+masys-domain = { path = "../masys-domain", version = "0.1.0" }
+# zbus cannot be built runtime-free: `default-features = false` fails to
+# compile with `async_io::block_on` unresolved, because the blocking API
+# is a wrapper over an async core. The executor comes along regardless,
+# which is why "single-threaded, no channels" in the design describes
+# masys's own event loop, not zbus's internals.
+zbus = "5"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# statvfs, sysconf. Already in the workspace lock via crossterm.
+libc = "0.2"
+
+[dev-dependencies]
+libc = "0.2"

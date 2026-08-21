@@ -1,0 +1,13 @@
+# The codebase is written at a wider line budget than rustfmt's stock 100
+# columns, and keeps struct literals, enum variants, and short call chains
+# on a single line where they fit - `masys_app::status::SECTIONS` and
+# `masys_domain::Finding` read as tables, not as blocks. "Max" sets every
+# width heuristic (struct_lit_width, struct_variant_width, fn_call_width,
+# chain_width, ...) to max_width, which is what preserves that.
+#
+# Note: rustfmt still expands *every* struct-like variant of an enum when
+# *any* variant carries a doc comment, whatever these widths say. That is
+# why `Finding` and `Node` are vertical while `SECTIONS` is not.
+max_width = 140
+use_small_heuristics = "Max"
+style_edition = "2024"

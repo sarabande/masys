@@ -1,0 +1,23 @@
+[package]
+name = "masys-render"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Draws a masys view to a ratatui frame."
+categories = ["command-line-utilities", "os::linux-apis"]
+
+[dependencies]
+masys-domain = { path = "../masys-domain", version = "0.1.0" }
+masys-view = { path = "../masys-view", version = "0.1.0" }
+ratatui = "0.30"
+# Already in the tree via ratatui-core, which uses it for the same reason:
+# terminal column width is not char count for CJK or combining marks.
+unicode-width = "0.2"
+# localtime_r, for journal timestamps in the operator's own zone. A clock
+# six hours off would make every other number on the screen suspect.
+libc = "0.2"
+
+[dev-dependencies]
+masys-app = { path = "../masys-app", version = "0.1.0" }

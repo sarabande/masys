@@ -1,0 +1,50 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  # A warning in this codebase is a defect that has not been written down
+  # yet. There are none today, and this is what keeps it that way.
+  RUSTFLAGS: -D warnings
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets
+
+      # The suite includes tests that read this runner's own systemd,
+      # /proc and journal. They assert invariants rather than values, and
+      # every one of them skips rather than fails where the system bus is
+      # absent - a missing bus is not a defect in masys.
+      - name: Test
+        run: cargo test --workspace
+
+  # The libsystemd path is loaded with dlopen at runtime, so an ordinary
+  # build never touches it and an ordinary test run takes the subprocess
+  # fallback. This job points masys at the runner's own library so the FFI
+  # is actually executed somewhere.
+  libsystemd:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Locate libsystemd
+        run: echo "MASYS_LIBSYSTEMD=$(ldconfig -p | awk '/libsystemd\.so\.0/ {print $NF; exit}')" >> "$GITHUB_ENV"
+      - name: Test against libsystemd
+        run: cargo test -p masys-systemd

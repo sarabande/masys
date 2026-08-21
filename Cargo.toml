@@ -1,0 +1,25 @@
+[workspace]
+resolver = "3"
+members = ["crates/masys-domain", "crates/masys-view", "crates/masys-app", "crates/masys-render", "crates/masys-scan", "crates/masys-systemd", "crates/masys-platform-fallback", "crates/masys-platform-nixos", "crates/masys"]
+
+# Publishing order, which `cargo publish` cannot work out for itself: a
+# crate cannot go up until everything it depends on is already on
+# crates.io.
+#
+#   masys-domain
+#   masys-view
+#   masys-app
+#   masys-render, masys-scan, masys-systemd, masys-platform-*
+#   masys
+#
+# Until then `cargo package -p masys-view` and anything after it fails
+# with "no matching package named masys-domain" - which is the index
+# telling the truth, not a misconfiguration.
+
+[workspace.package]
+edition = "2024"
+version = "0.1.0"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/sarabande/masys"
+# `let ... else`, let-chains in stable position, and edition 2024 itself.
+rust-version = "1.85"

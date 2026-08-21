@@ -1,0 +1,30 @@
+[package]
+name = "masys"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "A magit-style TUI for Linux system runtime ops: triage, processes, systemd, logs and IO in one place."
+readme = "../../README.md"
+keywords = ["tui", "systemd", "monitoring", "linux", "sysadmin"]
+categories = ["command-line-utilities", "os::linux-apis"]
+
+[[bin]]
+name = "masys"
+path = "src/main.rs"
+
+[dependencies]
+masys-app = { path = "../masys-app", version = "0.1.0" }
+masys-domain = { path = "../masys-domain", version = "0.1.0" }
+masys-platform-fallback = { path = "../masys-platform-fallback", version = "0.1.0" }
+masys-platform-nixos = { path = "../masys-platform-nixos", version = "0.1.0" }
+masys-render = { path = "../masys-render", version = "0.1.0" }
+masys-scan = { path = "../masys-scan", version = "0.1.0" }
+masys-systemd = { path = "../masys-systemd", version = "0.1.0" }
+masys-view = { path = "../masys-view", version = "0.1.0" }
+ratatui = "0.30"
+crossterm = "0.29"
+# Reading ~/.config/masys/config.toml. Parsed here rather than in
+# masys-app, which stays free of I/O and of a config format.
+toml = "0.9"

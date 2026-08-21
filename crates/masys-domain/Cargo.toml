@@ -1,0 +1,18 @@
+[package]
+name = "masys-domain"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Entities, port traits and triage rules for masys. No I/O."
+categories = ["command-line-utilities", "os::linux-apis"]
+
+[dependencies]
+thiserror = "2"
+
+# No dev-dependencies: masys-domain's tests run against fake SystemService/
+# PlatformService doubles (tests/fake/mod.rs), so the domain's suite needs
+# no D-Bus, no systemctl, no /proc, and - crucially - no dependency on the
+# infrastructure beneath it. Real-adapter coverage of the same use cases
+# lives in masys-systemd/tests and masys-platform-*/tests, in later plans.
