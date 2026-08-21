@@ -905,9 +905,9 @@ fn a_cursor_landing_on_a_detail_row_still_draws_the_buffer() {
 /// only from `build_items`' own batching arm. Delete that arm (or blank
 /// `row_item`'s `RebootPending` dispatch, which is not batched at all)
 /// and every one of these rows renders as an empty line while
-/// `tests/view.rs` - which calls `view::generation_lines` et al. directly
-/// - stays entirely green. Only a real frame proves the row actually
-/// gets there.
+/// `tests/view.rs` - which calls `view::generation_lines` et al.
+/// directly - stays entirely green. Only a real frame proves the row
+/// actually gets there.
 ///
 /// The same hole exists for `Unit`, `Timer`, `Disk` and `Filesystem`, and
 /// is out of scope here: this closes it for the Nix view alone.

@@ -6,6 +6,8 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 description = "Platform facts for a host masys has no specific adapter for."
+readme = "../../README.md"
+keywords = ["masys", "linux", "platform", "fallback", "sysadmin"]
 categories = ["command-line-utilities", "os::linux-apis"]
 
 [dependencies]

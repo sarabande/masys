@@ -144,12 +144,7 @@ fn row_item(node: &Node, theme: &Theme, columns: &view::ProcColumns) -> ListItem
 /// is what the second return value exists to fix - the cursor is a node
 /// index, and handing it to the list untranslated would select the wrong
 /// row the moment anything was open above it.
-fn build_items<'a>(
-    nodes: &[Node],
-    theme: &Theme,
-    columns: &view::ProcColumns,
-    scope: Option<&'a str>,
-) -> (Vec<ListItem<'static>>, Vec<usize>) {
+fn build_items(nodes: &[Node], theme: &Theme, columns: &view::ProcColumns, scope: Option<&str>) -> (Vec<ListItem<'static>>, Vec<usize>) {
     let mut items = Vec::with_capacity(nodes.len());
     let mut first_item: Vec<usize> = Vec::with_capacity(nodes.len());
     let mut index = 0;

@@ -27,11 +27,11 @@ const ETC_NIXOS: &str = "/etc/nixos";
 
 /// One command line, as owned words.
 ///
-/// `Vec<String>` rather than `Vec<&str>` because several arms interpolate
-/// - a generation number, a profile path joined to `bin/…` - and a
-/// borrowed variant would need every caller to hold those temporaries
-/// alive. The commands run at most once per keypress; the allocations are
-/// free against a human.
+/// `Vec<String>` rather than `Vec<&str>` because several arms
+/// interpolate - a generation number, a profile path joined to `bin/…` -
+/// and a borrowed variant would need every caller to hold those
+/// temporaries alive. The commands run at most once per keypress; the
+/// allocations are free against a human.
 fn words(parts: &[&str]) -> Vec<String> {
     parts.iter().map(|part| part.to_string()).collect()
 }

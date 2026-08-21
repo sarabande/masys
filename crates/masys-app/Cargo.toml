@@ -6,6 +6,8 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 description = "Session state, keymap and outline building for masys."
+readme = "../../README.md"
+keywords = ["masys", "tui", "keymap", "session", "linux"]
 categories = ["command-line-utilities", "os::linux-apis"]
 
 [dependencies]

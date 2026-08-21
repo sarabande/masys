@@ -37,8 +37,8 @@ pub struct Key {
     /// Held Control.
     ///
     /// Carried because without it `convert` in the binary had nowhere to
-    /// put the modifier and dropped it, so `ctrl-k` arrived as a bare `k`
-    /// - which in the Procs view opens the SIGTERM confirmation. A
+    /// put the modifier and dropped it, so `ctrl-k` arrived as a bare
+    /// `k` - which in the Procs view opens the SIGTERM confirmation. A
     /// modifier a key model cannot represent is a modifier that silently
     /// becomes a different keystroke.
     pub ctrl: bool,

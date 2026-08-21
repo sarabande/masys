@@ -6,6 +6,8 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 description = "Parallel directory sizing for masys - what is using the disk."
+readme = "../../README.md"
+keywords = ["masys", "disk-usage", "directory", "rayon", "linux"]
 categories = ["command-line-utilities", "os::linux-apis"]
 
 [dependencies]

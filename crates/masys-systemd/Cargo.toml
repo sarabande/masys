@@ -6,6 +6,8 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 description = "The systemd, /proc and journal adapter for masys."
+readme = "../../README.md"
+keywords = ["masys", "systemd", "journal", "proc", "linux"]
 categories = ["command-line-utilities", "os::linux-apis"]
 
 [dependencies]

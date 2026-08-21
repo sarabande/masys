@@ -133,12 +133,16 @@ fn parse_unix(text: &str) -> SocketTable {
         .collect()
 }
 
+/// One `/proc/net` file and the parser that reads it: the name to look
+/// for, and what to do with the text if it is there.
+type Source = (&'static str, fn(&str) -> SocketTable);
+
 /// Every socket table the host has, merged into one index.
 ///
 /// Missing files are skipped, not errors: a kernel built without IPv6 has
 /// no `tcp6`, and a container may have none of them.
 pub fn socket_table(read: impl Fn(&str) -> Option<String>) -> SocketTable {
-    let sources: [(&str, fn(&str) -> SocketTable); 5] = [
+    let sources: [Source; 5] = [
         ("tcp", |text| parse_inet(text, false, true)),
         ("tcp6", |text| parse_inet(text, true, true)),
         ("udp", |text| parse_inet(text, false, false)),

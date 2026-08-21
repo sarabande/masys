@@ -6,6 +6,8 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 description = "Draws a masys view to a ratatui frame."
+readme = "../../README.md"
+keywords = ["masys", "tui", "ratatui", "render", "linux"]
 categories = ["command-line-utilities", "os::linux-apis"]
 
 [dependencies]

@@ -6,6 +6,8 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 description = "Entities, port traits and triage rules for masys. No I/O."
+readme = "../../README.md"
+keywords = ["masys", "triage", "systemd", "linux", "monitoring"]
 categories = ["command-line-utilities", "os::linux-apis"]
 
 [dependencies]

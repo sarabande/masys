@@ -311,7 +311,7 @@ fn folding_home_manager_survives_learning_how_it_is_deployed() {
     };
     let build = |home_mode: HomeMode, collapsed: &HashSet<String>| {
         build_nix_rows(
-            Some(&[home.clone()]),
+            Some(std::slice::from_ref(&home)),
             None,
             None,
             home_mode,

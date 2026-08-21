@@ -120,13 +120,18 @@ actually said, from its own journal, so the common case needs no second
 step.
 
 **Actions where the fault is.** `r` restarts, `S`/`X` start and stop, `R`
-reloads, `alt+r` try-restarts, `e`/`D` enable and disable, `M`/`U` mask and
-unmask, `F` clears a failed state, `E` opens the drop-in in `$EDITOR`.
+reloads, `alt+r` try-restarts, `D` disables, `M`/`U` mask and unmask, `F`
+clears a failed state, `E` opens the drop-in in `$EDITOR`. `e` opens a
+transient on the row under the cursor with the rest, grouped and
+annotated.
 
 **It tells you when an action will not stick.** On a declaratively managed
-host — NixOS today — the five verbs that write under `/etc/systemd/system`
-are dimmed and say so before you press them, because "enabled" that a
-rebuild silently reverts is worse than no button at all.
+host — NixOS today — the verbs that write under `/etc/systemd/system` say
+so before you press them, because "enabled" that a rebuild silently
+reverts is worse than no button at all. `D`, `E`, `M` and `U` carry the
+mark in the footer; `enable` carries it on its own row in the transient,
+with the reason beside it. Marked, never hidden: the key still works, and
+what it costs you is stated rather than taken away.
 
 **Logs read like logs.** One unit's journal, sectioned by local day, `o` to
 flip oldest/newest first, and a sender's own timestamp stripped so the
@@ -140,16 +145,14 @@ byte for byte, stays on one filesystem, and finished `/home` (622 GB) in
 
 ## Installing
 
-```
-cargo install masys
-```
-
-Or from a clone:
+From a clone:
 
 ```
 cargo build --release
 ./target/release/masys
 ```
+
+`cargo install masys` once the crates are published.
 
 Runs unprivileged. Everything it can read without privileges, it reads;
 anything it cannot is reported as absent rather than as an error.
@@ -160,9 +163,9 @@ can be granted them. The NixOS operations that write a root-owned profile
 - activating a generation, collecting the store - have no such mechanism:
 `nix-env` and `nix-collect-garbage` take no elevation flag and raise no
 polkit action. masys checks whether the profile directories can be
-written and marks those keys in the footer where they cannot, rather than
-starting a command that would delete some generations and then fail
-partway. Run masys as root to use them.
+written and marks those rows where they cannot, rather than starting a
+command that would delete some generations and then fail partway. Run
+masys as root to use them.
 
 ### Optional: following logs live
 
@@ -224,6 +227,18 @@ tested.
 
 Early. It runs, it is useful, and the shape is settled; the version says
 0.1.0 and means it.
+
+What is not done, in the order you are likely to meet it. A rebuild run
+unprivileged builds for minutes and is then refused at activation:
+`nixos-rebuild` can deploy as a non-root user through `--elevate`, which
+masys does not yet pass, so run it as root for anything that activates -
+`build` is the exception and works either way. Four operations the design
+names are deliberately absent, each waiting on a question only the code
+that reaches them can settle: `upgrade`, `repl`, `build-vm` and
+`build-image`. And NixOS is the only platform adapter that answers
+anything; every other host gets the fallback, which is honest about
+knowing nothing rather than guessing, but it means one adapter is proving
+a seam meant for several.
 
 ## License
 

@@ -38,6 +38,15 @@ fn is_kernel(cgroup: Option<&str>) -> bool {
 /// `collapsed` holds group names rather than expanded ones, so a cgroup
 /// that appears between two ticks shows up expanded without anything
 /// having to notice it is new.
+///
+/// Eight arguments, and clippy is right that this is too many. The cause
+/// is structural rather than local: a buffer's facts and its state live
+/// in two different flat bags on the session, so the only way to reunite
+/// them at a call site is a positional list. `build_nix_rows` carries the
+/// same allow for the same reason and takes twelve. Shortening this one
+/// alone would mean inventing a parameter struct for this buffer and no
+/// other, which is the shape without the decision behind it.
+#[allow(clippy::too_many_arguments)]
 pub fn build_proc_rows(
     procs: &[Proc],
     rates: &[ProcRate],

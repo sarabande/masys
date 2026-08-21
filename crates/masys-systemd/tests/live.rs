@@ -198,7 +198,7 @@ fn proc_detail_reads_this_process() {
     assert!(cmdline.contains("live"), "the running test binary: {cmdline:?}");
     assert!(detail.exe.as_deref().unwrap_or_default().contains("live"), "{:?}", detail.exe);
     assert!(detail.cwd.is_some(), "a process always has a working directory");
-    assert_eq!(detail.ppid.is_some(), true, "every process but init has a parent");
+    assert!(detail.ppid.is_some(), "every process but init has a parent");
     assert!(detail.virt_bytes.unwrap_or(0) > 0, "a userspace process has mapped memory: {:?}", detail.virt_bytes);
     assert!(detail.env.iter().any(|(key, _)| key == "PATH"), "PATH is always set");
 

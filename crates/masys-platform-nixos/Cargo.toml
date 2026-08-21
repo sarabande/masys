@@ -6,6 +6,8 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 description = "NixOS platform facts for masys: generations, unit ownership, pending reboot."
+readme = "../../README.md"
+keywords = ["masys", "nixos", "nix", "generations", "linux"]
 categories = ["command-line-utilities", "os::linux-apis"]
 
 [dependencies]
