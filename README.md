@@ -201,10 +201,18 @@ startup: a typo should cost you the customisation, not the key.
 ## Developing
 
 ```
-cargo test --workspace          # 676 tests, no D-Bus or /proc required
+cargo test --workspace          # 677 tests, no D-Bus or /proc required
 cargo fmt --all                 # rustfmt.toml widens the line budget past 100
 cargo clippy --workspace --all-targets
 ```
+
+There is a Nix dev shell if you want one - `nix develop` - carrying the
+toolchain, `clippy` and `rustfmt`, and pointing `MASYS_LIBSYSTEMD` at a
+`libsystemd` so the `dlopen` path is exercised rather than skipped. It
+also clears `RUSTFLAGS`, so a `~/.cargo/config.toml` naming a wrapper or
+a linker the shell does not provide cannot make the build a function of
+your home directory. Nothing here requires it; the three commands above
+work on any toolchain at or past the floor.
 
 CI runs those three with `RUSTFLAGS: -D warnings`, so a warning fails the
 build. The workspace needs **Rust 1.88**, and cargo says so itself before
