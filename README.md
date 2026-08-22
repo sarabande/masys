@@ -198,6 +198,33 @@ filter = "/"
 A binding that cannot be parsed leaves the default in place and says so on
 startup: a typo should cost you the customisation, not the key.
 
+## Developing
+
+```
+cargo test --workspace          # 676 tests, no D-Bus or /proc required
+cargo fmt --all                 # rustfmt.toml widens the line budget past 100
+cargo clippy --workspace --all-targets
+```
+
+CI runs those three with `RUSTFLAGS: -D warnings`, so a warning fails the
+build. The workspace needs **Rust 1.88**, and cargo says so itself before
+it builds anything - the floor is set by dependencies rather than by
+masys: ratatui 0.30.2 declares 1.88 and zbus 5.19 declares 1.87.
+
+`masys-domain` and `masys-app` have **no dev-dependencies**. Their suites
+run against fake `SystemService`/`PlatformService` doubles, so neither
+needs D-Bus, `systemctl` or `/proc` to be tested, and neither can quietly
+grow a dependency on the infrastructure beneath it. Anything that needs a
+real machine belongs in `masys-systemd/tests` or `masys-platform-*/tests`,
+where the suites skip rather than fail when the bus is absent.
+
+The dependency direction in the table below is an invariant, not a
+description, and `crates/masys/tests/layering.rs` enforces it: the domain
+depends on `thiserror` alone, the view on the domain alone, nothing above
+the composition root names a terminal library, and only the `masys` binary
+may name a platform adapter. Break one and the suite says which rule and
+why.
+
 ## Architecture
 
 Ports and adapters, one concern per crate.
