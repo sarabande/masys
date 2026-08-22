@@ -10,10 +10,15 @@
       # for it to do on another kernel.
       systems = [ "x86_64-linux" "aarch64-linux" ];
       forEach = f: nixpkgs.lib.genAttrs systems (system: f nixpkgs.legacyPackages.${system});
+      # `CARGO_TARGET_<TRIPLE>_LINKER`, with the triple spelled the way
+      # cargo wants it: upper case, hyphens as underscores.
+      linkerVar = pkgs:
+        "CARGO_TARGET_" + nixpkgs.lib.toUpper
+          (builtins.replaceStrings [ "-" ] [ "_" ] pkgs.stdenv.hostPlatform.config) + "_LINKER";
     in
     {
       devShells = forEach (pkgs: {
-        default = pkgs.mkShell {
+        default = pkgs.mkShell ({
           # The workspace needs 1.88, a floor its dependencies set rather
           # than masys: ratatui 0.30.2 declares 1.88 and zbus 5.19 declares
           # 1.87. nixpkgs is well past that, so the version is not pinned
@@ -43,13 +48,26 @@
           # alone.
           MASYS_LIBSYSTEMD = "${pkgs.systemd}/lib/libsystemd.so.0";
 
-          # ~/.cargo/config.toml on a contributor's machine may name a
-          # wrapper or a linker this shell does not provide. Cargo's env
-          # var wins over the config file, and empty means "no flags",
+          # `~/.cargo/config.toml` on a contributor's machine may name a
+          # wrapper, a linker or flags this shell does not provide, and
+          # cargo reads it wherever the build runs. Each env var below
+          # wins over the config key it shadows, and empty means "none" -
           # which is what makes the shell reproducible rather than a
           # function of whatever is in the caller's home directory.
+          #
+          # All three are needed and one is not enough: `RUSTFLAGS` covers
+          # `rustflags`, and leaves `rustc-wrapper` and `linker` in force.
+          # A clone with no `.cargo/config.toml` of its own found that out
+          # - the shell died on a global `sccache` path that does not
+          # exist, having cleared only the flags.
           RUSTFLAGS = "";
-        };
+          CARGO_BUILD_RUSTC_WRAPPER = "";
+        } // {
+          # Built separately because the name is computed: `//` binds to
+          # `mkShell`'s *result* without the parentheses around the whole
+          # argument, which silently drops it.
+          ${linkerVar pkgs} = "cc";
+        });
       });
     };
 }
