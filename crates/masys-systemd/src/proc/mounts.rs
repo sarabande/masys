@@ -1,9 +1,16 @@
 //! `/proc/mounts` - which filesystems are worth a `statvfs`, and which
 //! must not be touched.
 
-/// One mount worth measuring. `fstype` is kept because the caller filters
-/// on it, and `device` because two mount points backed by the same device
-/// report identical numbers and only one should be shown.
+/// One mount worth measuring. `device` is kept because two mount points
+/// backed by the same device report identical numbers and only one
+/// should be shown.
+///
+/// `fstype` is carried but never read outside the tests. The filtering it
+/// was kept for happens here, on the local value, before a `Mount` is
+/// built at all - `PSEUDO` is checked against the column as it is parsed.
+/// What the field earns is the test that proves that filter ran: asserting
+/// no `autofs` survives is a claim about *why* a row is absent, and a
+/// mount point alone cannot make it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Mount {
     pub device: String,
@@ -57,7 +64,12 @@ pub fn parse_mounts(text: &str) -> Vec<Mount> {
             if PSEUDO.contains(&fstype.as_str()) {
                 return None;
             }
-            Some(Mount { device, mount_point, fstype, read_only: options.split(',').any(|o| o == "ro") })
+            Some(Mount {
+                device,
+                mount_point,
+                fstype,
+                read_only: options.split(',').any(|o| o == "ro"),
+            })
         })
         .collect()
 }
@@ -83,7 +95,7 @@ fn unescape(field: &str) -> String {
 }
 
 /// Whether a read-only mount means *the kernel remounted it after an I/O
-/// error* - the silent failure `Finding::ReadOnlyFilesystem` exists to
+/// error* - the silent failure `FindingKind::ReadOnlyFilesystem` exists to
 /// catch - rather than a deliberate mount option.
 ///
 /// Only a local, block-device-backed filesystem can fail that way. A

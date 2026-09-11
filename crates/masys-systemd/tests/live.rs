@@ -26,18 +26,29 @@ fn sample_reads_this_machine() {
 
     assert!(!snapshot.procs.is_empty(), "a running host has processes");
     // The suite itself is running, so its own pid must be in the sweep.
-    let me = snapshot.procs.iter().find(|p| p.pid == std::process::id()).expect("this test process");
+    let me = snapshot
+        .procs
+        .iter()
+        .find(|p| p.pid == std::process::id())
+        .expect("this test process");
     assert!(me.rss_bytes > 0, "a running process has resident memory");
     assert!(me.threads >= 1);
     // Unix milliseconds, from btime + starttime ticks. Sanity-check the
     // epoch rather than the value: a ticks/seconds mix-up lands decades off.
-    assert!(me.started_at_ms > 1_600_000_000_000, "started_at_ms is Unix ms: {}", me.started_at_ms);
+    assert!(
+        me.started_at_ms > 1_600_000_000_000,
+        "started_at_ms is Unix ms: {}",
+        me.started_at_ms
+    );
 
     assert!(snapshot.load.is_some(), "/proc/loadavg is always readable");
     assert!(snapshot.uptime_secs.unwrap_or(0) > 0);
     let memory = snapshot.memory.expect("/proc/meminfo is always readable");
     assert!(memory.total_bytes > 0);
-    assert!(memory.used_bytes <= memory.total_bytes, "used cannot exceed total");
+    assert!(
+        memory.used_bytes <= memory.total_bytes,
+        "used cannot exceed total"
+    );
 }
 
 /// The Disk section's inputs. Every filesystem reported must be
@@ -50,13 +61,20 @@ fn filesystems_are_real_and_deduplicated() {
     assert!(!filesystems.is_empty(), "at least the root filesystem");
     for fs in &filesystems {
         assert!(fs.used_percent >= 0.0 && fs.used_percent <= 100.0, "{fs:?}");
-        assert!(fs.inode_used_percent >= 0.0 && fs.inode_used_percent <= 100.0, "{fs:?}");
+        assert!(
+            fs.inode_used_percent >= 0.0 && fs.inode_used_percent <= 100.0,
+            "{fs:?}"
+        );
     }
     let mut points: Vec<&str> = filesystems.iter().map(|f| f.mount_point.as_str()).collect();
     points.sort_unstable();
     let before = points.len();
     points.dedup();
-    assert_eq!(points.len(), before, "a mount point is reported once: {filesystems:#?}");
+    assert_eq!(
+        points.len(),
+        before,
+        "a mount point is reported once: {filesystems:#?}"
+    );
 }
 
 /// `statvfs` on an autofs mount point triggers the automount, so the scan
@@ -81,7 +99,9 @@ fn an_unmounted_autofs_trigger_is_never_measured() {
         .collect();
     let dormant: Vec<&str> = entries
         .iter()
-        .filter(|(point, fstype)| *fstype == "autofs" && !entries.iter().any(|(p, f)| p == point && *f != "autofs"))
+        .filter(|(point, fstype)| {
+            *fstype == "autofs" && !entries.iter().any(|(p, f)| p == point && *f != "autofs")
+        })
         .map(|(point, _)| *point)
         .collect();
     if dormant.is_empty() {
@@ -104,11 +124,19 @@ fn units_reads_this_machines_units() {
     assert!(!units.is_empty(), "a running host has units");
     // Every unit systemd knows, nothing filtered. `.device` units used to
     // be dropped for costing a round trip each; none of them costs one now.
-    for suffix in [".service", ".device", ".target", ".socket", ".mount", ".timer"] {
-        assert!(units.iter().any(|u| u.name.ends_with(suffix)), "no {suffix} unit is listed");
+    for suffix in [
+        ".service", ".device", ".target", ".socket", ".mount", ".timer",
+    ] {
+        assert!(
+            units.iter().any(|u| u.name.ends_with(suffix)),
+            "no {suffix} unit is listed"
+        );
     }
     for unit in &units {
-        assert!(!unit.sub_state.is_empty(), "every unit has a sub-state: {unit:?}");
+        assert!(
+            !unit.sub_state.is_empty(),
+            "every unit has a sub-state: {unit:?}"
+        );
     }
 }
 
@@ -130,12 +158,21 @@ fn a_warm_cold_cache_agrees_with_the_fresh_read() {
 
     let mut compared = 0;
     for a in &first {
-        let Some(b) = second.iter().find(|u| u.name == a.name) else { continue };
-        assert_eq!(a.enabled, b.enabled, "{}: cached enabled must match the fresh read", a.name);
+        let Some(b) = second.iter().find(|u| u.name == a.name) else {
+            continue;
+        };
+        assert_eq!(
+            a.enabled, b.enabled,
+            "{}: cached enabled must match the fresh read",
+            a.name
+        );
         assert_eq!(a.cgroup, b.cgroup, "{}: cached cgroup must match", a.name);
         compared += 1;
     }
-    assert!(compared > 0, "the two polls shared no units at all, which cannot be right");
+    assert!(
+        compared > 0,
+        "the two polls shared no units at all, which cannot be right"
+    );
 }
 
 /// Restart history is recovered from the journal at startup, so the
@@ -145,13 +182,24 @@ fn a_warm_cold_cache_agrees_with_the_fresh_read() {
 #[test]
 fn the_first_poll_may_report_history_recovered_from_the_journal() {
     let Some(svc) = service() else { return };
-    let now_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).expect("a clock after 1970").as_millis() as u64;
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("a clock after 1970")
+        .as_millis() as u64;
     let units = svc.units().expect("units");
 
     for unit in &units {
         for stamp in &unit.restart_timestamps_ms {
-            assert!(*stamp <= now_ms, "{}: a restart in the future: {stamp}", unit.name);
-            assert!(now_ms - stamp <= WINDOW_MS + 60_000, "{}: a restart older than the window: {stamp}", unit.name);
+            assert!(
+                *stamp <= now_ms,
+                "{}: a restart in the future: {stamp}",
+                unit.name
+            );
+            assert!(
+                now_ms - stamp <= WINDOW_MS + 60_000,
+                "{}: a restart older than the window: {stamp}",
+                unit.name
+            );
         }
     }
     // A host with a volatile journal legitimately recovers nothing, so
@@ -164,9 +212,14 @@ fn the_first_poll_may_report_history_recovered_from_the_journal() {
 #[test]
 fn a_units_journal_reads_that_unit() {
     let Some(svc) = service() else { return };
-    let entries = svc.unit_journal("systemd-journald.service", 20).expect("journal entries");
+    let entries = svc
+        .unit_journal("systemd-journald.service", 20)
+        .expect("journal entries");
     for entry in &entries {
-        assert!(entry.timestamp_ms > 1_600_000_000_000, "journal timestamps are Unix ms: {entry:?}");
+        assert!(
+            entry.timestamp_ms > 1_600_000_000_000,
+            "journal timestamps are Unix ms: {entry:?}"
+        );
         // `-u` returns two things: the unit's own output, tagged with the
         // unit by journald from the sender's cgroup, and systemd's
         // messages *about* it, which come from pid 1 and are tagged
@@ -194,16 +247,41 @@ fn proc_detail_reads_this_process() {
     let pid = std::process::id();
     let detail = proc::detail::read_proc_detail(pid, &sockets).expect("this process exists");
 
-    let cmdline = detail.cmdline.as_deref().expect("a test binary has a command line");
-    assert!(cmdline.contains("live"), "the running test binary: {cmdline:?}");
-    assert!(detail.exe.as_deref().unwrap_or_default().contains("live"), "{:?}", detail.exe);
-    assert!(detail.cwd.is_some(), "a process always has a working directory");
+    let cmdline = detail
+        .cmdline
+        .as_deref()
+        .expect("a test binary has a command line");
+    assert!(
+        cmdline.contains("live"),
+        "the running test binary: {cmdline:?}"
+    );
+    assert!(
+        detail.exe.as_deref().unwrap_or_default().contains("live"),
+        "{:?}",
+        detail.exe
+    );
+    assert!(
+        detail.cwd.is_some(),
+        "a process always has a working directory"
+    );
     assert!(detail.ppid.is_some(), "every process but init has a parent");
-    assert!(detail.virt_bytes.unwrap_or(0) > 0, "a userspace process has mapped memory: {:?}", detail.virt_bytes);
-    assert!(detail.env.iter().any(|(key, _)| key == "PATH"), "PATH is always set");
+    assert!(
+        detail.virt_bytes.unwrap_or(0) > 0,
+        "a userspace process has mapped memory: {:?}",
+        detail.virt_bytes
+    );
+    assert!(
+        detail.env.iter().any(|(key, _)| key == "PATH"),
+        "PATH is always set"
+    );
 
     // 0, 1 and 2 always exist, whatever they point at.
-    let standard: Vec<u32> = detail.fds.iter().filter(|fd| fd.is_standard()).map(|fd| fd.number).collect();
+    let standard: Vec<u32> = detail
+        .fds
+        .iter()
+        .filter(|fd| fd.is_standard())
+        .map(|fd| fd.number)
+        .collect();
     assert_eq!(standard, vec![0, 1, 2], "{:?}", detail.fds);
 }
 

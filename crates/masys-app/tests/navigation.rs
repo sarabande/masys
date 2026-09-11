@@ -29,10 +29,15 @@ fn snapshot() -> Snapshot {
         load: None,
         uptime_secs: None,
         memory: None,
+        cpu_times: None,
+        thermal_throttled_ms_by_core: None,
     }
 }
 
-fn with_cgroup(mut p: masys_domain::sample::Proc, cgroup: Option<&str>) -> masys_domain::sample::Proc {
+fn with_cgroup(
+    mut p: masys_domain::sample::Proc,
+    cgroup: Option<&str>,
+) -> masys_domain::sample::Proc {
     p.cgroup = cgroup.map(str::to_string);
     p
 }
@@ -49,10 +54,19 @@ fn app() -> App {
         queued: Default::default(),
         proc_details: Default::default(),
         detail_queries: Default::default(),
+        units_fail_with: None,
+        sample_fail_with: None,
+        smart: None,
+        smart_reads: Default::default(),
     };
-    let platform = FakePlatformService { boot_pressure: None, pending_reboot: None };
-    let mut app = App::new(Box::new(system), Box::new(platform), Box::new(fake::NoScanner), "devbox".to_string());
-    app.tick(1_000, "t".to_string()).expect("tick");
+    let platform = FakePlatformService::default();
+    let mut app = App::new(
+        Box::new(system),
+        Box::new(platform),
+        Box::new(fake::NoScanner),
+        "devbox".to_string(),
+    );
+    app.tick(1_000, "t".to_string());
     app
 }
 
@@ -78,10 +92,10 @@ fn a_session_opens_on_the_status_buffer() {
     assert!(matches!(app.view().header, Header::Status { .. }));
 }
 
-/// A digit jumps straight to its view - the only way to switch. Letters
-/// are the view's own; none of them navigates.
+/// A digit jumps straight to its buffer - the only way to switch. Letters
+/// are the buffer's own; none of them navigates.
 #[test]
-fn a_digit_switches_views() {
+fn a_digit_switches_buffers() {
     let mut app = app();
     press(&mut app, "2");
     assert_eq!(app.buffer(), Buffer::Procs);
@@ -93,7 +107,11 @@ fn a_digit_switches_views() {
     // The letters these jumps used to occupy no longer move anything.
     for stale in ["s", "t", "u", "j", "d"] {
         press(&mut app, stale);
-        assert_eq!(app.buffer(), Buffer::Status, "`{stale}` still switches views");
+        assert_eq!(
+            app.buffer(),
+            Buffer::Status,
+            "`{stale}` still switches buffers"
+        );
     }
 }
 
@@ -106,19 +124,32 @@ fn b_no_longer_swallows_the_next_key() {
     press(&mut app, "b");
     assert_eq!(app.buffer(), Buffer::Status);
     press(&mut app, "2");
-    assert_eq!(app.buffer(), Buffer::Procs, "the digit after b is read normally");
+    assert_eq!(
+        app.buffer(),
+        Buffer::Procs,
+        "the digit after b is read normally"
+    );
 }
 
-/// `q` quits from every view. It used to bury to Status first, which is
-/// two meanings on one key - and with a digit reaching any view directly
+/// `q` quits from every buffer. It used to bury to Status first, which is
+/// two meanings on one key - and with a digit reaching any buffer directly
 /// there is nothing left for the burying half to do.
 #[test]
-fn q_quits_from_every_view() {
-    for (digit, buffer) in [("1", Buffer::Status), ("2", Buffer::Procs), ("3", Buffer::Systemd), ("4", Buffer::Io)] {
+fn q_quits_from_every_buffer() {
+    for (digit, buffer) in [
+        ("1", Buffer::Status),
+        ("2", Buffer::Procs),
+        ("3", Buffer::Systemd),
+        ("4", Buffer::Io),
+    ] {
         let mut app = app();
         press(&mut app, digit);
         assert_eq!(app.buffer(), buffer);
-        assert_eq!(press(&mut app, "q"), Flow::Quit, "q must quit from {buffer:?}");
+        assert_eq!(
+            press(&mut app, "q"),
+            Flow::Quit,
+            "q must quit from {buffer:?}"
+        );
     }
 }
 
@@ -127,12 +158,20 @@ fn the_cursor_moves_and_stops_at_both_ends() {
     let mut app = app();
     let first = app.view().selected.expect("a cursor on a non-empty buffer");
     press_key(&mut app, KeyCode::Up, 1);
-    assert_eq!(app.view().selected, Some(first), "the cursor does not run off the top");
+    assert_eq!(
+        app.view().selected,
+        Some(first),
+        "the cursor does not run off the top"
+    );
 
     press_key(&mut app, KeyCode::Down, 24);
     let last = app.view().selected.expect("a cursor");
     press_key(&mut app, KeyCode::Down, 1);
-    assert_eq!(app.view().selected, Some(last), "the cursor does not run off the bottom");
+    assert_eq!(
+        app.view().selected,
+        Some(last),
+        "the cursor does not run off the bottom"
+    );
 }
 
 /// A blank line is spacing, not a row: landing the cursor on one would
@@ -142,7 +181,10 @@ fn the_cursor_never_lands_on_a_spacer() {
     let mut app = app();
     for _ in 0..30 {
         let selected = app.view().selected.expect("a cursor");
-        assert!(!matches!(app.view().rows[selected], Node::Spacer), "row {selected} is a spacer");
+        assert!(
+            !matches!(app.view().rows[selected], Node::Spacer),
+            "row {selected} is a spacer"
+        );
         app.handle_key(Key::new(KeyCode::Down));
     }
 }
@@ -160,9 +202,17 @@ fn each_buffer_remembers_its_own_cursor() {
     let procs_cursor = app.view().selected.expect("a cursor");
 
     press(&mut app, "1");
-    assert_eq!(app.view().selected, Some(status_cursor), "Status kept its place");
+    assert_eq!(
+        app.view().selected,
+        Some(status_cursor),
+        "Status kept its place"
+    );
     press(&mut app, "2");
-    assert_eq!(app.view().selected, Some(procs_cursor), "Procs kept its place");
+    assert_eq!(
+        app.view().selected,
+        Some(procs_cursor),
+        "Procs kept its place"
+    );
 }
 
 /// Rows are rebuilt on every tick, and a buffer can shrink between them.
@@ -187,11 +237,19 @@ fn the_cursor_is_clamped_when_the_buffer_shrinks() {
         queued: Default::default(),
         proc_details: Default::default(),
         detail_queries: Default::default(),
+        units_fail_with: None,
+        sample_fail_with: None,
+        smart: None,
+        smart_reads: Default::default(),
     }));
-    app.tick(2_000, "t".to_string()).expect("tick");
+    app.tick(2_000, "t".to_string());
 
     let selected = app.view().selected.expect("a cursor");
-    assert!(selected < app.view().rows.len(), "cursor {selected} is past {} rows", app.view().rows.len());
+    assert!(
+        selected < app.view().rows.len(),
+        "cursor {selected} is past {} rows",
+        app.view().rows.len()
+    );
 }
 
 #[test]
@@ -211,7 +269,7 @@ fn g_refreshes_without_changing_buffer_or_cursor() {
 /// named `/` that sorts first and buries the real services.
 #[test]
 fn kernel_threads_bucket_separately_from_real_cgroups() {
-    use masys_app::procs::{KERNEL_GROUP, build_proc_rows};
+    use masys_app::procs::{KERNEL_GROUP, ProcsBuffer};
     use std::collections::HashSet;
 
     let mut kthread = proc(2, "kthreadd", 0);
@@ -221,16 +279,12 @@ fn kernel_threads_bucket_separately_from_real_cgroups() {
     let mut orphan = proc(4, "weird", 0);
     orphan.cgroup = None;
 
-    let rows = build_proc_rows(
-        &[kthread, service, orphan],
-        &[],
-        &HashSet::new(),
-        masys_app::keymap::Sort::Name,
-        false,
-        100,
-        0,
-        &Default::default(),
-    );
+    let procs = ProcsBuffer {
+        sort: masys_app::keymap::Sort::Name,
+        descending: false,
+        ..Default::default()
+    };
+    let rows = procs.rows(&[kthread, service, orphan], 100, &HashSet::new(), 0);
     let groups: Vec<String> = rows
         .iter()
         .filter_map(|r| match r {
@@ -238,7 +292,13 @@ fn kernel_threads_bucket_separately_from_real_cgroups() {
             _ => None,
         })
         .collect();
-    assert_eq!(groups, vec!["/system.slice/sshd.service".to_string(), KERNEL_GROUP.to_string()]);
+    assert_eq!(
+        groups,
+        vec![
+            "/system.slice/sshd.service".to_string(),
+            KERNEL_GROUP.to_string()
+        ]
+    );
 }
 
 /// 145 `kworker/*` rows are noise, which is why the design's own mockup
@@ -251,7 +311,9 @@ fn the_kernel_bucket_starts_collapsed() {
     let kernel = rows
         .iter()
         .find_map(|r| match r {
-            Node::ProcGroup { name, expanded, .. } if name == masys_app::procs::KERNEL_GROUP => Some(*expanded),
+            Node::ProcGroup { name, expanded, .. } if name == masys_app::procs::KERNEL_GROUP => {
+                Some(*expanded)
+            }
             _ => None,
         })
         .expect("a kernel group");

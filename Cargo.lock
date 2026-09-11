@@ -890,7 +890,7 @@ dependencies = [
  "crossterm",
  "masys-app",
  "masys-domain",
- "masys-platform-fallback",
+ "masys-platform-debian",
  "masys-platform-nixos",
  "masys-render",
  "masys-scan",
@@ -916,7 +916,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "masys-platform-fallback"
+name = "masys-platform-debian"
 version = "0.1.0"
 dependencies = [
  "masys-domain",

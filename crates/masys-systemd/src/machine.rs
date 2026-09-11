@@ -17,10 +17,19 @@ pub fn parse_os_release(text: &str) -> String {
     let field = |key: &str| -> Option<String> {
         text.lines()
             .find_map(|line| line.strip_prefix(key)?.strip_prefix('='))
-            .map(|value| value.trim().trim_matches('"').trim_matches('\'').to_string())
+            .map(|value| {
+                value
+                    .trim()
+                    .trim_matches('"')
+                    .trim_matches('\'')
+                    .to_string()
+            })
             .filter(|value| !value.is_empty())
     };
-    field("PRETTY_NAME").or_else(|| field("NAME")).or_else(|| field("ID")).unwrap_or_else(|| "unknown".to_string())
+    field("PRETTY_NAME")
+        .or_else(|| field("NAME"))
+        .or_else(|| field("ID"))
+        .unwrap_or_else(|| "unknown".to_string())
 }
 
 /// `(model, logical cpu count)` from `/proc/cpuinfo`.
@@ -37,9 +46,16 @@ pub fn parse_os_release(text: &str) -> String {
 pub fn parse_cpuinfo(text: &str) -> (String, u32) {
     let model = text
         .lines()
-        .find_map(|line| line.strip_prefix("model name")?.split_once(':').map(|(_, v)| v.trim().to_string()))
+        .find_map(|line| {
+            line.strip_prefix("model name")?
+                .split_once(':')
+                .map(|(_, v)| v.trim().to_string())
+        })
         .unwrap_or_default();
-    let cores = text.lines().filter(|line| line.starts_with("processor")).count() as u32;
+    let cores = text
+        .lines()
+        .filter(|line| line.starts_with("processor"))
+        .count() as u32;
     (model, cores)
 }
 
@@ -52,7 +68,10 @@ pub fn read_machine() -> Machine {
     let (cpu_model, cpu_cores) = parse_cpuinfo(&cpuinfo);
     Machine {
         distro: parse_os_release(&os_release),
-        kernel: std::fs::read_to_string("/proc/sys/kernel/osrelease").unwrap_or_default().trim().to_string(),
+        kernel: std::fs::read_to_string("/proc/sys/kernel/osrelease")
+            .unwrap_or_default()
+            .trim()
+            .to_string(),
         arch: arch(),
         cpu_model,
         cpu_cores,
@@ -68,6 +87,11 @@ fn arch() -> String {
     if unsafe { libc::uname(&mut buf) } != 0 {
         return String::new();
     }
-    let bytes: Vec<u8> = buf.machine.iter().take_while(|c| **c != 0).map(|c| *c as u8).collect();
+    let bytes: Vec<u8> = buf
+        .machine
+        .iter()
+        .take_while(|c| **c != 0)
+        .map(|c| *c as u8)
+        .collect();
     String::from_utf8_lossy(&bytes).into_owned()
 }

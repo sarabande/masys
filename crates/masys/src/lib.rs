@@ -4,19 +4,22 @@
 //! this line knows which implementations it is talking to, and nothing
 //! above this line names `ratatui` or `crossterm`.
 
+mod platform;
+
 use std::io::Write;
+use std::str::FromStr;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crossterm::event::{self, Event, KeyCode as TermCode, KeyEvent, KeyEventKind, KeyModifiers};
-use masys_app::buffer::Registry;
+use masys_app::buffer::{BufferGates, Registry};
 use masys_app::keymap::Keymap;
 use masys_app::{Aftermath, App, Flow, Key, KeyCode};
-use masys_domain::declarative::DeclarativeService;
-use masys_domain::service::{PlatformService, SystemService};
-use masys_platform_fallback::FallbackPlatform;
-use masys_platform_nixos::{NixosPlatform, is_nixos};
+use masys_domain::finding::Thresholds;
+use masys_domain::service::SystemService;
 use masys_render::theme::Theme;
 use masys_systemd::SystemdService;
+use platform::{NoScanner, select_declarative, select_packages, select_platform};
+use ratatui::style::Color;
 use ratatui::{DefaultTerminal, Frame};
 
 /// How far back flapping is looked for. Matches
@@ -50,28 +53,48 @@ pub fn run() -> Result<(), String> {
     // The design's error table: "not a systemd host - refuse to start with
     // one clear line". Connecting to the bus is what actually establishes
     // that, so the check and the connection are the same step.
-    let system = SystemdService::connect(FLAPPING_WINDOW_MS)
-        .map_err(|e| format!("cannot reach systemd on the system bus - is this a systemd host? ({e})"))?;
+    let system = SystemdService::connect(FLAPPING_WINDOW_MS).map_err(|e| {
+        format!("cannot reach systemd on the system bus - is this a systemd host? ({e})")
+    })?;
 
     // One read, because three decisions turn on the one fact: which
     // platform adapter, whether there is a declarative service, and
-    // which views the keymap has. Reading the file once per question
+    // which buffers the keymap has. Reading the file once per question
     // would be three chances for one host to answer the same question
     // three ways.
-    let os_release = std::fs::read_to_string("/etc/os-release").unwrap_or_default();
+    //
+    // `None` where it could not be read, kept apart from `Some("")`:
+    // collapsing the two let an unreadable file reach `FallbackPlatform`
+    // as an unrecognised distro, which answers `Ownership::Imperative`
+    // and so promises a `systemctl enable` will stick on a host that may
+    // be NixOS.
+    let os_release = std::fs::read_to_string("/etc/os-release").ok();
 
     // Distro detection, at last with something to choose between. The
     // guard this feeds is not cosmetic: on NixOS a unit's definition
     // lives in the read-only store, so enabling one either fails or is
     // undone by the next rebuild, and the fallback adapter would have
     // reported it as a change that sticks.
-    let platform = select_platform(&os_release);
-    let declarative = select_declarative(&os_release);
+    // The other two already fail safe on an unreadable file - no
+    // declarative service and no package adapter is the same answer they
+    // give an unrecognised distro, and both absences are honest. Only
+    // `select_platform` had an answer that changed.
+    let platform = select_platform(os_release.as_deref());
+    let declarative = select_declarative(os_release.as_deref().unwrap_or_default());
+    let packages = select_packages(os_release.as_deref().unwrap_or_default());
 
     // The registry follows the service, not the distro name: it is the
     // presence of an adapter that decides whether `5` exists, and
     // `App::with_declarative` asserts the two agree.
-    let (keymap, problems) = load_keymap(Registry::new(declarative.is_some()));
+    let Config {
+        keymap,
+        thresholds,
+        theme,
+        problems,
+    } = load_config(Registry::new(BufferGates {
+        declarative: declarative.is_some(),
+        packages: packages.is_some(),
+    }));
     // The retention floor is scaled to the filesystem being scanned, and
     // the largest mounted one is the honest yardstick for a scanner that
     // will be pointed at any of them.
@@ -79,11 +102,20 @@ pub fn run() -> Result<(), String> {
     let scanner: Box<dyn masys_domain::scan::DirScanner> = match scanner {
         Some(scanner) => Box::new(scanner),
         // A pool that will not build is not a reason to refuse to start:
-        // every other view still works, and this one simply finds
+        // every other buffer still works, and this one simply finds
         // nothing.
         None => Box::new(NoScanner),
     };
-    let mut app = App::with_declarative(Box::new(system) as Box<dyn SystemService>, platform, scanner, hostname(), keymap, declarative);
+    let mut app = App::with_declarative(
+        Box::new(system) as Box<dyn SystemService>,
+        platform,
+        scanner,
+        hostname(),
+        keymap,
+        declarative,
+    );
+    app.set_package_service(packages);
+    app.set_thresholds(thresholds);
     // Reported before the terminal is taken over, because a config
     // problem the operator cannot see is a config problem they will not
     // fix - and this is the last moment there is a real terminal to
@@ -94,14 +126,14 @@ pub fn run() -> Result<(), String> {
 
     // One tick before the first draw, so the opening frame shows the
     // machine rather than an empty buffer that fills in two seconds later.
-    let _ = tick(&mut app);
+    tick(&mut app);
 
     // `ratatui::init` panics when there is no terminal - piping masys
     // into `less` printed a backtrace from inside ratatui rather than
     // saying what was wrong. This is the last point where a plain message
     // still reaches the user.
     let mut terminal = ratatui::try_init().map_err(|e| format!("masys needs a terminal ({e})"))?;
-    let result = event_loop(&mut terminal, &mut app);
+    let result = event_loop(&mut terminal, &mut app, &theme);
     // Restore before propagating: a raw-mode terminal would otherwise
     // swallow the error message about to be printed.
     ratatui::restore();
@@ -121,7 +153,10 @@ fn hostname() -> String {
 }
 
 fn now_unix_ms() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 /// The status header's clock, in the host's own timezone.
@@ -133,15 +168,18 @@ fn timestamp(now_ms: u64) -> String {
     masys_render::view::local_datetime(now_ms)
 }
 
-/// One sample-and-triage pass. Errors are returned rather than swallowed;
-/// the caller decides whether one failed tick should end the session.
-fn tick(app: &mut App) -> Result<(), masys_domain::MasysError> {
+/// One sample-and-triage pass.
+///
+/// Nothing is returned, and that is the point: a failed sample reports
+/// itself in the echo line. All four call sites here were
+/// `let _ = tick(app)` while this handed back a `Result`, so the failure
+/// that ends a pass was the one thing on the screen nobody could see.
+fn tick(app: &mut App) {
     let now = now_unix_ms();
     app.tick(now, timestamp(now))
 }
 
-fn event_loop(terminal: &mut DefaultTerminal, app: &mut App) -> std::io::Result<()> {
-    let theme = Theme::default();
+fn event_loop(terminal: &mut DefaultTerminal, app: &mut App, theme: &Theme) -> std::io::Result<()> {
     let mut next_tick = Instant::now() + TICK;
 
     loop {
@@ -149,7 +187,7 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App) -> std::io::Result<
         // renderer consumes it. The renderer never holds an `&mut App`, so
         // drawing cannot mutate session state behind our back.
         terminal.draw(|frame: &mut Frame| {
-            masys_render::render(frame, &app.view(), &theme);
+            masys_render::render(frame, &app.view(), theme);
         })?;
 
         // Wait only as long as is left before the next sample, so a
@@ -163,7 +201,11 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App) -> std::io::Result<
         // 250 ms cadence affordable - and on a host without libsystemd it
         // answers "no" for free and the tick does the work instead.
         let until_tick = next_tick.saturating_duration_since(Instant::now());
-        let wait = if app.following() { until_tick.min(FOLLOW_POLL) } else { until_tick };
+        let wait = if app.following() {
+            until_tick.min(FOLLOW_POLL)
+        } else {
+            until_tick
+        };
         if event::poll(wait)?
             && let Event::Key(event) = event::read()?
             && event.kind == KeyEventKind::Press
@@ -172,7 +214,8 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App) -> std::io::Result<
             // binding: it is not in the keymap because a user must
             // not be able to rebind their way out of being able to
             // quit.
-            if event.code == TermCode::Char('c') && event.modifiers.contains(KeyModifiers::CONTROL) {
+            if event.code == TermCode::Char('c') && event.modifiers.contains(KeyModifiers::CONTROL)
+            {
                 return Ok(());
             }
             let key = convert(event);
@@ -180,7 +223,7 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App) -> std::io::Result<
             // itself: it needs a clock, and `App::tick` deliberately
             // takes the time rather than reading one.
             if app.wants_refresh(key) {
-                let _ = tick(app);
+                tick(app);
                 next_tick = Instant::now() + TICK;
             } else {
                 match app.handle_key(key) {
@@ -224,7 +267,7 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App) -> std::io::Result<
                 // exactly when an operator wants the tool to stay up. The
                 // design's error table calls this "skip that tick, do not
                 // block the loop".
-                let _ = tick(app);
+                tick(app);
             }
             next_tick = Instant::now() + TICK;
         }
@@ -260,7 +303,7 @@ fn suspended(app: &mut App) -> std::io::Result<DefaultTerminal> {
     let terminal = ratatui::try_init()?;
     // The unit may have changed under the editor, and the frame drawn next
     // is the first thing the operator sees on coming back.
-    let _ = tick(app);
+    tick(app);
     Ok(terminal)
 }
 
@@ -274,7 +317,7 @@ fn suspended(app: &mut App) -> std::io::Result<DefaultTerminal> {
 /// `nix store diff-closures`; and a confirmation reads `{what}  y / n`, a
 /// statement followed by the key that answers it, so this is a statement
 /// followed by the key that answers it.
-const RESUME_PROMPT: &str = "masys: any key returns to the view";
+const RESUME_PROMPT: &str = "masys: any key returns to the buffer";
 
 /// Holds the normal screen until the operator has read what is on it.
 ///
@@ -327,7 +370,7 @@ fn wait_for_key() -> std::io::Result<()> {
 /// ctrl-c is not special here. Raw mode delivers it as a key like any
 /// other, so it dismisses the pause rather than raising SIGINT, and the
 /// loop's own ctrl-c branch takes the next one. Driven through a pty: the
-/// first returns to the view, the second quits. Two presses to leave is
+/// first returns to the buffer, the second quits. Two presses to leave is
 /// the right cost - the alternative is a key that discards the output the
 /// pause exists to show.
 fn wait_for_press() -> std::io::Result<()> {
@@ -377,33 +420,7 @@ fn convert(event: KeyEvent) -> Key {
     }
 }
 
-/// The platform adapter for this host.
-///
-/// Given `/etc/os-release`'s text rather than reading it, so that the one
-/// read in `run` settles every question the file answers. An unreadable or
-/// unrecognised file gets the fallback, which answers every distro-specific
-/// question with "not supported" - the design's point being that an unknown
-/// distro is a normal working state rather than an error.
-fn select_platform(os_release: &str) -> Box<dyn PlatformService> {
-    if is_nixos(os_release) {
-        return Box::new(NixosPlatform);
-    }
-    Box::new(FallbackPlatform)
-}
-
-/// The declarative adapter for this host, if it has one.
-///
-/// `None` is the ordinary answer everywhere but NixOS, and it is what
-/// keeps the Nix view off a host that has no generations to show. Absent
-/// rather than empty: an unreadable `/etc/os-release` reads as not-NixOS
-/// here, which is the same answer a Debian box gives, and on a host that
-/// really is NixOS the view going missing is a visible failure rather
-/// than a screen of dashes pretending to be readings.
-fn select_declarative(os_release: &str) -> Option<Box<dyn DeclarativeService>> {
-    is_nixos(os_release).then(|| Box::new(NixosPlatform) as Box<dyn DeclarativeService>)
-}
-
-/// The keymap, with `~/.config/masys/config.toml`'s `[keys]` applied.
+/// The keymap and the triage thresholds, from `~/.config/masys/config.toml`.
 ///
 /// Read here rather than in masys-app for the same reason the platform
 /// adapter is chosen here: the composition root owns I/O and file
@@ -420,16 +437,40 @@ fn select_declarative(os_release: &str) -> Option<Box<dyn DeclarativeService>> {
 /// `keymap_from`'s decision, not this function's - this is the only half
 /// that touches the filesystem, and the only half `keymap_from`'s tests
 /// do not have to.
-fn load_keymap(registry: Registry) -> (Keymap, Vec<String>) {
+fn load_config(registry: Registry) -> Config {
     let Some(path) = config_path() else {
-        return keymap_from(registry, "", None);
+        return config_from(registry, "", None);
     };
     let text = std::fs::read_to_string(&path).ok();
-    keymap_from(registry, &path.to_string_lossy(), text.as_deref())
+    config_from(registry, &path.to_string_lossy(), text.as_deref())
 }
 
-/// Every decision `load_keymap` makes once the filesystem has answered
+/// Everything one config file has to say, and everything masys would not
+/// take from it.
+///
+/// A struct rather than a fourth element on a tuple, for the reason
+/// `triage::Tick` is one: three of these are what the file said and the
+/// fourth is what it got wrong, and at a call site their order was
+/// carrying the whole meaning. Each field is what the host asked for on
+/// its own axis - which keys, what counts as a problem, what it is drawn
+/// in - so a caller that wants one of them names it.
+struct Config {
+    keymap: Keymap,
+    thresholds: Thresholds,
+    theme: Theme,
+    /// Every setting masys refused, in the order the file offered them,
+    /// for printing before the terminal is taken over. Empty is the
+    /// normal case, including for a host with no config file at all.
+    problems: Vec<String>,
+}
+
+/// Every decision `load_config` makes once the filesystem has answered
 /// its one question: is there a config file, and what does it say.
+///
+/// One function for all three tables rather than one apiece, because the
+/// file is parsed here: three loaders would parse it three times and
+/// report a stray bracket three times, which reads as three problems
+/// with one file.
 ///
 /// `text` folds two of the five paths - no config file, and a file that
 /// exists but could not be read - into the same `None`: both already
@@ -439,20 +480,44 @@ fn load_keymap(registry: Registry) -> (Keymap, Vec<String>) {
 /// no real path to offer may pass an empty one.
 ///
 /// `registry` is threaded through every return rather than any of them
-/// falling back to `Keymap::default()`. Which views a host has is a fact
+/// falling back to `Keymap::default()`. Which buffers a host has is a fact
 /// about the host, not about its config file: a NixOS box with no
 /// `~/.config/masys/config.toml` still has generations to show, and a
 /// default keymap on that host would drop `5` while the service that
 /// feeds it exists - the exact disagreement `App::with_declarative`
 /// asserts against.
-fn keymap_from(registry: Registry, path: &str, text: Option<&str>) -> (Keymap, Vec<String>) {
+fn config_from(registry: Registry, path: &str, text: Option<&str>) -> Config {
+    let untouched = |registry, problems| Config {
+        keymap: Keymap::for_registry(registry),
+        thresholds: Thresholds::default(),
+        theme: Theme::default(),
+        problems,
+    };
     let Some(text) = text else {
-        return (Keymap::for_registry(registry), Vec::new());
+        return untouched(registry, Vec::new());
     };
     let table: toml::Table = match text.parse() {
         Ok(table) => table,
-        Err(e) => return (Keymap::for_registry(registry), vec![format!("{path}: {e}")]),
+        // All three fall back together. A file masys could not parse has
+        // said nothing about any of them, and applying a third of
+        // nothing would be worse than applying none of it.
+        Err(e) => return untouched(registry, vec![format!("{path}: {e}")]),
     };
+    let (keymap, mut problems) = keymap_from_table(registry, &table);
+    let (thresholds, mut rejected) = thresholds_from_table(&table);
+    problems.append(&mut rejected);
+    let (theme, mut unknown) = theme_from_table(&table);
+    problems.append(&mut unknown);
+    Config {
+        keymap,
+        thresholds,
+        theme,
+        problems,
+    }
+}
+
+/// The `[keys]` table, applied on top of the given registry.
+fn keymap_from_table(registry: Registry, table: &toml::Table) -> (Keymap, Vec<String>) {
     let Some(keys) = table.get("keys").and_then(|keys| keys.as_table()) else {
         return (Keymap::for_registry(registry), Vec::new());
     };
@@ -470,11 +535,176 @@ fn keymap_from(registry: Registry, path: &str, text: Option<&str>) -> (Keymap, V
     (keymap, problems)
 }
 
+/// The `[thresholds]` table, on top of the values the design names.
+///
+/// The design's Keymap and config section says thresholds live in config
+/// rather than in code, and `masys_domain::finding::Thresholds` has taken
+/// them as a parameter since it was written; this is the loader that had
+/// never been built. Every rule keeps its default until a file says
+/// otherwise, so a host with no config file evaluates exactly as before.
+///
+/// The keys are the struct's own field names, deliberately. A friendlier
+/// spelling - `flapping_window` over `flapping_window_ms` - would be a
+/// mapping table between what an operator writes and what triage reads,
+/// and a mapping table is a thing that can drift. One name for one
+/// number.
+///
+/// A value masys will not take leaves that one threshold at its default
+/// and says so, the rule `[keys]` already follows: a typo should cost you
+/// the customisation, not the check. Unknown keys are reported for the
+/// same reason - a misspelled `disk_used_percentage` that silently did
+/// nothing would leave an operator believing they had raised a threshold
+/// they had not.
+fn thresholds_from_table(table: &toml::Table) -> (Thresholds, Vec<String>) {
+    let mut thresholds = Thresholds::default();
+    let Some(configured) = table.get("thresholds").and_then(|table| table.as_table()) else {
+        return (thresholds, Vec::new());
+    };
+    let mut problems = Vec::new();
+    for (key, value) in configured {
+        let applied =
+            match key.as_str() {
+                "flapping_restart_count" => at_least_one(value)
+                    .map(|count| thresholds.flapping_restart_count = count as u32),
+                "flapping_window_ms" => {
+                    at_least_one(value).map(|window| thresholds.flapping_window_ms = window)
+                }
+                "psi_some_avg60_percent" => {
+                    percent(value).map(|percent| thresholds.psi_some_avg60_percent = percent)
+                }
+                "psi_full_avg60_percent" => {
+                    percent(value).map(|percent| thresholds.psi_full_avg60_percent = percent)
+                }
+                "disk_used_percent" => {
+                    percent(value).map(|percent| thresholds.disk_used_percent = percent)
+                }
+                "inode_used_percent" => {
+                    percent(value).map(|percent| thresholds.inode_used_percent = percent)
+                }
+                "journal_window_ms" => {
+                    at_least_one(value).map(|window| thresholds.journal_window_ms = window)
+                }
+                "journal_rows_per_section" => at_least_one(value)
+                    .map(|rows| thresholds.journal_rows_per_section = rows as u32),
+                "thermal_throttled_percent" => {
+                    percent(value).map(|percent| thresholds.thermal_throttled_percent = percent)
+                }
+                _ => Err("not a threshold masys has".to_string()),
+            };
+        if let Err(why) = applied {
+            problems.push(format!("`thresholds.{key}`: {why}"));
+        }
+    }
+    (thresholds, problems)
+}
+
+/// A count of something that must happen at least once to mean anything.
+///
+/// Zero is rejected rather than taken: a flapping window of no time, or a
+/// restart count of none, would make every unit on the host a finding the
+/// moment the file was saved - and the operator who typed it would be
+/// looking at a screen of alarms wondering what broke.
+fn at_least_one(value: &toml::Value) -> Result<u64, String> {
+    match value.as_integer() {
+        Some(number) if number >= 1 => Ok(number as u64),
+        Some(_) => Err("must be at least 1".to_string()),
+        None => Err("must be a whole number".to_string()),
+    }
+}
+
+/// A percentage of something, which means nothing outside 0 to 100.
+///
+/// Refused rather than clamped. `disk_used_percent = 150` clamped to 100
+/// is a check that never fires, reported as a check that was accepted;
+/// refused, it is one line on startup and the default still applies.
+///
+/// An integer is a number here. `disk_used_percent = 90` is what somebody
+/// writes, and TOML makes that an integer rather than a float - insisting
+/// on `90.0` would be the config file having opinions about arithmetic.
+fn percent(value: &toml::Value) -> Result<f32, String> {
+    let number = value
+        .as_float()
+        .or_else(|| value.as_integer().map(|integer| integer as f64));
+    match number {
+        Some(number) if (0.0..=100.0).contains(&number) => Ok(number as f32),
+        Some(_) => Err("must be between 0 and 100".to_string()),
+        None => Err("must be a number".to_string()),
+    }
+}
+
+/// The `[theme]` table, on top of the six colours masys draws with.
+///
+/// The keys are `Theme`'s own field names, for `[thresholds]`' reason:
+/// one name for one colour, and no mapping table between what an operator
+/// writes and what the renderer reads.
+///
+/// **Why the palette is not a preference.** Severity *is* colour here. A
+/// finding's glyph carries the shape - `x` dead, `~`/`^` warning, `!`
+/// urgent, `.` a plain fact - but the judgement is in the colour beside
+/// it, and two of the defaults are `LightRed` and `DarkGray`, the two
+/// most likely to be unreadable on a terminal somebody else configured.
+/// On such a host the tool's main signal was lost with no recourse.
+///
+/// A colour masys cannot read leaves that one slot at its default and
+/// says so, and an unknown key is reported rather than ignored - both
+/// the rule `[keys]` and `[thresholds]` already follow. An absent table,
+/// or one that names three colours, leaves the rest of the palette
+/// exactly as it is: a config file is a host with something to say, not
+/// a feature being switched on.
+fn theme_from_table(table: &toml::Table) -> (Theme, Vec<String>) {
+    let mut theme = Theme::default();
+    let Some(configured) = table.get("theme").and_then(|table| table.as_table()) else {
+        return (theme, Vec::new());
+    };
+    let mut problems = Vec::new();
+    for (key, value) in configured {
+        // The key first and the colour second, so a misspelled slot is
+        // reported as the slot masys does not have rather than as
+        // whatever its value turned out to be.
+        let applied = match key.as_str() {
+            "section_header" => color(value).map(|c| theme.section_header = c),
+            "severity_dead" => color(value).map(|c| theme.severity_dead = c),
+            "severity_warning" => color(value).map(|c| theme.severity_warning = c),
+            "severity_urgent" => color(value).map(|c| theme.severity_urgent = c),
+            "info" => color(value).map(|c| theme.info = c),
+            "status_error" => color(value).map(|c| theme.status_error = c),
+            _ => Err("not a colour masys draws with".to_string()),
+        };
+        if let Err(why) = applied {
+            problems.push(format!("`theme.{key}`: {why}"));
+        }
+    }
+    (theme, problems)
+}
+
+/// One colour, in any spelling the terminal library already accepts: a
+/// name (`red`, `light-red`, `darkgray`), a 0-255 palette index, or
+/// `#rrggbb`.
+///
+/// Its parser rather than a list of our own, which is not laziness about
+/// the six names: a host whose problem is that `LightRed` is illegible
+/// needs the spelling that names *its* palette entry, and a name-only
+/// vocabulary would answer that host with sixteen colours it has already
+/// redefined. The names remain what the README leads with, because they
+/// are what respects a terminal's own configuration.
+///
+/// A colour masys cannot read is named back in the problem. `theme.info:
+/// must be a colour` would leave an operator re-reading the line they
+/// just typed.
+fn color(value: &toml::Value) -> Result<Color, String> {
+    let Some(name) = value.as_str() else {
+        return Err("must be a string".to_string());
+    };
+    Color::from_str(name).map_err(|_| format!("`{name}` is not a colour masys can read"))
+}
+
 /// `$XDG_CONFIG_HOME/masys/config.toml`, falling back to `~/.config`.
 fn config_path() -> Option<std::path::PathBuf> {
     let base = std::env::var_os("XDG_CONFIG_HOME")
         .map(std::path::PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| std::path::PathBuf::from(home).join(".config")))?;
+        .or_else(|| {
+            std::env::var_os("HOME").map(|home| std::path::PathBuf::from(home).join(".config"))
+        })?;
     Some(base.join("masys").join("config.toml"))
 }
 
@@ -501,17 +731,6 @@ fn largest_filesystem_bytes(system: &SystemdService) -> u64 {
                 .unwrap_or(0)
         })
         .unwrap_or(0)
-}
-
-/// The scanner a host gets when the thread pool will not build.
-struct NoScanner;
-
-impl masys_domain::scan::DirScanner for NoScanner {
-    fn start(&self, _root: &std::path::Path) {}
-    fn poll(&self) -> masys_domain::scan::ScanProgress {
-        masys_domain::scan::ScanProgress::default()
-    }
-    fn cancel(&self) {}
 }
 
 #[cfg(test)]

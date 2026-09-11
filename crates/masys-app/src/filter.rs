@@ -6,39 +6,7 @@
 //! and less all use `/` and all mean "show me the lines with this in
 //! them".
 
-use masys_domain::finding::{Finding, PressureResource};
 use masys_view::Node;
-
-/// What a finding is *about*, in the words it is displayed under.
-///
-/// The status buffer's rows are findings, so without this `/` could never
-/// match anything there and the key emptied the whole buffer for every
-/// search an operator would actually type. The strings mirror what
-/// `masys_render::view` prints for each variant - searching for what is
-/// on the screen has to work, and the renderer is where "what is on the
-/// screen" is decided.
-fn finding_text(finding: &Finding) -> String {
-    match finding {
-        // The reason is free text from the unit's own log, and it is the
-        // most specific thing on the row - `curl: (6) could not resolve
-        // host` is worth being able to search for.
-        Finding::FailedUnit { unit, reason, .. } => match reason {
-            Some(reason) => format!("{unit} {reason}"),
-            None => unit.clone(),
-        },
-        Finding::FlappingUnit { unit, .. } => unit.clone(),
-        Finding::Pressure { resource, .. } => match resource {
-            PressureResource::Cpu => "cpu pressure".to_string(),
-            PressureResource::Io => "io pressure".to_string(),
-            PressureResource::Memory => "memory pressure".to_string(),
-        },
-        Finding::DiskCapacity { mount_point, .. } | Finding::InodeExhaustion { mount_point, .. } => mount_point.clone(),
-        Finding::ReadOnlyFilesystem { mount_point } => format!("{mount_point} read-only"),
-        Finding::ClockUnsynchronized => "clock not synchronized".to_string(),
-        Finding::OomKill { comm, pid, .. } => format!("{pid} {comm} oom"),
-        Finding::SystemDegraded { .. } => "system degraded".to_string(),
-    }
-}
 
 /// A row's searchable text, or `None` for a row that is structure rather
 /// than content.
@@ -47,37 +15,66 @@ fn text_of(node: &Node) -> Option<String> {
         Node::Proc { proc, .. } => Some(format!("{} {}", proc.pid, proc.comm)),
         Node::ProcGroup { name, .. } => Some(name.clone()),
         Node::Unit { unit, .. } => Some(format!("{} {}", unit.name, unit.sub_state)),
-        Node::Timer { name, activates, .. } => Some(format!("{name} {activates}")),
+        Node::Timer {
+            name, activates, ..
+        } => Some(format!("{name} {activates}")),
         Node::Filesystem { filesystem, .. } => Some(filesystem.mount_point.clone()),
         Node::DirEntry { path, .. } => Some(path.display().to_string()),
         Node::Disk { disk, .. } => Some(disk.name.clone()),
         Node::Interface { interface, .. } => Some(interface.name.clone()),
-        Node::JournalEntry(entry) => Some(format!("{} {}", entry.unit.clone().unwrap_or_else(|| "kernel".to_string()), entry.message)),
-        Node::Finding(finding) => Some(finding_text(finding)),
-        // The System section's body genuinely is context rather than a
-        // row you would search for: it is one block of machine facts,
-        // always present, and narrowing to it answers nothing.
-        Node::Overview(_) => None,
+        // Name and version both, so `/1.2` finds a version and `/git`
+        // finds a package - the search box is the only way through a list
+        // this long.
+        Node::Package(package) => Some(format!("{} {}", package.name, package.version)),
+        Node::JournalEntry(entry) => Some(format!(
+            "{} {}",
+            entry.unit.clone().unwrap_or_else(|| "kernel".to_string()),
+            entry.message
+        )),
+        Node::Finding { presentation, .. } => Some(presentation.searchable()),
+        // The System section is context rather than rows you would search
+        // for: machine facts that are always present, so narrowing to them
+        // answers nothing.
+        //
+        // Still `None` now that each line is its own row, and the effect
+        // is unchanged - every line is dropped, so the header follows and
+        // the section leaves the buffer whole, exactly as it did when one
+        // node carried the lot. Giving these lines real search text is a
+        // decision about what `/mem` should mean, not a consequence of
+        // splitting them, so it is not made here.
+        Node::OverviewLine { .. } => None,
         // A generation is found by its number or its version: `437` and
         // `26.11` are both things you would type to reach one, and the
         // number is what the rollback action names.
-        Node::Generation { generation, .. } => Some(format!("{} {}", generation.id, generation.label.clone().unwrap_or_default())),
-        Node::Input { input, .. } => Some(format!("{} {}", input.name, input.origin.clone().unwrap_or_default())),
+        Node::Generation { generation, .. } => Some(format!(
+            "{} {}",
+            generation.id,
+            generation.label.clone().unwrap_or_default()
+        )),
+        Node::Input { input, .. } => Some(format!(
+            "{} {}",
+            input.name,
+            input.origin.clone().unwrap_or_default()
+        )),
         // The job and the unit behind it, because either is a reasonable
         // thing to search for: `gc` is what it does, `nix-gc.timer` is
-        // what the systemd view calls it.
+        // what the systemd buffer calls it.
         Node::NixPolicy { job, unit, .. } => Some(format!("{job} {unit}")),
         // A block of machine facts rather than a row you would search
-        // for, the same judgement `Overview` gets above: it is always
+        // for, the same judgement `OverviewLine` gets above: it is always
         // present - the Nix buffer's equivalent of the Status buffer's
         // System section - and narrowing to it answers nothing.
         Node::NixStore { .. } => None,
         // Not a fact block like `NixStore`: this row exists only when
         // `DeclarativeService::reboot()` returned `Some`, the same
-        // conditional-alert shape as `Finding::ClockUnsynchronized` and
-        // `Finding::SystemDegraded` above, so it gets the same kind of
+        // conditional-alert shape as `FindingKind::ClockUnsynchronized` and
+        // `FindingKind::SystemDegraded` above, so it gets the same kind of
         // real search text they do.
-        Node::RebootPending { kernel_changed, initrd_changed, .. } => Some(match (*kernel_changed, *initrd_changed) {
+        Node::RebootPending {
+            kernel_changed,
+            initrd_changed,
+            ..
+        } => Some(match (*kernel_changed, *initrd_changed) {
             (true, true) => "reboot pending kernel initrd changed".to_string(),
             (true, false) => "reboot pending kernel changed".to_string(),
             (false, true) => "reboot pending initrd changed".to_string(),
@@ -85,7 +82,10 @@ fn text_of(node: &Node) -> Option<String> {
         }),
         // Structure, or a row whose text belongs to another row: neither
         // is matched on its own. `apply` decides what happens to them.
-        Node::UnitDetail { .. } | Node::ProcDetail { .. } | Node::SectionHeader { .. } | Node::Spacer => None,
+        Node::UnitDetail { .. }
+        | Node::ProcDetail { .. }
+        | Node::SectionHeader { .. }
+        | Node::Spacer => None,
     }
 }
 
@@ -106,7 +106,8 @@ fn text_of(node: &Node) -> Option<String> {
 /// disagree with the rows it describes.
 pub fn apply(rows: Vec<Node>, needle: &str) -> (Vec<Node>, usize) {
     let needle = needle.to_lowercase();
-    let matches = |node: &Node| text_of(node).is_some_and(|text| text.to_lowercase().contains(&needle));
+    let matches =
+        |node: &Node| text_of(node).is_some_and(|text| text.to_lowercase().contains(&needle));
 
     let mut kept: Vec<Node> = Vec::new();
     let mut matched = 0usize;
@@ -141,17 +142,19 @@ pub fn apply(rows: Vec<Node>, needle: &str) -> (Vec<Node>, usize) {
             // A detail row has no text of its own - it is the row above
             // it, spelled out - so it rides along with that row rather
             // than being matched independently. Filtering it on its own
-            // dropped it, and opening a unit inside a filtered view then
+            // dropped it, and opening a unit inside a filtered buffer then
             // appeared to do nothing at all.
             Node::UnitDetail { unit, .. } => {
-                if matches!(kept.last(), Some(Node::Unit { unit: kept_unit, .. }) if kept_unit.name == unit.name) {
+                if matches!(kept.last(), Some(Node::Unit { unit: kept_unit, .. }) if kept_unit.name == unit.name)
+                {
                     kept.push(node);
                 }
             }
             // Same rule, for the process rows: the block belongs to the
             // row above it, so it survives exactly when that row does.
             Node::ProcDetail { proc, .. } => {
-                if matches!(kept.last(), Some(Node::Proc { proc: kept_proc, .. }) if kept_proc.pid == proc.pid) {
+                if matches!(kept.last(), Some(Node::Proc { proc: kept_proc, .. }) if kept_proc.pid == proc.pid)
+                {
                     kept.push(node);
                 }
             }

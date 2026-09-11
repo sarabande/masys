@@ -135,7 +135,9 @@ impl ProcDetail {
         self.fds.iter().fold(FdCounts::default(), |mut counts, fd| {
             match fd.target {
                 FdTarget::Path(_) => counts.files += 1,
-                FdTarget::Tcp { .. } | FdTarget::Udp { .. } | FdTarget::Unix { .. } => counts.sockets += 1,
+                FdTarget::Tcp { .. } | FdTarget::Udp { .. } | FdTarget::Unix { .. } => {
+                    counts.sockets += 1
+                }
                 FdTarget::Pipe => counts.pipes += 1,
                 FdTarget::Other(_) => counts.other += 1,
             }

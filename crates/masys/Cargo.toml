@@ -17,8 +17,10 @@ path = "src/main.rs"
 [dependencies]
 masys-app = { path = "../masys-app", version = "0.1.0" }
 masys-domain = { path = "../masys-domain", version = "0.1.0" }
-masys-platform-fallback = { path = "../masys-platform-fallback", version = "0.1.0" }
 masys-platform-nixos = { path = "../masys-platform-nixos", version = "0.1.0" }
+# The second platform adapter. Named here for the same reason the first
+# is: choosing between them is the composition root's job.
+masys-platform-debian = { path = "../masys-platform-debian", version = "0.1.0" }
 masys-render = { path = "../masys-render", version = "0.1.0" }
 masys-scan = { path = "../masys-scan", version = "0.1.0" }
 masys-systemd = { path = "../masys-systemd", version = "0.1.0" }

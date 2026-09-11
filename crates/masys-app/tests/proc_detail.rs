@@ -43,8 +43,18 @@ fn a_detail() -> ProcDetail {
         swap_bytes: Some(0),
         env: vec![("PGDATA".into(), "/var/lib/postgresql/16".into())],
         fds: vec![
-            Fd { number: 0, target: FdTarget::Path("/dev/null".into()) },
-            Fd { number: 7, target: FdTarget::Tcp { local: "0.0.0.0:5432".into(), peer: None, state: "LISTEN".into() } },
+            Fd {
+                number: 0,
+                target: FdTarget::Path("/dev/null".into()),
+            },
+            Fd {
+                number: 7,
+                target: FdTarget::Tcp {
+                    local: "0.0.0.0:5432".into(),
+                    peer: None,
+                    state: "LISTEN".into(),
+                },
+            },
         ],
     }
 }
@@ -67,6 +77,8 @@ fn app_with(procs: Vec<Proc>, units: Vec<Unit>, details: HashMap<u32, ProcDetail
             load: None,
             uptime_secs: None,
             memory: None,
+            cpu_times: None,
+            thermal_throttled_ms_by_core: None,
         },
         units,
         calls: Default::default(),
@@ -77,16 +89,28 @@ fn app_with(procs: Vec<Proc>, units: Vec<Unit>, details: HashMap<u32, ProcDetail
         queued: Default::default(),
         proc_details: details,
         detail_queries: Default::default(),
+        units_fail_with: None,
+        sample_fail_with: None,
+        smart: None,
+        smart_reads: Default::default(),
     };
-    let platform = FakePlatformService { boot_pressure: None, pending_reboot: None };
-    let mut app = App::new(Box::new(system), Box::new(platform), Box::new(fake::NoScanner), "devbox".to_string());
-    app.tick(1_000, "t".to_string()).expect("tick");
+    let platform = FakePlatformService::default();
+    let mut app = App::new(
+        Box::new(system),
+        Box::new(platform),
+        Box::new(fake::NoScanner),
+        "devbox".to_string(),
+    );
+    app.tick(1_000, "t".to_string());
     app
 }
 
 fn app() -> App {
     app_with(
-        vec![in_cgroup(proc(9932, "postgres", 0), "/system.slice/postgresql.service")],
+        vec![in_cgroup(
+            proc(9932, "postgres", 0),
+            "/system.slice/postgresql.service",
+        )],
         vec![unit("postgresql.service", UnitKind::Service)],
         HashMap::from([(9932, a_detail())]),
     )
@@ -102,7 +126,10 @@ fn press(app: &mut App, keys: &str) {
 fn on_a_process(app: &mut App) {
     press(app, "2");
     for _ in 0..10 {
-        if matches!(app.view().rows.get(app.view().selected.unwrap_or(0)), Some(Node::Proc { .. })) {
+        if matches!(
+            app.view().rows.get(app.view().selected.unwrap_or(0)),
+            Some(Node::Proc { .. })
+        ) {
             return;
         }
         app.handle_key(Key::new(KeyCode::Down));
@@ -111,7 +138,10 @@ fn on_a_process(app: &mut App) {
 }
 
 fn detail_row(app: &App) -> Option<&Node> {
-    app.view().rows.iter().find(|row| matches!(row, Node::ProcDetail { .. }))
+    app.view()
+        .rows
+        .iter()
+        .find(|row| matches!(row, Node::ProcDetail { .. }))
 }
 
 /// `tab` falls through to the row's own detail on any row with no
@@ -138,7 +168,10 @@ fn nothing_is_read_until_the_row_is_opened() {
     let system = FakeSystemService {
         snapshot: Snapshot {
             taken_at_ms: 0,
-            procs: vec![in_cgroup(proc(9932, "postgres", 0), "/system.slice/postgresql.service")],
+            procs: vec![in_cgroup(
+                proc(9932, "postgres", 0),
+                "/system.slice/postgresql.service",
+            )],
             pressure: Some(Pressure::default()),
             filesystems: Vec::new(),
             disks: Vec::new(),
@@ -152,6 +185,8 @@ fn nothing_is_read_until_the_row_is_opened() {
             load: None,
             uptime_secs: None,
             memory: None,
+            cpu_times: None,
+            thermal_throttled_ms_by_core: None,
         },
         units: Vec::new(),
         calls: Default::default(),
@@ -162,14 +197,27 @@ fn nothing_is_read_until_the_row_is_opened() {
         queued: Default::default(),
         proc_details: HashMap::from([(9932, a_detail())]),
         detail_queries: Default::default(),
+        units_fail_with: None,
+        sample_fail_with: None,
+        smart: None,
+        smart_reads: Default::default(),
     };
     let queries = system.detail_queries.clone();
-    let platform = FakePlatformService { boot_pressure: None, pending_reboot: None };
-    let mut app = App::new(Box::new(system), Box::new(platform), Box::new(fake::NoScanner), "devbox".to_string());
-    app.tick(1_000, "t".to_string()).expect("tick");
+    let platform = FakePlatformService::default();
+    let mut app = App::new(
+        Box::new(system),
+        Box::new(platform),
+        Box::new(fake::NoScanner),
+        "devbox".to_string(),
+    );
+    app.tick(1_000, "t".to_string());
 
     on_a_process(&mut app);
-    assert!(queries.borrow().is_empty(), "walking to a row reads nothing: {:?}", queries.borrow());
+    assert!(
+        queries.borrow().is_empty(),
+        "walking to a row reads nothing: {:?}",
+        queries.borrow()
+    );
 
     app.handle_key(Key::new(KeyCode::Tab));
     assert_eq!(*queries.borrow(), vec![9932]);
@@ -184,11 +232,25 @@ fn the_detail_sits_directly_under_its_own_row() {
     app.handle_key(Key::new(KeyCode::Tab));
 
     let rows = app.view().rows;
-    let at = rows.iter().position(|row| matches!(row, Node::ProcDetail { .. })).expect("a detail row");
-    let Some(Node::Proc { proc, .. }) = rows.get(at - 1) else { panic!("{:#?}", rows) };
-    let Some(Node::ProcDetail { proc: described, detail }) = rows.get(at) else { unreachable!() };
+    let at = rows
+        .iter()
+        .position(|row| matches!(row, Node::ProcDetail { .. }))
+        .expect("a detail row");
+    let Some(Node::Proc { proc, .. }) = rows.get(at - 1) else {
+        panic!("{:#?}", rows)
+    };
+    let Some(Node::ProcDetail {
+        proc: described,
+        detail,
+    }) = rows.get(at)
+    else {
+        unreachable!()
+    };
     assert_eq!(proc.pid, described.pid);
-    assert_eq!(detail.as_deref().and_then(|d| d.cmdline.clone()).as_deref(), Some(a_detail().cmdline.unwrap().as_str()));
+    assert_eq!(
+        detail.as_deref().and_then(|d| d.cmdline.clone()).as_deref(),
+        Some(a_detail().cmdline.unwrap().as_str())
+    );
 }
 
 /// Most of what the detail reads is gated on same-uid or CAP_SYS_PTRACE,
@@ -198,7 +260,10 @@ fn the_detail_sits_directly_under_its_own_row() {
 #[test]
 fn a_process_masys_cannot_read_still_opens() {
     let mut app = app_with(
-        vec![in_cgroup(proc(9932, "postgres", 0), "/system.slice/postgresql.service")],
+        vec![in_cgroup(
+            proc(9932, "postgres", 0),
+            "/system.slice/postgresql.service",
+        )],
         Vec::new(),
         // No entry, so the fake answers with the empty detail an
         // unprivileged read produces.
@@ -206,7 +271,11 @@ fn a_process_masys_cannot_read_still_opens() {
     );
     on_a_process(&mut app);
     app.handle_key(Key::new(KeyCode::Tab));
-    assert!(detail_row(&app).is_some(), "the row opens on what Proc carries: {:#?}", app.view().rows);
+    assert!(
+        detail_row(&app).is_some(),
+        "the row opens on what Proc carries: {:#?}",
+        app.view().rows
+    );
 }
 
 /// The association was always in the data - the Procs buffer groups by
@@ -232,12 +301,18 @@ fn u_jumps_from_a_process_to_the_unit_that_owns_it() {
 fn u_jumps_from_a_group_row_too() {
     let mut app = app();
     press(&mut app, "2");
-    assert!(matches!(app.view().rows.first(), Some(Node::ProcGroup { .. })), "{:#?}", app.view().rows);
+    assert!(
+        matches!(app.view().rows.first(), Some(Node::ProcGroup { .. })),
+        "{:#?}",
+        app.view().rows
+    );
     press(&mut app, "u");
 
     assert_eq!(app.buffer(), Buffer::Systemd);
     let view = app.view();
-    assert!(matches!(view.rows.get(view.selected.unwrap()), Some(Node::Unit { unit, .. }) if unit.name == "postgresql.service"));
+    assert!(
+        matches!(view.rows.get(view.selected.unwrap()), Some(Node::Unit { unit, .. }) if unit.name == "postgresql.service")
+    );
 }
 
 /// A delegated sub-cgroup puts processes several levels below the unit
@@ -247,7 +322,10 @@ fn u_jumps_from_a_group_row_too() {
 #[test]
 fn a_delegated_subcgroup_still_finds_its_unit() {
     let mut app = app_with(
-        vec![in_cgroup(proc(9932, "worker", 0), "/system.slice/containerd.service/kubepods/pod-abc")],
+        vec![in_cgroup(
+            proc(9932, "worker", 0),
+            "/system.slice/containerd.service/kubepods/pod-abc",
+        )],
         vec![unit("containerd.service", UnitKind::Service)],
         HashMap::new(),
     );
@@ -255,7 +333,9 @@ fn a_delegated_subcgroup_still_finds_its_unit() {
     press(&mut app, "u");
 
     let view = app.view();
-    assert!(matches!(view.rows.get(view.selected.unwrap()), Some(Node::Unit { unit, .. }) if unit.name == "containerd.service"));
+    assert!(
+        matches!(view.rows.get(view.selected.unwrap()), Some(Node::Unit { unit, .. }) if unit.name == "containerd.service")
+    );
 }
 
 /// A jump that lands on nothing because the target was filtered out is
@@ -264,27 +344,44 @@ fn a_delegated_subcgroup_still_finds_its_unit() {
 #[test]
 fn the_jump_reveals_a_unit_the_systemd_filter_was_hiding() {
     let mut app = app_with(
-        vec![in_cgroup(proc(9932, "postgres", 0), "/system.slice/postgresql.service")],
-        vec![unit("postgresql.service", UnitKind::Service), unit("sshd.service", UnitKind::Service)],
+        vec![in_cgroup(
+            proc(9932, "postgres", 0),
+            "/system.slice/postgresql.service",
+        )],
+        vec![
+            unit("postgresql.service", UnitKind::Service),
+            unit("sshd.service", UnitKind::Service),
+        ],
         HashMap::new(),
     );
-    // Narrow the systemd view to something else entirely, then leave it.
+    // Narrow the systemd buffer to something else entirely, then leave it.
     press(&mut app, "3/sshd");
     app.handle_key(Key::new(KeyCode::Enter));
-    assert!(!app.view().rows.iter().any(|r| matches!(r, Node::Unit { unit, .. } if unit.name == "postgresql.service")));
+    assert!(
+        !app.view()
+            .rows
+            .iter()
+            .any(|r| matches!(r, Node::Unit { unit, .. } if unit.name == "postgresql.service"))
+    );
 
     on_a_process(&mut app);
     press(&mut app, "u");
     let view = app.view();
-    assert!(matches!(view.rows.get(view.selected.unwrap()), Some(Node::Unit { unit, .. }) if unit.name == "postgresql.service"));
+    assert!(
+        matches!(view.rows.get(view.selected.unwrap()), Some(Node::Unit { unit, .. }) if unit.name == "postgresql.service")
+    );
 }
 
 /// The kernel bucket has no unit and never will. Silent rather than an
-/// error line, because `u` is bound on the view where the kernel bucket
+/// error line, because `u` is bound on the buffer where the kernel bucket
 /// lives and a message on every stray press would be noise.
 #[test]
 fn u_does_nothing_on_a_row_with_no_unit() {
-    let mut app = app_with(vec![in_cgroup(proc(2, "kthreadd", 0), "/")], Vec::new(), HashMap::new());
+    let mut app = app_with(
+        vec![in_cgroup(proc(2, "kthreadd", 0), "/")],
+        Vec::new(),
+        HashMap::new(),
+    );
     press(&mut app, "2");
     let before = app.buffer();
     press(&mut app, "u");
@@ -303,7 +400,11 @@ fn esc_returns_from_the_jump_to_the_row_it_left() {
 
     app.handle_key(Key::new(KeyCode::Esc));
     assert_eq!(app.buffer(), Buffer::Procs);
-    assert_eq!(app.view().selected, before, "back to the row, not to the top");
+    assert_eq!(
+        app.view().selected,
+        before,
+        "back to the row, not to the top"
+    );
 }
 
 /// The Procs footer has to say the key exists, or nobody presses it.
@@ -314,7 +415,11 @@ fn the_procs_footer_offers_the_jump() {
     assert!(
         app.view().actions.iter().any(|b| b.chord == "u"),
         "{:?}",
-        app.view().actions.iter().map(|b| b.chord.clone()).collect::<Vec<_>>()
+        app.view()
+            .actions
+            .iter()
+            .map(|b| b.chord.clone())
+            .collect::<Vec<_>>()
     );
 }
 
@@ -348,7 +453,14 @@ fn the_filter_counts_matches_rather_than_rows() {
 /// found, and the processes under it come along as its contents.
 #[test]
 fn a_group_matched_by_name_counts_once() {
-    let mut app = app_with(vec![in_cgroup(proc(9932, "postgres", 0), "/system.slice/postgresql.service")], Vec::new(), HashMap::new());
+    let mut app = app_with(
+        vec![in_cgroup(
+            proc(9932, "postgres", 0),
+            "/system.slice/postgresql.service",
+        )],
+        Vec::new(),
+        HashMap::new(),
+    );
     press(&mut app, "2/postgresql.service");
     assert_eq!(app.view().filter_matches, Some(1), "{:#?}", app.view().rows);
 }
@@ -358,7 +470,10 @@ fn a_group_matched_by_name_counts_once() {
 #[test]
 fn the_count_follows_the_query_as_it_narrows() {
     let mut app = app_with(
-        vec![in_cgroup(proc(9932, "postgres", 0), "/system.slice/db.service"), in_cgroup(proc(3000, "chrome", 0), "/user.slice")],
+        vec![
+            in_cgroup(proc(9932, "postgres", 0), "/system.slice/db.service"),
+            in_cgroup(proc(3000, "chrome", 0), "/user.slice"),
+        ],
         Vec::new(),
         HashMap::new(),
     );
@@ -389,7 +504,7 @@ fn an_open_process_pauses_the_tick_and_folding_resumes_it() {
 }
 
 /// The pause follows the open row, not the buffer you are looking at: a
-/// row left open while you glance at the systemd view is still a row
+/// row left open while you glance at the systemd buffer is still a row
 /// being read, and still costs a per-descriptor re-read every tick.
 #[test]
 fn the_pause_survives_a_look_at_another_buffer() {
@@ -407,7 +522,152 @@ fn a_manual_refresh_still_works_while_paused() {
     let mut app = app();
     on_a_process(&mut app);
     app.handle_key(Key::new(KeyCode::Tab));
-    assert!(app.wants_refresh(Key::char('g')), "g still asks the caller to tick");
-    app.tick(2_000, "t2".to_string()).expect("a manual tick");
-    assert!(app.auto_refresh_paused(), "and the row is still open afterwards");
+    assert!(
+        app.wants_refresh(Key::char('g')),
+        "g still asks the caller to tick"
+    );
+    app.tick(2_000, "t2".to_string());
+    assert!(
+        app.auto_refresh_paused(),
+        "and the row is still open afterwards"
+    );
+}
+
+/// A tick re-reads the open row's detail.
+///
+/// The detail block is the one thing an open row is *for*, and it is also
+/// what pauses the auto-tick: `App::auto_refresh_paused` stops the loop
+/// ticking underneath it because the read is the most expensive one this
+/// buffer takes. The loop's own comment says "`g` still refreshes on
+/// demand", so the key that pays for the read has to actually take it -
+/// otherwise the row updates on `g` and the block beneath it does not,
+/// which is one frame showing two different moments.
+#[test]
+fn a_refresh_re_reads_an_open_processes_detail() {
+    let system = FakeSystemService {
+        snapshot: one_process(),
+        units: Vec::new(),
+        calls: Default::default(),
+        fails_with: None,
+        journal: Vec::new(),
+        appended: Default::default(),
+        journal_queries: Default::default(),
+        queued: Default::default(),
+        proc_details: HashMap::from([(9932, a_detail())]),
+        detail_queries: Default::default(),
+        units_fail_with: None,
+        sample_fail_with: None,
+        smart: None,
+        smart_reads: Default::default(),
+    };
+    let queries = system.detail_queries.clone();
+    let platform = FakePlatformService::default();
+    let mut app = App::new(
+        Box::new(system),
+        Box::new(platform),
+        Box::new(fake::NoScanner),
+        "devbox".to_string(),
+    );
+    app.tick(1_000, "t".to_string());
+
+    on_a_process(&mut app);
+    app.handle_key(Key::new(KeyCode::Tab));
+    let opened = queries.borrow().len();
+    assert_eq!(opened, 1, "opening the row costs one read");
+
+    app.tick(3_000, "t".to_string());
+    assert!(
+        queries.borrow().len() > opened,
+        "and every tick after it costs another, got {:?}",
+        queries.borrow()
+    );
+}
+
+/// A pid that comes back belonging to something else opens shut.
+///
+/// The row is dropped when its process leaves the sample, rather than
+/// left in the open map: `proc_detail` fails for a dead pid *and* for
+/// another user's live one, so the sample is what tells the two apart.
+/// Leaving it would make the next process to be handed that pid draw a
+/// detail block describing the one before it - pids are recycled, and
+/// this host wraps at 4194304.
+#[test]
+fn a_recycled_pid_does_not_inherit_the_previous_processes_detail() {
+    let mut app = app();
+    on_a_process(&mut app);
+    app.handle_key(Key::new(KeyCode::Tab));
+    assert!(
+        app.view()
+            .rows
+            .iter()
+            .any(|row| matches!(row, Node::ProcDetail { .. })),
+        "the row is open to begin with"
+    );
+
+    // Gone. Nothing to draw, and nothing that should be remembered.
+    app.replace_system(Box::new(system_showing(Vec::new())));
+    app.tick(3_000, "t".to_string());
+
+    // And back, as something else entirely.
+    app.replace_system(Box::new(system_showing(vec![in_cgroup(
+        proc(9932, "sshd", 0),
+        "/system.slice/sshd.service",
+    )])));
+    app.tick(5_000, "t".to_string());
+
+    assert!(
+        !app.view()
+            .rows
+            .iter()
+            .any(|row| matches!(row, Node::ProcDetail { .. })),
+        "the recycled pid opens shut, got {:#?}",
+        app.view().rows
+    );
+}
+
+fn system_showing(procs: Vec<Proc>) -> FakeSystemService {
+    FakeSystemService {
+        snapshot: Snapshot {
+            procs,
+            ..one_process()
+        },
+        units: Vec::new(),
+        calls: Default::default(),
+        fails_with: None,
+        journal: Vec::new(),
+        appended: Default::default(),
+        journal_queries: Default::default(),
+        queued: Default::default(),
+        proc_details: HashMap::from([(9932, a_detail())]),
+        detail_queries: Default::default(),
+        units_fail_with: None,
+        sample_fail_with: None,
+        smart: None,
+        smart_reads: Default::default(),
+    }
+}
+
+fn one_process() -> Snapshot {
+    Snapshot {
+        taken_at_ms: 0,
+        procs: vec![in_cgroup(
+            proc(9932, "postgres", 0),
+            "/system.slice/postgresql.service",
+        )],
+        pressure: Some(Pressure::default()),
+        filesystems: Vec::new(),
+        disks: Vec::new(),
+        clock_synced: true,
+        utc_offset_secs: -21_600,
+        interfaces: Vec::new(),
+        oom_kills: Vec::new(),
+        system_state: SystemState::Running,
+        clock_ticks_per_sec: 100,
+        machine: None,
+        load: None,
+        uptime_secs: None,
+        memory: None,
+        cpu_times: None,
+        thermal_throttled_ms_by_core: None,
+    }
 }

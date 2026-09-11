@@ -1,13 +1,13 @@
 [package]
-name = "masys-platform-fallback"
+name = "masys-platform-debian"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
-description = "Platform facts for a host masys has no specific adapter for."
+description = "Debian platform facts for masys: pending reboot, unit ownership, kernel images in /boot."
 readme = "../../README.md"
-keywords = ["masys", "linux", "platform", "fallback", "sysadmin"]
+keywords = ["masys", "debian", "ubuntu", "systemd", "linux"]
 categories = ["command-line-utilities", "os::linux-apis"]
 
 [dependencies]

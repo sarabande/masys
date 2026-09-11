@@ -84,10 +84,13 @@ lists. This one has a reboot pending, and says whether it can wait:
 ```
 
 masys reads the profile symlinks and the flake lock directly, and shows
-what they say. `e` opens the operations on what it found — the eighteen
-`nixos-rebuild`, `nix`, `nix-env` and `nix-channel` invocations worth
-having, grouped, with the generation under the cursor named in the group
-that acts on it.
+what they say. Seven keys reach the operations on what it found — the
+eighteen `nixos-rebuild`, `nix`, `nix-env` and `nix-channel` invocations
+worth having. `s` switches, and `h` switches a standalone home-manager —
+each reached for often enough to earn a letter of its own. `b`, `a`, `i`,
+`c` and `f` open a small popup per family — rebuild, generation, inputs,
+store and search — with the generation under the cursor named in the
+group that acts on it.
 
 Rows that cannot act here are **marked and still listed**, each with the
 reason: `no channels on this host` on a flake machine, `activated by
@@ -159,13 +162,42 @@ anything it cannot is reported as absent rather than as an error.
 
 Acting is a different question, and masys answers it per action. Unit
 verbs shell out to `systemctl`, which raises polkit, so an ordinary user
-can be granted them. The NixOS operations that write a root-owned profile
-- activating a generation, collecting the store - have no such mechanism:
-`nix-env` and `nix-collect-garbage` take no elevation flag and raise no
-polkit action. masys checks whether the profile directories can be
-written and marks those rows where they cannot, rather than starting a
-command that would delete some generations and then fail partway. Run
-masys as root to use them.
+can be granted them.
+
+Rebuilds raise privilege themselves. Every verb that reaches
+`switch-to-configuration` - `switch`, `boot`, `test`, `dry-activate` and
+`rollback` - is handed `--elevate` when masys is not root, so the build
+runs as you and only the activation half asks for anything.
+
+It asks through `sudo`, on the terminal masys has just given up for the
+rebuild's own output - so the prompt appears where you are already
+looking. That is the whole reason for the choice. `run0` would authorise
+through polkit, which sounds tidier and asks wherever the session's
+polkit agent happens to be: on a desktop that is a window somewhere
+behind the terminal, and over SSH or on a bare TTY there is no agent to
+ask at all. masys falls back to `run0` only where there is no `sudo`,
+since a prompt you have to go and find still beats none. `build` is the
+exception and needs nothing: it stops at a store path.
+
+The flag belongs to `nixos-rebuild-ng`, so masys asks your
+`nixos-rebuild` whether it takes one before passing it, and looks on
+`PATH` for the method before naming it. Where either answer is no,
+nothing is passed and the old behaviour stands.
+
+The operations that write a root-owned profile - activating a
+generation, deleting some, collecting the store - ask for root too, and
+by the same preference. `nix-env` and `nix-collect-garbage` take no
+elevation flag, so masys runs them *through* `sudo` rather than passing
+one. Those rows say `asks for root` before you press them.
+
+Asked per profile, not per user: `~/.local/state/nix/profiles` is yours,
+so deleting a home-manager generation needs nothing, and masys does not
+prompt for a privilege the act will not use. `clean` is the exception and
+asks regardless, because `nix-collect-garbage` acts on every profile it
+finds and the system one is never yours.
+
+On a host with neither `sudo` nor `run0` those rows stay marked *run
+masys as root*, which is what they all used to say.
 
 ### Optional: following logs live
 
@@ -184,25 +216,87 @@ MASYS_LIBSYSTEMD=/run/current-system/sw/lib/libsystemd.so.0 masys
 
 Without it, everything works and logs refresh on the ordinary tick.
 
+### Optional: SMART disk health
+
+The overview shows `smart ok` or `smart failing` where masys can ask the
+disks and every one of them answered. Asking means running `smartctl` from
+smartmontools, which most hosts do not have installed and which usually
+needs root.
+
+Where it cannot ask, the segment is **absent rather than reassuring**. No
+tool, no permission, a virtual disk, a disk in standby, one disk of three
+unreadable: each of those draws nothing, because a disk nobody asked must
+not read the same as a disk that answered and is fine. So an absent
+segment means "not asked", never "healthy" — and if you expect the reading
+and do not see it, install smartmontools and check masys can run it.
+
 ## Configuration
 
-`~/.config/masys/config.toml`, and only for keys:
+`~/.config/masys/config.toml`, for keys, for what counts as a problem,
+and for what it is drawn in.
 
 ```toml
 [keys]
 unit_restart = "r"
-view_procs = "2"
+buffer_procs = "2"
 filter = "/"
+
+[thresholds]
+disk_used_percent = 90          # default 85
+inode_used_percent = 90
+psi_some_avg60_percent = 20     # the fraction of wall-clock time tasks
+psi_full_avg60_percent = 5      # spent blocked, over the last minute
+flapping_restart_count = 3      # restarts within the window below
+flapping_window_ms = 3_600_000
+thermal_throttled_percent = 10  # share of a tick a core spent held
+                                # below the clock it asked for
+
+[theme]
+section_header = "white"        # section headings and the footer's keys
+severity_dead = "red"           # x - a unit that has stopped
+severity_warning = "yellow"     # ~ ^ - flapping, pressure, capacity
+severity_urgent = "light-red"   # ! - clock, OOM, degraded, kernel
+info = "dark-gray"              # . - the System section's plain facts
+status_error = "red"            # the status line when something failed
 ```
 
-A binding that cannot be parsed leaves the default in place and says so on
-startup: a typo should cost you the customisation, not the key.
+All three tables are optional, and every value shown is its default
+except `disk_used_percent`, so the file above changes exactly one thing.
+The threshold and colour keys are the field names triage and the renderer
+read, on purpose: a friendlier spelling would be a mapping between what
+you write and what the code uses, and a mapping is a thing that can
+drift.
+
+**The palette is not a preference.** Severity *is* colour here: the glyph
+carries the shape and the colour carries the judgement, and two of the
+defaults are `light-red` and `dark-gray` - the two most likely to be
+unreadable on a terminal you configured yourself. A colour is one of the
+sixteen terminal names - `black`, `white`, `gray`, `dark-gray`, and
+`red`, `green`, `yellow`, `blue`, `magenta`, `cyan` each with a `light-`
+form - or a 0-255 palette index like `"208"`, or `"#ff8800"`. The names
+are the ones that respect a terminal's own configuration; the other two
+spellings are for saying which entry you actually mean. There are no
+named palettes to choose from, for the reason there is no colemak preset
+for `[keys]`: the mechanism is what earns its keep, and a curated set of
+themes is a second decision nobody has asked for.
+
+A `[theme]` table naming three colours moves three; the rest of the
+palette stays exactly as it is.
+
+Anything masys will not take leaves that one setting at its default and
+says so on startup - a typo should cost you the customisation, not the
+key or the check. That includes a misspelled threshold, which is reported
+rather than ignored: a `disk_used_percentage` that silently did nothing
+would leave you believing you had relaxed a check you had not. A
+percentage outside 0 to 100 is refused rather than clamped, because 150
+clamped to 100 is a check that never fires, reported as one that was
+accepted.
 
 ## Developing
 
 ```
-cargo test --workspace          # 677 tests, no D-Bus or /proc required
-cargo fmt --all                 # rustfmt.toml widens the line budget past 100
+cargo test --workspace          # 963 tests, no D-Bus or /proc required
+cargo fmt --all                 # stock rustfmt; the tree carries no config
 cargo clippy --workspace --all-targets
 ```
 
@@ -250,9 +344,21 @@ Ports and adapters, one concern per crate.
 
 The event loop is single-threaded with no channels. That is affordable
 because every source is cheap against its cadence — a full sample of this
-host is 99 ms against a 2 s tick. One source is not: summing a directory
-tree is seconds, so it lives behind a thread pool and a poll, which is the
-exception the architecture names rather than one it stumbled into.
+host is 99 ms against a 2 s tick. Two sources are not, and both are named
+exceptions rather than ones the architecture stumbled into. Summing a
+directory tree is seconds, so it lives behind a thread pool and a poll.
+A SMART check spawns one `smartctl` per disk, so it is held for five
+minutes rather than taken per tick. Measured: 19 ms for this host's one
+**SATA SSD**, against 45 ms for the readings every tick takes anyway — so
+the tick that carries it costs half again as much, and still sits far
+inside the 2 s cadence. The disks are asked in turn, so four cost four
+times one on hardware like this. A disk with **platters** was not
+measured and this host has none, though `-n standby` means a spun-down
+one answers without being woken, which is the case that would have cost
+seconds rather than milliseconds. Without root, or without smartmontools,
+the read fails in 14 ms or 0.3 ms and answers *unknown* — which is why
+this cost is invisible on a development machine, and why it had to be
+measured deliberately.
 
 `masys-domain` and `masys-app` have no dev-dependencies. Their suites run
 against fakes, so neither needs D-Bus, `systemctl` or `/proc` to be
@@ -263,17 +369,42 @@ tested.
 Early. It runs, it is useful, and the shape is settled; the version says
 0.1.0 and means it.
 
-What is not done, in the order you are likely to meet it. A rebuild run
-unprivileged builds for minutes and is then refused at activation:
-`nixos-rebuild` can deploy as a non-root user through `--elevate`, which
-masys does not yet pass, so run it as root for anything that activates -
-`build` is the exception and works either way. Four operations the design
-names are deliberately absent, each waiting on a question only the code
-that reaches them can settle: `upgrade`, `repl`, `build-vm` and
-`build-image`. And NixOS is the only platform adapter that answers
-anything; every other host gets the fallback, which is honest about
-knowing nothing rather than guessing, but it means one adapter is proving
-a seam meant for several.
+What is not done, in the order you are likely to meet it.
+
+**masys reads deeply and acts narrowly.** Every buffer's readings are
+built out — the Nix buffer alone takes nine — while the action tables are
+sparse outside units and Nix. The sharpest form of that is the Status
+buffer: it names what is wrong and gives you nothing to press. A finding
+is a row you read, not a row you act on or follow to where the trouble
+is.
+
+**The Network buffer is two thirds of itself.** Interfaces and throughput
+are there, as a section of the IO buffer. Listening ports are not: you
+can see what a process has open by opening that process, and there is no
+way to ask the question from the port end.
+
+**Some designed per-row actions have no key**: a signal picker for
+processes beyond `k`/`K`, `ionice`, resource limits, jumping from a unit
+to its processes, and filtering the journal to the unit under the cursor.
+
+**Eight mutating Nix operations have never been run against a live
+host** — `switch`, `boot`, `test`, `rollback`, both `nix-env` generation
+verbs, `nix flake update` and `nix-collect-garbage`. Their commands are
+checked against their tools' synopses and their behaviour is not. The two
+defects this project has found that way — an operation refused after
+building for minutes, and one that cannot work on a flake host — were
+both invisible to every other kind of check.
+
+Two platform adapters answer: NixOS, and Debian and its derivatives. Every
+other host gets the fallback, which is honest about knowing nothing rather
+than guessing. The Debian adapter is deliberately small — a pending
+reboot, unit ownership, and what is sitting in `/boot` — and it earned its
+place by disagreeing with the port: `BootPressure::generations` was a
+`u32` until a distro with no generations had to answer it, and would have
+reported `0` where the renderer prints a count.
+
+The NixOS adapter is still much the deeper of the two, and the port has
+now been argued with by exactly one distro that answers differently.
 
 ## License
 

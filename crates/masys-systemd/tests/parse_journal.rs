@@ -1,4 +1,4 @@
-use masys_domain::journal::Priority;
+use masys_domain::journal::{Origin, Priority};
 use masys_systemd::journal::{parse_entry, parse_stream};
 
 /// Captured from `journalctl -n1 -o json` on this machine, trimmed to the
@@ -15,8 +15,11 @@ fn an_entry_carries_the_four_fields_the_journal_buffer_shows() {
     assert_eq!(entry.timestamp_ms, 1_779_332_941_369);
 }
 
-/// Kernel records have no owning unit - that absence is what
-/// `SectionKind::Kernel` is keyed on, so it must survive as `None`.
+/// Kernel records have no owning unit, which is why `Entry::unit` is an
+/// `Option` at all. The absence has to survive parsing as `None`: a
+/// parser that invented a unit name here would attribute a dmesg-class
+/// event to whatever it guessed, and the Logs buffer would file a GPU
+/// hang under a service that had nothing to do with it.
 #[test]
 fn a_kernel_record_has_no_unit() {
     let line = r#"{"__REALTIME_TIMESTAMP":"1779332941369216","PRIORITY":"4","_TRANSPORT":"kernel","MESSAGE":"i915 rcs0 GPU hang"}"#;
@@ -37,8 +40,13 @@ fn every_priority_digit_maps_to_its_level() {
         ("6", Priority::Info),
         ("7", Priority::Debug),
     ] {
-        let line = format!(r#"{{"PRIORITY":"{digit}","MESSAGE":"x","__REALTIME_TIMESTAMP":"1000"}}"#);
-        assert_eq!(parse_entry(&line).expect("parsed").priority, expected, "priority {digit}");
+        let line =
+            format!(r#"{{"PRIORITY":"{digit}","MESSAGE":"x","__REALTIME_TIMESTAMP":"1000"}}"#);
+        assert_eq!(
+            parse_entry(&line).expect("parsed").priority,
+            expected,
+            "priority {digit}"
+        );
     }
 }
 
@@ -59,7 +67,11 @@ fn a_byte_array_message_is_decoded_rather_than_shown_as_numbers() {
 #[test]
 fn a_malformed_line_costs_one_entry_not_the_whole_query() {
     let stream = format!("{LINE}\nnot json at all\n{LINE}\n");
-    assert_eq!(parse_stream(&stream).len(), 2, "the two good records survive the bad one between them");
+    assert_eq!(
+        parse_stream(&stream).len(),
+        2,
+        "the two good records survive the bad one between them"
+    );
 }
 
 #[test]
@@ -72,7 +84,10 @@ fn a_trailing_newline_does_not_produce_an_empty_entry() {
 #[test]
 fn unit_events_are_read_from_the_unit_field_and_timestamp() {
     let line = r#"{"MESSAGE_ID":"be02cf6855d2428ba40df7e9d022f03d","UNIT":"nightly-backup.service","_SYSTEMD_UNIT":"init.scope","__REALTIME_TIMESTAMP":"1779332941369216","MESSAGE":"Failed to start Nightly backup."}"#;
-    assert_eq!(masys_systemd::journal::parse_unit_events(line), vec![("nightly-backup.service".to_string(), 1_779_332_941_369)]);
+    assert_eq!(
+        masys_systemd::journal::parse_unit_events(line),
+        vec![("nightly-backup.service".to_string(), 1_779_332_941_369)]
+    );
 }
 
 /// `_SYSTEMD_UNIT` is the *sender's* unit - init.scope for these - so a
@@ -89,4 +104,52 @@ fn a_malformed_line_costs_one_record_not_the_backfill() {
     let good = r#"{"MESSAGE_ID":"x","UNIT":"a.service","__REALTIME_TIMESTAMP":"2000000"}"#;
     let stream = format!("{good}\nnot json\n\n{good}\n");
     assert_eq!(masys_systemd::journal::parse_unit_events(&stream).len(), 2);
+}
+
+/// Who sent the line, measured rather than guessed.
+///
+/// `unit: None` is not the same claim: syslog forwarders, login sessions
+/// and anything else outside a unit's cgroup have no unit either, and a
+/// Kernel section built on that test would file a failed cron job under
+/// dmesg.
+#[test]
+fn a_kernel_record_says_the_kernel_sent_it() {
+    let kernel = r#"{"__REALTIME_TIMESTAMP":"1779332941369216","PRIORITY":"3","_TRANSPORT":"kernel","MESSAGE":"EXT4-fs error (device sda1)"}"#;
+    assert_eq!(parse_entry(kernel).expect("parsed").origin, Origin::Kernel);
+}
+
+#[test]
+fn a_userspace_record_does_not_claim_the_kernel_sent_it() {
+    assert_eq!(
+        parse_entry(LINE).expect("parsed").origin,
+        Origin::Userspace,
+        "sshd logs over stdout"
+    );
+
+    // A record with no unit and no kernel transport is the case the
+    // absent-unit test cannot distinguish.
+    let unitless = r#"{"__REALTIME_TIMESTAMP":"1779332941369216","PRIORITY":"3","_TRANSPORT":"syslog","MESSAGE":"session opened for user root"}"#;
+    let entry = parse_entry(unitless).expect("parsed");
+    assert_eq!(entry.unit, None);
+    assert_eq!(
+        entry.origin,
+        Origin::Userspace,
+        "no unit is not the same as no transport"
+    );
+}
+
+/// A record whose transport masys cannot read is attributed to nobody.
+///
+/// Not the kernel, because nothing said so - and not userspace either,
+/// which is what a `bool` here would have forced. journald stamps
+/// `_TRANSPORT` on everything it holds, so an absent one means this
+/// reader did not get it rather than that the line came from a program.
+#[test]
+fn a_record_with_no_transport_is_attributed_to_neither() {
+    let no_transport =
+        r#"{"__REALTIME_TIMESTAMP":"1779332941369216","PRIORITY":"3","MESSAGE":"who said this"}"#;
+    assert_eq!(
+        parse_entry(no_transport).expect("parsed").origin,
+        Origin::Unknown
+    );
 }

@@ -6,7 +6,7 @@
 //! library at link time.
 
 use masys_domain::error::MasysError;
-use masys_domain::journal::{Entry, Priority};
+use masys_domain::journal::{Entry, Origin, Priority};
 use serde::Deserialize;
 
 /// journalctl's `-o json` fields, of which masys wants four. Every value
@@ -22,6 +22,11 @@ struct RawEntry {
     unit: Option<String>,
     #[serde(rename = "MESSAGE")]
     message: Option<serde_json::Value>,
+    /// How the record reached journald. `kernel` for anything read out
+    /// of the kernel ring buffer; `stdout`, `syslog` and `journal` for
+    /// the userspace paths.
+    #[serde(rename = "_TRANSPORT")]
+    transport: Option<String>,
 }
 
 fn priority_of(raw: Option<&str>) -> Priority {
@@ -39,6 +44,43 @@ fn priority_of(raw: Option<&str>) -> Priority {
     }
 }
 
+/// What a record's `_TRANSPORT` field says about where it came from.
+///
+/// Named once, and beside `priority_code` for the same reason that one
+/// is beside `priority_of`: two readers construct an `Entry` - this
+/// module and `crate::sd_journal` - and a rule spelled in both is a rule
+/// that can be corrected in one.
+///
+/// An absent field is `Unknown`, not `Userspace`. journald stamps
+/// `_TRANSPORT` on every record it holds, so absence means this reader
+/// did not get it rather than that the record came from userspace, and
+/// saying otherwise would be an origin nobody measured.
+pub fn origin_of(transport: Option<&str>) -> Origin {
+    match transport {
+        Some("kernel") => Origin::Kernel,
+        Some(_) => Origin::Userspace,
+        None => Origin::Unknown,
+    }
+}
+
+/// The syslog number journalctl's `-p` wants for a priority.
+///
+/// The inverse of `priority_of`, and beside it so the two cannot drift:
+/// `-p 3` asks for "error and worse", which is the floor both Status
+/// journal sections read at.
+pub fn priority_code(priority: Priority) -> u8 {
+    match priority {
+        Priority::Emergency => 0,
+        Priority::Alert => 1,
+        Priority::Critical => 2,
+        Priority::Error => 3,
+        Priority::Warning => 4,
+        Priority::Notice => 5,
+        Priority::Info => 6,
+        Priority::Debug => 7,
+    }
+}
+
 /// `MESSAGE` is usually a string, but journalctl emits an **array of
 /// byte values** when the message is not valid UTF-8 - a real case for
 /// kernel records with embedded NULs. Rendering `[72, 105]` into the
@@ -47,7 +89,11 @@ fn message_of(value: Option<serde_json::Value>) -> String {
     match value {
         Some(serde_json::Value::String(text)) => text,
         Some(serde_json::Value::Array(bytes)) => {
-            let raw: Vec<u8> = bytes.iter().filter_map(|b| b.as_u64()).map(|b| b as u8).collect();
+            let raw: Vec<u8> = bytes
+                .iter()
+                .filter_map(|b| b.as_u64())
+                .map(|b| b as u8)
+                .collect();
             String::from_utf8_lossy(&raw).into_owned()
         }
         _ => String::new(),
@@ -58,15 +104,21 @@ fn message_of(value: Option<serde_json::Value>) -> String {
 /// line, so the caller parses line by line and a single malformed record
 /// costs one entry rather than the whole query.
 pub fn parse_entry(line: &str) -> Result<Entry, MasysError> {
-    let raw: RawEntry = serde_json::from_str(line).map_err(|e| MasysError::System(format!("journal: {e}")))?;
+    let raw: RawEntry =
+        serde_json::from_str(line).map_err(|e| MasysError::System(format!("journal: {e}")))?;
     Ok(Entry {
         // Journal timestamps are microseconds since the Unix epoch;
         // `Entry::timestamp_ms` is milliseconds on that same clock, not
         // the monotonic one `Snapshot::taken_at_ms` uses.
-        timestamp_ms: raw.realtime_timestamp.and_then(|t| t.parse::<u64>().ok()).unwrap_or(0) / 1000,
+        timestamp_ms: raw
+            .realtime_timestamp
+            .and_then(|t| t.parse::<u64>().ok())
+            .unwrap_or(0)
+            / 1000,
         unit: raw.unit,
         priority: priority_of(raw.priority.as_deref()),
         message: message_of(raw.message),
+        origin: origin_of(raw.transport.as_deref()),
     })
 }
 
@@ -74,7 +126,10 @@ pub fn parse_entry(line: &str) -> Result<Entry, MasysError> {
 /// is not valid JSON. journalctl prints a trailing newline, so empty
 /// lines are normal and not an error.
 pub fn parse_stream(text: &str) -> Vec<Entry> {
-    text.lines().filter(|l| !l.trim().is_empty()).filter_map(|l| parse_entry(l).ok()).collect()
+    text.lines()
+        .filter(|l| !l.trim().is_empty())
+        .filter_map(|l| parse_entry(l).ok())
+        .collect()
 }
 
 /// systemd's `MESSAGE_ID` for "unit failed" - `SD_MESSAGE_UNIT_FAILED`.

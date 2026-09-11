@@ -22,7 +22,7 @@ use std::collections::{HashMap, HashSet};
 use masys_view::{KeyBinding, KeyGroup};
 
 use crate::buffer::{Buffer, Registry};
-use crate::key::{Key, KeyCode};
+use crate::key::Key;
 use masys_domain::declarative::RebuildVerb;
 use masys_domain::service::Signal;
 
@@ -48,9 +48,9 @@ pub enum Action {
     CycleAll,
     /// Open or close the detail of the *row* under the cursor. Global for
     /// the same reason `Cycle` is: "show me what is inside this" is one
-    /// act, whichever view is asking.
+    /// act, whichever buffer is asking.
     ToggleDetail,
-    /// Quit, from any view. It used to bury back to Status first, which
+    /// Quit, from any buffer. It used to bury back to Status first, which
     /// failed the rule this keymap is built on: a global must mean the
     /// same thing everywhere, and "go back, except here, where I exit" is
     /// two meanings on one key.
@@ -87,6 +87,14 @@ pub enum Action {
     Unit(UnitVerb),
     /// Nix: an operation against the row under the cursor.
     Nix(NixVerb),
+    /// Nix: open the popup for one verb-family, regardless of the row
+    /// under the cursor. Rebuild, Inputs, Store and Search need no row at
+    /// all; Generation is contextual and names the generation it acts on
+    /// once one is selected, but opens - dimmed and marked, never hidden -
+    /// off one too. Mirrors magit's `c`/`b`/`l`: one top-level letter per
+    /// verb-family, each opening its own small popup, rather than one
+    /// popup for everything.
+    NixMenu(NixFamily),
     /// Open the transient for the row under the cursor.
     ///
     /// One key across every buffer, which is what the base map's own rule
@@ -104,7 +112,20 @@ pub enum Action {
     /// exactly one column worth ordering by and offering a choice of
     /// columns would be answering a question nobody asked.
     ToggleOrder,
-    /// Procs: open the systemd view at the unit that owns the row under
+    /// Status: go to the row the finding under the cursor is about.
+    ///
+    /// The Status buffer names what is wrong; this is what makes it a
+    /// place you can act from rather than only read. A failed unit takes
+    /// you to that unit, a full filesystem to that mount.
+    ///
+    /// Its own action rather than `ToggleDetail`, though `enter` would be
+    /// the obvious key: `enter` is a protected global, and this module's
+    /// one test-enforced invariant is that no overlay may shadow one.
+    /// Expand-in-place everywhere and navigate-away here would be two
+    /// meanings on one key, which is what got `q`'s bury-then-quit
+    /// behaviour removed.
+    JumpToFinding,
+    /// Procs: open the systemd buffer at the unit that owns the row under
     /// the cursor.
     ///
     /// The Procs buffer already groups by cgroup, and on a systemd host a
@@ -155,6 +176,39 @@ pub enum NixVerb {
     /// `nix-channel --update`, and its rollback.
     ChannelUpdate,
     ChannelRollback,
+    /// `nixos-rebuild repl` - a nix repl with this configuration loaded.
+    ///
+    /// A row on the Rebuild popup rather than a switch, because it is an
+    /// action and not a flag. `p` rather than the obvious `r`: `r` in that
+    /// popup already toggles the `-r` rollback switch, and a row and a
+    /// switch cannot share a chord - `answer_transient` reads one
+    /// character and asks `action` before `toggle`, so `r` would run a
+    /// repl and the rollback switch would become unreachable.
+    Repl,
+    /// `nixos-rebuild build-vm` - a qemu runner for this configuration.
+    ///
+    /// `v` on the Rebuild popup. Sits beside `B` (plain build) because it
+    /// is the same act with a different product, and both leave their
+    /// result under `./result` for the operator to use next.
+    BuildVm,
+    /// `nixos-rebuild build-image` with no variant, which prints the
+    /// variants available.
+    ///
+    /// `i`, the lowercase of the pair, because it is the one you reach
+    /// for first: you cannot ask for a variant you cannot name, and this
+    /// is how the names are found. It is also the harmless half - a list
+    /// and no build - which is the right way round for the easier key.
+    ListImageVariants,
+    /// `nixos-rebuild build-image --image-variant <variant>`, typed.
+    ///
+    /// `I`, the uppercase, for the half that costs minutes and writes to
+    /// the store.
+    BuildImage,
+    /// `nixos-rebuild switch --upgrade` - update the channels, then
+    /// switch. Reached as the `-u` switch on the Rebuild popup rather
+    /// than as a row, because it is a flag on `switch` and not an action
+    /// of its own, exactly as `-r` reaches `Rollback`.
+    Upgrade,
     /// `nix search nixpkgs <query>`, the query typed.
     SearchPackages,
     /// `nixos-option <name>`, the name typed.
@@ -183,12 +237,33 @@ impl NixVerb {
     /// without the operator having to remember which key they pressed.
     pub fn label(self) -> &'static str {
         match self {
-            NixVerb::Rebuild(RebuildVerb::Switch) => "build, activate, and make it the boot default",
-            NixVerb::Rebuild(RebuildVerb::Boot) => "build and make it the boot default",
-            NixVerb::Rebuild(RebuildVerb::Test) => "build and activate, without touching the boot default",
+            NixVerb::Rebuild(RebuildVerb::Switch) => {
+                "build, activate, and make it the boot default"
+            }
+            // Says what it does *not* do, the way `test` next door does.
+            // `boot` is the one rebuild verb whose safety is the thing it
+            // omits - nothing restarts, nothing is swapped under a running
+            // service - and an operator choosing between these five reads
+            // the labels rather than the manual. Leaving activation to
+            // inference made the safest verb look like the vaguest one.
+            NixVerb::Rebuild(RebuildVerb::Boot) => {
+                "build and make it the boot default, without activating it now"
+            }
+            NixVerb::Rebuild(RebuildVerb::Test) => {
+                "build and activate, without touching the boot default"
+            }
             NixVerb::Rebuild(RebuildVerb::Build) => "build only",
-            NixVerb::Rebuild(RebuildVerb::DryActivate) => "print what activating would change",
+            NixVerb::Rebuild(RebuildVerb::DryActivate) => {
+                "print which units activating would restart"
+            }
             NixVerb::Rollback => "activate the previous generation",
+            NixVerb::Upgrade => "update the nixos channel, then build and activate it",
+            NixVerb::Repl => "open a nix repl on this configuration",
+            NixVerb::BuildVm => "build a qemu runner for this configuration",
+            NixVerb::ListImageVariants => {
+                "list the disk-image variants this configuration can build"
+            }
+            NixVerb::BuildImage => "build a disk image for this configuration",
             NixVerb::HomeSwitch => "build and activate the home-manager configuration",
             NixVerb::Activate => "activate this generation",
             NixVerb::Diff => "diff against current",
@@ -214,6 +289,11 @@ impl NixVerb {
             NixVerb::Rebuild(RebuildVerb::Build) => "build",
             NixVerb::Rebuild(RebuildVerb::DryActivate) => "dry-activate",
             NixVerb::Rollback => "rollback",
+            NixVerb::Upgrade => "upgrade",
+            NixVerb::Repl => "repl",
+            NixVerb::BuildVm => "build-vm",
+            NixVerb::ListImageVariants => "image variants",
+            NixVerb::BuildImage => "build-image",
             NixVerb::HomeSwitch => "switch",
             NixVerb::Activate => "activate",
             NixVerb::Diff => "diff",
@@ -228,6 +308,22 @@ impl NixVerb {
             NixVerb::Clean => "clean",
         }
     }
+}
+
+/// The Nix buffer's own verb-families, one popup and one top-level letter
+/// each - `NixBuffer::family_transient`'s only parameter besides the row
+/// under the cursor.
+///
+/// Home-manager is not a variant here: `HomeSwitch` is one leaf with
+/// nothing to pick between, so it is bound directly, the shape magit
+/// gives `s`/`u`/`k`, rather than a popup with one row in it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NixFamily {
+    Rebuild,
+    Generation,
+    Inputs,
+    Store,
+    Search,
 }
 
 /// The systemctl verbs the Units buffer offers.
@@ -292,7 +388,14 @@ impl UnitVerb {
         // disable do, and more plainly: both write a symlink under
         // `/etc/systemd/system`, which a declaratively managed host
         // either refuses outright or rewrites on the next rebuild.
-        matches!(self, UnitVerb::Enable | UnitVerb::Disable | UnitVerb::Edit | UnitVerb::Mask | UnitVerb::Unmask)
+        matches!(
+            self,
+            UnitVerb::Enable
+                | UnitVerb::Disable
+                | UnitVerb::Edit
+                | UnitVerb::Mask
+                | UnitVerb::Unmask
+        )
     }
 
     /// Whether the verb only makes sense on a unit that has failed.
@@ -303,7 +406,15 @@ impl UnitVerb {
 
 impl Action {
     fn is_movement(&self) -> bool {
-        matches!(self, Action::MoveDown | Action::MoveUp | Action::PageDown | Action::PageUp | Action::MoveTop | Action::MoveBottom)
+        matches!(
+            self,
+            Action::MoveDown
+                | Action::MoveUp
+                | Action::PageDown
+                | Action::PageUp
+                | Action::MoveTop
+                | Action::MoveBottom
+        )
     }
 
     fn label(&self) -> &'static str {
@@ -317,6 +428,7 @@ impl Action {
             Action::Cycle => "cycle this section",
             Action::CycleAll => "cycle every section",
             Action::ToggleDetail => "open / close this row",
+            Action::JumpToFinding => "go to what this finding is about",
             Action::Quit => "quit",
             Action::Refresh => "refresh now",
             Action::Help => "these keys",
@@ -326,6 +438,7 @@ impl Action {
             Action::SortBy(sort) => match sort {
                 Sort::Cpu => "sort by cpu",
                 Sort::Memory => "sort by memory",
+                Sort::Io => "sort by io",
                 Sort::Name => "sort by name",
             },
             Action::Filter => "filter",
@@ -337,6 +450,11 @@ impl Action {
             Action::Nice(_) => "lower priority",
             Action::Unit(verb) => verb.label(),
             Action::Nix(verb) => verb.label(),
+            Action::NixMenu(NixFamily::Rebuild) => "rebuild options",
+            Action::NixMenu(NixFamily::Generation) => "generation options",
+            Action::NixMenu(NixFamily::Inputs) => "inputs options",
+            Action::NixMenu(NixFamily::Store) => "store options",
+            Action::NixMenu(NixFamily::Search) => "search options",
             Action::Logs => "this unit's log",
             Action::ToggleOrder => "oldest / newest first",
             Action::GoToUnit => "this row's unit",
@@ -360,6 +478,11 @@ fn short_label(action: &Action) -> &'static str {
         Action::Nice(_) => "nice+",
         Action::Unit(verb) => verb.label(),
         Action::Nix(verb) => verb.short_label(),
+        Action::NixMenu(NixFamily::Rebuild) => "rebuild",
+        Action::NixMenu(NixFamily::Generation) => "generation",
+        Action::NixMenu(NixFamily::Inputs) => "inputs",
+        Action::NixMenu(NixFamily::Store) => "store",
+        Action::NixMenu(NixFamily::Search) => "search",
         Action::Logs => "logs",
         Action::ToggleOrder => "order",
         Action::GoToUnit => "unit",
@@ -371,11 +494,11 @@ fn short_label(action: &Action) -> &'static str {
 #[derive(Debug, Clone)]
 pub struct Keymap {
     base: Vec<(Key, Action)>,
-    overlays: HashMap<&'static str, Vec<(Key, Action)>>,
+    overlays: HashMap<Buffer, Vec<(Key, Action)>>,
     protected: HashSet<Key>,
-    /// Which views this host has. Held here rather than beside the keymap
+    /// Which buffers this host has. Held here rather than beside the keymap
     /// because every consumer of it is a method on this type: the digit
-    /// that opens a view, the footer that offers it, and the `?` help that
+    /// that opens a buffer, the footer that offers it, and the `?` help that
     /// lists it. A registry the caller passed in at each of those three
     /// call sites would be three chances to pass the wrong one - and the
     /// static catalogue would still be in scope as the easy wrong answer.
@@ -413,17 +536,22 @@ pub const DEFAULT_BINDINGS: &[(&str, &str)] = &[
     ("refresh", "g"),
     ("help", "?"),
     ("filter", "/"),
-    // Digits: a view jump is a menu, not navigation within a view, so it
-    // has no claim on the letters the views need.
-    ("view_status", "1"),
-    ("view_procs", "2"),
-    ("view_systemd", "3"),
-    ("view_io", "4"),
-    ("view_nix", "5"),
+    // Digits: a buffer jump is a menu, not navigation within a buffer, so it
+    // has no claim on the letters the buffers need.
+    ("buffer_status", "1"),
+    ("buffer_procs", "2"),
+    ("buffer_systemd", "3"),
+    ("buffer_io", "4"),
+    ("buffer_nix", "5"),
+    ("buffer_packages", "6"),
     // Procs. `a` for alphabetical, `n` having gone to sections.
     ("sort_cpu", "c"),
     ("sort_memory", "m"),
     ("sort_name", "a"),
+    // `i` for io, beside `c` and `m`. Free in Procs: the Nix buffer's
+    // inputs menu takes `i` too, and `owner` keeps the two apart the way
+    // it already does for `a` and `c`.
+    ("sort_io", "i"),
     ("terminate", "k"),
     ("kill", "K"),
     ("nice_down", "]"),
@@ -448,65 +576,96 @@ pub const DEFAULT_BINDINGS: &[(&str, &str)] = &[
     // `e` was `unit_enable` until the transient engine landed. Enable is
     // reachable from the popup, and the popup needs one key everywhere.
     ("transient", "e"),
-    // Nix has no top-level keys of its own. `a`, `d` and `c` were
-    // activate, diff and clean while the transient did not exist - Phase
-    // 1 said they were temporary and this is where they go. All eighteen
-    // operations are rows in the popup `e` opens, which is what the
-    // design drew and what stops the Nix buffer from spending three
-    // letters on three of its thirteen operations.
     // `u` for unit. A drill-down out of Procs, so it lives with the
     // Procs keys rather than the systemd ones.
     ("go_to_unit", "u"),
-    // Log. `o` for order, and the view's only key of its own.
+    // Nix, magit-shaped: `a`, `d` and `c` were activate, diff and clean
+    // while the transient did not exist, and "all eighteen operations
+    // behind one `e`" was Phase 3's answer to that - a single letter
+    // spent nothing, but it made eighteen operations as hard to find as
+    // one. `unit_transient` next door already proved the other shape
+    // works in this codebase: direct keys for what's reached for
+    // constantly, small popups scoped to a family for the rest. `switch`
+    // is the Nix operation that fits the direct case - live on every row,
+    // reached for on nearly every visit - and home-manager's takes a
+    // second letter for the same reason where it is deployed standalone.
+    // The rest sort into the five families the mega-popup already grouped
+    // them into, each behind its own letter; `home_switch` is the one
+    // operation no family popup lists, so its letter is its only way in.
+    ("nix_rebuild_switch", "s"),
+    ("nix_home_switch", "h"),
+    ("nix_menu_rebuild", "b"),
+    ("nix_menu_generation", "a"),
+    ("nix_menu_inputs", "i"),
+    ("nix_menu_store", "c"),
+    ("nix_menu_search", "f"),
+    // Log. `o` for order, and the buffer's only key of its own.
     ("log_order", "o"),
+    // Status. `.` because punctuation reads as navigation, it is free,
+    // and it prejudges nothing about `hjkl`, which this map deliberately
+    // leaves unbound while which letters mean movement is unsettled.
+    ("jump_to_finding", "."),
 ];
 
-/// Which views an action belongs to.
+/// Which buffers an action belongs to.
 ///
 /// A slice rather than one buffer because a unit verb is meaningful in any
-/// view that shows units, and two now do: the systemd view and the Nix
-/// view's own units section. Filing it under one was what made the Nix
+/// buffer that shows units, and two now do: the systemd buffer and the Nix
+/// buffer's own units section. Filing it under one was what made the Nix
 /// section's stated justification - that `s`, `r` and `l` work on it
 /// through machinery that already exists - untrue in practice: `owner`
 /// sent every unit verb to `Buffer::Systemd` alone, so the same key that
-/// restarted a unit from the systemd view did nothing to the identical row
-/// shown in the Nix view.
+/// restarted a unit from the systemd buffer did nothing to the identical row
+/// shown in the Nix buffer.
 ///
 /// Empty means global.
 fn owner(action: Action) -> &'static [Buffer] {
     match action {
-        Action::SortBy(_) | Action::Kill(_) | Action::Nice(_) | Action::GoToUnit => &[Buffer::Procs],
+        Action::SortBy(_) | Action::Kill(_) | Action::Nice(_) | Action::GoToUnit => {
+            &[Buffer::Procs]
+        }
         // Every verb, not a hand-picked subset: `app.rs`'s `selected_unit`
         // reads `Node::Unit`/`Node::Timer` off the row under the cursor with
         // no branch on which buffer it came from, and `nix_buffer.rs` builds
         // the Nix units section out of that same `Node::Unit`. So
         // `nix-daemon.service` is the identical row whether reached from
-        // there or from the systemd view, and giving it fewer verbs in one
+        // there or from the systemd buffer, and giving it fewer verbs in one
         // of the two would make one row answer to different keys depending
         // which buffer happened to be showing it - not a smaller keymap, an
         // inconsistent one.
         Action::Unit(_) | Action::Logs | Action::Transient => &[Buffer::Systemd, Buffer::Nix],
-        // The Nix view alone. A generation row exists nowhere else, and
-        // the store-wide operations are what that view is about.
-        Action::Nix(_) => &[Buffer::Nix],
+        // The Nix buffer alone. A generation row exists nowhere else, and
+        // the store-wide operations are what that buffer is about. Its
+        // family menus (`NixMenu`) are the same buffer for the same reason.
+        Action::Nix(_) | Action::NixMenu(_) => &[Buffer::Nix],
         Action::ToggleOrder => &[Buffer::Log],
+        // Findings live in one buffer, so the key that follows one does
+        // too - and being owned is what keeps it out of every other
+        // buffer's footer.
+        Action::JumpToFinding => &[Buffer::Status],
         _ => &[],
     }
 }
 
 /// Whether this host can reach the action at all.
 ///
-/// Two ways it cannot: the jump names a view the host does not have, or
+/// Two ways it cannot: the jump names a buffer the host does not have, or
 /// the action lives *in* one. The second is not the same question as
-/// [`owner`] - `owner` says which views an action belongs to on a host
+/// [`owner`] - `owner` says which buffers an action belongs to on a host
 /// that has them, and this says whether the host has them.
 ///
-/// The Nix verbs are the only actions in the second class today, because
-/// `Buffer::Nix` is the only optional view. Without the arm they were
+/// The Nix verbs and family menus are the only actions in the second
+/// class today. Not because `Buffer::Nix` is the only optional buffer -
+/// `Buffer::Packages` is a second one, and this sentence said otherwise
+/// until 2026-08-30 - but because Packages carries no actions of its own.
+/// It is the thinnest buffer masys has: a list and a header, with nothing
+/// to act on, so the `Action::Open(buffer)` arm above is the whole of its
+/// reachability. A gated buffer that *did* have verbs would need an arm
+/// here, the way the Nix ones do. Without the arm they were
 /// built into a `Buffer::Nix` overlay on every host, Debian included,
 /// with no user-visible effect only because nothing can put the cursor in
 /// a buffer that is not registered. `Registry` is the one owner of which
-/// views exist, and an overlay for a view this host does not have is a
+/// buffers exist, and an overlay for a buffer this host does not have is a
 /// second, quieter answer to that question sitting where the first one
 /// should be - the same shape as the footer that advertised `[5] nix` on
 /// a host where `5` did nothing. Removing a bug's habitat beats fixing
@@ -514,7 +673,7 @@ fn owner(action: Action) -> &'static [Buffer] {
 fn reachable(registry: &Registry, action: Action) -> bool {
     match action {
         Action::Open(buffer) => registry.contains(buffer),
-        Action::Nix(_) => registry.contains(Buffer::Nix),
+        Action::Nix(_) | Action::NixMenu(_) => registry.contains(Buffer::Nix),
         _ => true,
     }
 }
@@ -526,20 +685,9 @@ impl Default for Keymap {
 }
 
 impl Keymap {
-    /// The keymap of a host with `registry`'s views and no config file.
+    /// The keymap of a host with `registry`'s buffers and no config file.
     pub fn for_registry(registry: Registry) -> Self {
         Self::with_overrides_for(registry, &[]).0
-    }
-
-    /// The keymap of a host with no declarative service, with `overrides`
-    /// applied.
-    ///
-    /// Kept as its own name because it is what a caller with no registry
-    /// to offer should get: `Registry::default()` is the host that has the
-    /// views every Linux box has, which is the safe answer to give someone
-    /// who has not asked the question yet.
-    pub fn with_overrides(overrides: &[(String, String)]) -> (Self, Vec<String>) {
-        Self::with_overrides_for(Registry::default(), overrides)
     }
 
     /// Builds the keymap for a host from the defaults, with `overrides`
@@ -549,14 +697,19 @@ impl Keymap {
     /// caller can tell the operator rather than silently ignoring a line
     /// of their config. A binding that fails to parse leaves the default
     /// in place: a typo should cost you the customisation, not the key.
-    pub fn with_overrides_for(registry: Registry, overrides: &[(String, String)]) -> (Self, Vec<String>) {
+    pub fn with_overrides_for(
+        registry: Registry,
+        overrides: &[(String, String)],
+    ) -> (Self, Vec<String>) {
         let mut problems = Vec::new();
-        // A view this host does not have is dropped here rather than at
+        // A buffer this host does not have is dropped here rather than at
         // the end, so nothing is reported as having "lost" a key to a
         // binding that was never going to exist.
         let mut bindings: Vec<(&'static str, String)> = DEFAULT_BINDINGS
             .iter()
-            .filter(|(name, _)| Action::from_name(name).is_none_or(|action| reachable(&registry, action)))
+            .filter(|(name, _)| {
+                Action::from_name(name).is_none_or(|action| reachable(&registry, action))
+            })
             .map(|(name, key)| (*name, (*key).to_string()))
             .collect();
 
@@ -566,7 +719,9 @@ impl Keymap {
                 continue;
             };
             if Key::parse(spelling).is_none() {
-                problems.push(format!("`{spelling}` is not a key masys understands (for `{name}`)"));
+                problems.push(format!(
+                    "`{spelling}` is not a key masys understands (for `{name}`)"
+                ));
                 continue;
             }
             match bindings.iter_mut().find(|(n, _)| n == known) {
@@ -588,17 +743,19 @@ impl Keymap {
             if chosen.contains(&name) {
                 continue;
             }
-            if let Some((winner, _)) =
-                bindings.iter().find(|(other, other_key)| *other != name && other_key == &spelling && chosen.contains(other))
-            {
-                problems.push(format!("`{name}` lost `{spelling}` to `{winner}` and is now unbound"));
+            if let Some((winner, _)) = bindings.iter().find(|(other, other_key)| {
+                *other != name && other_key == &spelling && chosen.contains(other)
+            }) {
+                problems.push(format!(
+                    "`{name}` lost `{spelling}` to `{winner}` and is now unbound"
+                ));
                 displaced.push(name);
             }
         }
         bindings.retain(|(name, _)| !displaced.contains(name));
 
         let mut base: Vec<(Key, Action)> = Vec::new();
-        let mut overlays: HashMap<&'static str, Vec<(Key, Action)>> = HashMap::new();
+        let mut overlays: HashMap<Buffer, Vec<(Key, Action)>> = HashMap::new();
         for (name, spelling) in &bindings {
             let (Some(action), Some(key)) = (Action::from_name(name), Key::parse(spelling)) else {
                 continue;
@@ -606,8 +763,8 @@ impl Keymap {
             // And again here, because an override can name an action the
             // defaults were filtered of. Silently, rather than reported: a
             // config shared between a NixOS box and a Debian one is not
-            // wrong for mentioning the Nix view, it is just describing a
-            // view this host does not have.
+            // wrong for mentioning the Nix buffer, it is just describing a
+            // buffer this host does not have.
             if !reachable(&registry, action) {
                 continue;
             }
@@ -615,7 +772,7 @@ impl Keymap {
                 [] => base.push((key, action)),
                 buffers => {
                     for buffer in buffers {
-                        overlays.entry(buffer.title()).or_default().push((key, action));
+                        overlays.entry(*buffer).or_default().push((key, action));
                     }
                 }
             }
@@ -623,7 +780,7 @@ impl Keymap {
 
         // Every global, and nothing else. `base` holds exactly the actions
         // `owner` assigns to no view, which is the same set as "means the
-        // same thing in every view" - so the protected set is not a
+        // same thing in every buffer" - so the protected set is not a
         // judgement made here, it is a restatement of that table.
         //
         // The old version filtered by action kind and so left `/` and
@@ -631,10 +788,18 @@ impl Keymap {
         // could quietly take either.
         let protected = base.iter().map(|(key, _)| *key).collect();
 
-        (Keymap { base, overlays, protected, registry }, problems)
+        (
+            Keymap {
+                base,
+                overlays,
+                protected,
+                registry,
+            },
+            problems,
+        )
     }
 
-    /// The views this host has.
+    /// The buffers this host has.
     ///
     /// Exposed so a caller that needs the same answer - which buffer a
     /// digit reaches, whether a buffer may be opened at all - reads the
@@ -644,8 +809,8 @@ impl Keymap {
         &self.registry
     }
 
-    /// Which key currently runs `action`, spelled as the footer and the
-    /// help print it.
+    /// Which key currently runs `action` in the base map, spelled as the
+    /// footer and the help print it.
     ///
     /// The reason both of those go through here rather than through a
     /// table of their own: a chord written down anywhere but the keymap
@@ -654,8 +819,21 @@ impl Keymap {
     /// nothing is bound to, so a displaced binding disappears from the
     /// offer instead of being advertised at a key that does something
     /// else now.
+    ///
+    /// The base map only, and it has to be: there is no buffer parameter
+    /// here, so an answer taken from a per-buffer overlay would be an
+    /// answer about some other buffer. It searched the overlays too until
+    /// 2026-08-29, which could not be reached - every caller asks about
+    /// `Open`, `Refresh`, `Help`, `Quit` or `Filter`, all of them base
+    /// bindings that match before the search got there - and which would
+    /// have been randomised if it ever were, since `overlays` is a
+    /// `HashMap` and twelve actions sit in both the systemd and nix
+    /// overlays.
     pub fn chord_for(&self, action: Action) -> Option<String> {
-        self.base.iter().chain(self.overlays.values().flatten()).find(|(_, bound)| *bound == action).map(|(key, _)| key.spelling())
+        self.base
+            .iter()
+            .find(|(_, bound)| *bound == action)
+            .map(|(key, _)| key.spelling())
     }
 
     pub fn is_protected(&self, key: Key) -> bool {
@@ -670,29 +848,24 @@ impl Keymap {
     /// wrongly, a lookup cannot.
     pub fn resolve(&self, buffer: Buffer, key: Key) -> Option<Action> {
         if !self.is_protected(key)
-            && let Some(overlay) = self.overlays.get(buffer.title())
+            && let Some(overlay) = self.overlays.get(&buffer)
             && let Some((_, action)) = overlay.iter().find(|(k, _)| *k == key)
         {
             return Some(*action);
         }
-        self.base.iter().find(|(k, _)| *k == key).map(|(_, action)| *action)
+        self.base
+            .iter()
+            .find(|(k, _)| *k == key)
+            .map(|(_, action)| *action)
     }
 
     /// What `key` means with no buffer in play - used by the shadowing
     /// test to state what a protected key must keep meaning.
     pub fn base_action(&self, key: Key) -> Option<Action> {
-        self.base.iter().find(|(k, _)| *k == key).map(|(_, action)| *action)
-    }
-
-    /// The buffer a key opens, if any.
-    ///
-    /// Kept as its own lookup rather than folded into `resolve` so the
-    /// registry stays the single source of which letter reaches which
-    /// buffer - `resolve` answers "what does this key do", this answers
-    /// "which buffer is that".
-    pub fn resolve_buffer(&self, key: Key) -> Option<Buffer> {
-        let KeyCode::Char(c) = key.code else { return None };
-        self.registry.by_key(c)
+        self.base
+            .iter()
+            .find(|(k, _)| *k == key)
+            .map(|(_, action)| *action)
     }
 
     /// The footer's offer: how to reach every other buffer, then the
@@ -706,35 +879,54 @@ impl Keymap {
             .iter()
             .filter(|spec| spec.key.is_some())
             .filter_map(|spec| {
-                let mut hint = self.binding(Action::Open(spec.buffer), &spec.title.to_lowercase())?;
+                let mut hint =
+                    self.binding(Action::Open(spec.buffer), &spec.title.to_lowercase())?;
                 hint.active = spec.buffer == buffer;
                 Some(hint)
             })
             .collect();
         hints.extend(
-            [self.binding(Action::Refresh, "refresh"), self.binding(Action::Help, "keys"), self.binding(Action::Quit, "quit")]
-                .into_iter()
-                .flatten(),
+            [
+                self.binding(Action::Refresh, "refresh"),
+                self.binding(Action::Help, "keys"),
+                self.binding(Action::Quit, "quit"),
+            ]
+            .into_iter()
+            .flatten(),
         );
         hints
     }
 
     /// One footer entry, or nothing when the action has no key.
     fn binding(&self, action: Action, label: &str) -> Option<KeyBinding> {
-        Some(KeyBinding { chord: self.chord_for(action)?, label: label.to_string(), dimmed: false, active: false })
+        Some(KeyBinding {
+            chord: self.chord_for(action)?,
+            label: label.to_string(),
+            dimmed: false,
+            active: false,
+        })
     }
 
     /// Which action a chord runs, for the caller to decide whether it is
     /// currently applicable.
+    ///
+    /// Defers to `resolve` rather than scanning the overlay itself, so
+    /// there is one answer to "what does this key do" and not two. It read
+    /// the overlay directly until 2026-08-29, which made it blind to every
+    /// base binding: `actions` offers `/` from the base map, so the
+    /// footer's dimming pass asked about a key this could not see and got
+    /// `None`. That landed on the `_` arm and left `/` undimmed, which is
+    /// the right answer arrived at by accident - filter is always
+    /// available, and nothing here knew it.
     pub fn action_for(&self, buffer: Buffer, chord: &str) -> Option<Action> {
-        self.overlays.get(buffer.title())?.iter().find(|(key, _)| key.spelling() == chord).map(|(_, action)| *action)
+        self.resolve(buffer, Key::parse(chord)?)
     }
 
     /// The open buffer's own keys, for the footer's second row.
     pub fn actions(&self, buffer: Buffer) -> Vec<KeyBinding> {
         let mut actions: Vec<KeyBinding> = self
             .overlays
-            .get(buffer.title())
+            .get(&buffer)
             .map(|overlay| {
                 overlay
                     .iter()
@@ -759,17 +951,28 @@ impl Keymap {
             self.base
                 .iter()
                 .filter(|(_, action)| wanted(action))
-                .map(|(key, action)| KeyBinding { chord: key.spelling(), label: action.label().to_string(), dimmed: false, active: false })
+                .map(|(key, action)| KeyBinding {
+                    chord: key.spelling(),
+                    label: action.label().to_string(),
+                    dimmed: false,
+                    active: false,
+                })
                 .collect()
         };
 
         let mut groups = vec![
-            KeyGroup { heading: "Movement".to_string(), bindings: bindings(|a| a.is_movement()) },
+            KeyGroup {
+                heading: "Movement".to_string(),
+                bindings: bindings(|a| a.is_movement()),
+            },
             // Everything else the base map binds, rather than a list of
             // the four variants that existed when this was written -
             // `/`, `n` and `p` were all added afterwards and none of
             // them ever appeared in the help.
-            KeyGroup { heading: "Global".to_string(), bindings: bindings(|a| !a.is_movement() && !matches!(a, Action::Open(_))) },
+            KeyGroup {
+                heading: "Global".to_string(),
+                bindings: bindings(|a| !a.is_movement() && !matches!(a, Action::Open(_))),
+            },
             KeyGroup {
                 heading: "Buffers".to_string(),
                 // This host's registry, for the same reason the footer
@@ -780,15 +983,17 @@ impl Keymap {
                     .registry
                     .specs()
                     .iter()
-                    .filter_map(|spec| self.binding(Action::Open(spec.buffer), &spec.title.to_lowercase()))
+                    .filter_map(|spec| {
+                        self.binding(Action::Open(spec.buffer), &spec.title.to_lowercase())
+                    })
                     .collect(),
             },
         ];
 
         // The open buffer's own section, last and titled after it, so it
-        // is obvious which keys follow you between screens and which do
+        // is obvious which keys follow you between buffers and which do
         // not.
-        if let Some(overlay) = self.overlays.get(buffer.title())
+        if let Some(overlay) = self.overlays.get(&buffer)
             && !overlay.is_empty()
         {
             groups.push(KeyGroup {
@@ -827,18 +1032,21 @@ pub const ACTIONS: &[(&str, Action)] = &[
     ("cycle_all", Action::CycleAll),
     ("toggle_detail", Action::ToggleDetail),
     ("go_to_unit", Action::GoToUnit),
+    ("jump_to_finding", Action::JumpToFinding),
     ("quit", Action::Quit),
     ("refresh", Action::Refresh),
     ("help", Action::Help),
     ("filter", Action::Filter),
-    ("view_status", Action::Open(Buffer::Status)),
-    ("view_procs", Action::Open(Buffer::Procs)),
-    ("view_systemd", Action::Open(Buffer::Systemd)),
-    ("view_io", Action::Open(Buffer::Io)),
-    ("view_nix", Action::Open(Buffer::Nix)),
+    ("buffer_status", Action::Open(Buffer::Status)),
+    ("buffer_procs", Action::Open(Buffer::Procs)),
+    ("buffer_systemd", Action::Open(Buffer::Systemd)),
+    ("buffer_io", Action::Open(Buffer::Io)),
+    ("buffer_nix", Action::Open(Buffer::Nix)),
+    ("buffer_packages", Action::Open(Buffer::Packages)),
     ("sort_cpu", Action::SortBy(Sort::Cpu)),
     ("sort_memory", Action::SortBy(Sort::Memory)),
     ("sort_name", Action::SortBy(Sort::Name)),
+    ("sort_io", Action::SortBy(Sort::Io)),
     ("terminate", Action::Kill(Signal::Term)),
     ("kill", Action::Kill(Signal::Kill)),
     ("nice_down", Action::Nice(1)),
@@ -856,35 +1064,78 @@ pub const ACTIONS: &[(&str, Action)] = &[
     ("unit_mask", Action::Unit(UnitVerb::Mask)),
     ("unit_unmask", Action::Unit(UnitVerb::Unmask)),
     ("unit_logs", Action::Logs),
-    ("nix_rebuild_switch", Action::Nix(NixVerb::Rebuild(RebuildVerb::Switch))),
-    ("nix_rebuild_boot", Action::Nix(NixVerb::Rebuild(RebuildVerb::Boot))),
-    ("nix_rebuild_test", Action::Nix(NixVerb::Rebuild(RebuildVerb::Test))),
-    ("nix_rebuild_build", Action::Nix(NixVerb::Rebuild(RebuildVerb::Build))),
-    ("nix_dry_activate", Action::Nix(NixVerb::Rebuild(RebuildVerb::DryActivate))),
+    (
+        "nix_rebuild_switch",
+        Action::Nix(NixVerb::Rebuild(RebuildVerb::Switch)),
+    ),
+    (
+        "nix_rebuild_boot",
+        Action::Nix(NixVerb::Rebuild(RebuildVerb::Boot)),
+    ),
+    (
+        "nix_rebuild_test",
+        Action::Nix(NixVerb::Rebuild(RebuildVerb::Test)),
+    ),
+    (
+        "nix_rebuild_build",
+        Action::Nix(NixVerb::Rebuild(RebuildVerb::Build)),
+    ),
+    (
+        "nix_dry_activate",
+        Action::Nix(NixVerb::Rebuild(RebuildVerb::DryActivate)),
+    ),
     ("nix_rollback", Action::Nix(NixVerb::Rollback)),
+    ("nix_upgrade", Action::Nix(NixVerb::Upgrade)),
+    ("nix_repl", Action::Nix(NixVerb::Repl)),
+    ("nix_build_vm", Action::Nix(NixVerb::BuildVm)),
+    (
+        "nix_image_variants",
+        Action::Nix(NixVerb::ListImageVariants),
+    ),
+    ("nix_build_image", Action::Nix(NixVerb::BuildImage)),
     ("nix_home_switch", Action::Nix(NixVerb::HomeSwitch)),
     ("nix_activate", Action::Nix(NixVerb::Activate)),
     ("nix_diff", Action::Nix(NixVerb::Diff)),
     ("nix_delete_here", Action::Nix(NixVerb::DeleteHere)),
-    ("nix_delete_generations", Action::Nix(NixVerb::DeleteGenerations)),
+    (
+        "nix_delete_generations",
+        Action::Nix(NixVerb::DeleteGenerations),
+    ),
     ("nix_flake_update", Action::Nix(NixVerb::FlakeUpdate)),
     ("nix_flake_check", Action::Nix(NixVerb::FlakeCheck)),
     ("nix_channel_update", Action::Nix(NixVerb::ChannelUpdate)),
-    ("nix_channel_rollback", Action::Nix(NixVerb::ChannelRollback)),
+    (
+        "nix_channel_rollback",
+        Action::Nix(NixVerb::ChannelRollback),
+    ),
     ("nix_search_packages", Action::Nix(NixVerb::SearchPackages)),
     ("nix_option_value", Action::Nix(NixVerb::OptionValue)),
     ("nix_clean", Action::Nix(NixVerb::Clean)),
+    ("nix_menu_rebuild", Action::NixMenu(NixFamily::Rebuild)),
+    (
+        "nix_menu_generation",
+        Action::NixMenu(NixFamily::Generation),
+    ),
+    ("nix_menu_inputs", Action::NixMenu(NixFamily::Inputs)),
+    ("nix_menu_store", Action::NixMenu(NixFamily::Store)),
+    ("nix_menu_search", Action::NixMenu(NixFamily::Search)),
     ("log_order", Action::ToggleOrder),
 ];
 
 impl Action {
     /// The config-file name for this action, if it has one.
     pub fn name(&self) -> Option<&'static str> {
-        ACTIONS.iter().find(|(_, action)| action == self).map(|(name, _)| *name)
+        ACTIONS
+            .iter()
+            .find(|(_, action)| action == self)
+            .map(|(name, _)| *name)
     }
 
     /// The action a config file means by `name`.
     pub fn from_name(name: &str) -> Option<Action> {
-        ACTIONS.iter().find(|(known, _)| *known == name).map(|(_, action)| *action)
+        ACTIONS
+            .iter()
+            .find(|(known, _)| *known == name)
+            .map(|(_, action)| *action)
     }
 }

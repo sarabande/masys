@@ -18,7 +18,11 @@ struct Tree(PathBuf);
 
 impl Tree {
     fn new() -> Tree {
-        let path = std::env::temp_dir().join(format!("masys-scan-{}-{}", std::process::id(), UNIQUE.fetch_add(1, Ordering::Relaxed)));
+        let path = std::env::temp_dir().join(format!(
+            "masys-scan-{}-{}",
+            std::process::id(),
+            UNIQUE.fetch_add(1, Ordering::Relaxed)
+        ));
         fs::create_dir_all(&path).expect("a temp tree");
         Tree(path)
     }
@@ -63,7 +67,11 @@ impl Drop for Tree {
 
 /// The size a directory was recorded as, if it was retained at all.
 fn bytes_of(progress: &masys_domain::scan::ScanProgress, path: &Path) -> Option<u64> {
-    progress.dirs.iter().find(|d| d.path == path).map(|d| d.bytes)
+    progress
+        .dirs
+        .iter()
+        .find(|d| d.path == path)
+        .map(|d| d.bytes)
 }
 
 /// Block accounting, like `du`: the total is what the tree occupies, so
@@ -84,7 +92,10 @@ fn a_tree_is_summed_from_its_files() {
     let a = bytes_of(&progress, &tree.0.join("a")).expect("a was retained");
     let b = bytes_of(&progress, &tree.0.join("b")).expect("b was retained");
     assert!(a > b, "a holds twice what b does: a={a} b={b}");
-    assert!(root >= a + b, "the root holds both: root={root} a={a} b={b}");
+    assert!(
+        root >= a + b,
+        "the root holds both: root={root} a={a} b={b}"
+    );
     assert!(progress.done, "a finished walk says so");
 }
 
@@ -103,7 +114,10 @@ fn a_directory_costs_its_own_blocks() {
     let progress = state.progress();
 
     let empty = bytes_of(&progress, &tree.0.join("empty")).expect("retained");
-    assert!(empty > 0, "three empty directories still occupy blocks: {empty}");
+    assert!(
+        empty > 0,
+        "three empty directories still occupy blocks: {empty}"
+    );
 }
 
 /// The floor is what keeps the tree in kilobytes rather than the 70-100MB
@@ -127,9 +141,18 @@ fn a_directory_under_the_floor_folds_into_its_parent() {
         state.progress()
     };
 
-    assert!(bytes_of(&unbounded, &tree.0.join("small")).is_some(), "kept with no floor");
-    assert!(bytes_of(&bounded, &tree.0.join("small")).is_none(), "dropped under the floor");
-    assert!(bytes_of(&bounded, &tree.0.join("big")).is_some(), "the big one stays");
+    assert!(
+        bytes_of(&unbounded, &tree.0.join("small")).is_some(),
+        "kept with no floor"
+    );
+    assert!(
+        bytes_of(&bounded, &tree.0.join("small")).is_none(),
+        "dropped under the floor"
+    );
+    assert!(
+        bytes_of(&bounded, &tree.0.join("big")).is_some(),
+        "the big one stays"
+    );
     assert_eq!(
         bytes_of(&unbounded, tree.path()),
         bytes_of(&bounded, tree.path()),
@@ -154,15 +177,24 @@ fn an_unreadable_directory_is_counted_rather_than_fatal() {
     walk(tree.path(), 0, &state);
     let progress = state.progress();
 
-    assert_eq!(progress.unreadable, 1, "the shut directory was counted: {progress:?}");
-    assert!(bytes_of(&progress, &tree.0.join("readable")).is_some(), "the rest was still walked");
+    assert_eq!(
+        progress.unreadable, 1,
+        "the shut directory was counted: {progress:?}"
+    );
+    assert!(
+        bytes_of(&progress, &tree.0.join("readable")).is_some(),
+        "the rest was still walked"
+    );
     assert!(progress.done, "and the walk still finished");
     // Its contents are unreachable, but the directory itself still
     // occupies blocks and can still be stat'd - and `du` counts them.
     // Returning zero here left masys 36,864 bytes short of `du` over
     // /home/user, which is the whole of the remaining disagreement.
     let shut_bytes = bytes_of(&progress, &shut).expect("the shut directory is still a row");
-    assert!(shut_bytes > 0, "an unreadable directory still costs its own blocks: {shut_bytes}");
+    assert!(
+        shut_bytes > 0,
+        "an unreadable directory still costs its own blocks: {shut_bytes}"
+    );
 }
 
 /// `du -x`, and not a nicety: this host has 26TB of NFS under `/mnt`, and
@@ -184,8 +216,16 @@ fn a_walk_does_not_cross_a_mount_boundary() {
 
     // The mount *point* belongs to the parent filesystem and is fine to
     // record; anything beneath it is a different filesystem and is not.
-    let crossed: Vec<&PathBuf> = progress.dirs.iter().map(|d| &d.path).filter(|p| p.starts_with("/run/user/1000/")).collect();
-    assert!(crossed.is_empty(), "the walk crossed into another filesystem: {crossed:?}");
+    let crossed: Vec<&PathBuf> = progress
+        .dirs
+        .iter()
+        .map(|d| &d.path)
+        .filter(|p| p.starts_with("/run/user/1000/"))
+        .collect();
+    assert!(
+        crossed.is_empty(),
+        "the walk crossed into another filesystem: {crossed:?}"
+    );
     assert!(progress.done);
 }
 

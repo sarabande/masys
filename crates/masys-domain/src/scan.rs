@@ -52,10 +52,14 @@ pub struct ScanProgress {
 impl ScanProgress {
     /// The retained children of `parent`, largest first.
     ///
-    /// Only direct children: the tree is flat on the wire, and the view
+    /// Only direct children: the tree is flat on the wire, and the buffer
     /// asks one level at a time as rows are opened.
     pub fn children_of(&self, parent: &Path) -> Vec<&DirSize> {
-        let mut children: Vec<&DirSize> = self.dirs.iter().filter(|d| d.path.parent() == Some(parent)).collect();
+        let mut children: Vec<&DirSize> = self
+            .dirs
+            .iter()
+            .filter(|d| d.path.parent() == Some(parent))
+            .collect();
         children.sort_by(|a, b| b.bytes.cmp(&a.bytes).then_with(|| a.path.cmp(&b.path)));
         children
     }
@@ -64,9 +68,10 @@ impl ScanProgress {
 /// Summing a directory tree, without blocking the caller.
 ///
 /// The one port in masys that is not request/response, because the work
-/// it fronts cannot be: `masys-design.md` allows exactly this - "the fix
-/// is moving *that one source* behind a thread and channel, not making
-/// everything async" - and a scan is the source that earns it.
+/// it fronts cannot be. The rule it answers to is that a source too slow
+/// for the tick moves *that one source* behind a thread and a channel,
+/// rather than making everything async - and a scan is the source that
+/// earns it.
 pub trait DirScanner {
     /// Begin scanning `root`, abandoning any scan already in flight.
     fn start(&self, root: &Path);

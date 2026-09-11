@@ -2,7 +2,17 @@ use masys_platform_nixos::reboot_state;
 
 #[test]
 fn identical_store_paths_mean_no_reboot_is_pending() {
-    assert_eq!(reboot_state("/nix/store/aaa-sys", "/nix/store/aaa-sys", None, None, None, None), None);
+    assert_eq!(
+        reboot_state(
+            "/nix/store/aaa-sys",
+            "/nix/store/aaa-sys",
+            None,
+            None,
+            None,
+            None
+        ),
+        None
+    );
 }
 
 /// The whole point of the type. Every other tool prints "reboot required";
@@ -84,7 +94,15 @@ fn the_same_version_from_a_different_build_counts_as_changed() {
 /// made.
 #[test]
 fn an_unread_kernel_is_never_mistaken_for_an_unchanged_one() {
-    let state = reboot_state("/nix/store/aaa-sys", "/nix/store/bbb-sys", None, None, None, None).unwrap();
+    let state = reboot_state(
+        "/nix/store/aaa-sys",
+        "/nix/store/bbb-sys",
+        None,
+        None,
+        None,
+        None,
+    )
+    .unwrap();
 
     assert!(state.kernel_changed);
 }

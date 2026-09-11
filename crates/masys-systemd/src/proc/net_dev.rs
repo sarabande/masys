@@ -40,7 +40,10 @@ pub fn parse_net_dev(text: &str) -> Vec<Interface> {
             if name.is_empty() || name.contains(char::is_whitespace) {
                 return None;
             }
-            let fields: Vec<u64> = counters.split_whitespace().filter_map(|f| f.parse().ok()).collect();
+            let fields: Vec<u64> = counters
+                .split_whitespace()
+                .filter_map(|f| f.parse().ok())
+                .collect();
             if fields.len() < TX_DROP + 1 {
                 return None;
             }
@@ -77,11 +80,17 @@ pub fn read_interfaces() -> Vec<Interface> {
     parse_net_dev(&text)
         .into_iter()
         .map(|interface| {
-            let attr =
-                |name: &str| std::fs::read_to_string(format!("/sys/class/net/{}/{name}", interface.name)).map(|s| s.trim().to_string());
+            let attr = |name: &str| {
+                std::fs::read_to_string(format!("/sys/class/net/{}/{name}", interface.name))
+                    .map(|s| s.trim().to_string())
+            };
             Interface {
-                up: attr("operstate").map(|state| state != "down").unwrap_or(true),
-                loopback: attr("type").map(|kind| kind == ARPHRD_LOOPBACK).unwrap_or(false),
+                up: attr("operstate")
+                    .map(|state| state != "down")
+                    .unwrap_or(true),
+                loopback: attr("type")
+                    .map(|kind| kind == ARPHRD_LOOPBACK)
+                    .unwrap_or(false),
                 ..interface
             }
         })

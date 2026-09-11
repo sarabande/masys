@@ -3,14 +3,14 @@
 //!
 //! Separate from `PlatformService`, which stays neutral. That port exists
 //! to answer one question every distro can answer - does a runtime
-//! `enable` survive - and `masys-platform-fallback` exists to force it to
-//! model not knowing. Generations, profiles and flake locks are not
-//! questions Debian can answer at all, and putting them there would
-//! dissolve the property the fallback crate is there to protect.
+//! `enable` survive - and its return types are what force it to model not
+//! knowing. Generations, profiles and flake locks are not questions Debian
+//! can answer at all, and putting them there would dissolve the property
+//! those types are there to protect.
 //!
 //! Held by the session as an `Option`. Absent is the ordinary case: on
 //! Debian, Arch, or an unrecognised host there is no service, and the Nix
-//! view is not registered rather than being registered and empty.
+//! buffer is not registered rather than being registered and empty.
 
 use crate::error::MasysError;
 
@@ -321,9 +321,54 @@ pub trait DeclarativeService {
     /// the operator needs `nixos-rebuild`'s error text and not masys's
     /// summary of it; what the `Err` adds is which command failed and how.
     fn run(&self, op: &NixOp) -> Result<(), MasysError>;
+
+    /// Whether this host can raise privilege for an operation that needs
+    /// it, without masys itself being root.
+    ///
+    /// The operations that write a root-owned profile - activating a
+    /// generation, deleting some, collecting the store - are driven by
+    /// `nix-env` and `nix-collect-garbage`, and neither takes an
+    /// elevation flag. That used to make them a dead end: the rows were
+    /// marked *run masys as root*, and the only way through was to quit
+    /// and start the whole terminal program again as root, which grants
+    /// far more than the one directory the operation writes.
+    ///
+    /// An adapter answers `true` where it has a mechanism to run one
+    /// command as root - `run0`, which raises the same polkit action a
+    /// unit verb does, or `sudo`. The row is then live and says it will
+    /// ask, rather than refusing.
+    ///
+    /// `false` is not a failure and needs no error: a host with neither
+    /// mechanism, or an adapter that does not elevate at all, simply
+    /// leaves those rows marked as they were. Boolean rather than
+    /// `Option<bool>` for that reason - there is no reading here to fail,
+    /// only a capability the adapter either has or has not.
+    ///
+    /// Says nothing about whether the *policy* will let this operator
+    /// through. That is not knowable without trying, for either
+    /// mechanism, and the operation still has to be attempted to find
+    /// out.
+    fn can_elevate(&self) -> bool {
+        false
+    }
+
+    /// Whether this process is already root.
+    ///
+    /// `elevation` already checks this for the one thing it decides - the
+    /// flag to hand `nixos-rebuild` - but nothing above it could ask, so a
+    /// rebuild row had no way to say a password might be coming before the
+    /// build was spent. `can_elevate` cannot stand in for it: that answers
+    /// whether a mechanism exists, not whether *this* process needs one.
+    ///
+    /// `false` by default, the same direction as `can_elevate`'s: an
+    /// adapter that does not override this reports no privilege, which
+    /// costs an unnecessary caveat rather than a missing one.
+    fn is_root(&self) -> bool {
+        false
+    }
 }
 
-/// One operation the Nix view can perform.
+/// One operation the Nix buffer can perform.
 ///
 /// A typed enum rather than a data-driven table because the operations do
 /// not share an argument shape: `Activate` takes a profile and a
@@ -341,18 +386,24 @@ pub trait DeclarativeService {
 /// work. `masys-platform-nixos::ops::argv` is the one place that says
 /// what each of these runs.
 ///
-/// The design's table lists three more - `repl`, `build-vm` and
-/// `build-image` - which are deliberately absent until something can
-/// reach them. Each carries an unresolved question that only the reaching
-/// code can settle: `repl` is interactive with no natural end, where
-/// every operation here streams and exits; `build-image` requires an
-/// `--image-variant` whose candidate list has to come from the flake, so
-/// it needs the transient's input engine before its field shape is
-/// knowable; and `build-vm`'s value is in *running* the
+/// The design's table lists two more - `build-vm` and `build-image` -
+/// which are deliberately absent until something can reach them. Each
+/// carries an unresolved question that only the reaching code can settle:
+/// `build-image` requires an `--image-variant` whose candidate list has to
+/// come from the flake, so it needs the transient's input engine before
+/// its field shape is knowable; and `build-vm`'s value is in *running* the
 /// `./result/bin/run-*-vm` it produces, which masys does not yet do. A
 /// variant with no producer is dead weight - `SectionKind::NixUnits` was
 /// carried for a while with nothing constructing it - and each of these
 /// costs one variant, one match arm and one test whenever it is wanted.
+///
+/// `repl` was the third of these until 2026-08-30. Its question - "no
+/// natural end, where every operation here streams and exits" - was
+/// settled by `App::holds_the_terminal`, which asks each operation which
+/// of the two it is rather than assuming; `Suspended::EditUnit` had held
+/// the terminal that way since `systemctl edit` landed. The blocker is
+/// removed because the blocker was answered, and this paragraph named it
+/// as still open for the four commits after it stopped being so.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NixOp {
     /// `nixos-rebuild <verb>`, with `--flake <ref>` where one resolves.
@@ -384,6 +435,92 @@ pub enum NixOp {
     /// one rebuild form that takes no flake reference: it builds nothing,
     /// it activates a generation that already exists.
     Rollback,
+    /// `nixos-rebuild repl` - a nix repl with this configuration loaded.
+    ///
+    /// One of `nixos-rebuild`'s thirteen actions rather than a flag, so it
+    /// takes `--flake` where one resolves exactly as the [`RebuildVerb`]s
+    /// do. Not a `RebuildVerb` itself because it builds nothing and
+    /// activates nothing: `rebuild_verb` maps that enum onto sub-commands
+    /// that all produce a system, and `repl` produces a prompt.
+    ///
+    /// **The one operation that holds the terminal.** Every other
+    /// operation streams and exits, so masys pauses afterwards to let the
+    /// output be read. This one is interactive and ends when the operator
+    /// leaves it - `:q` or the shell's own EOF - so pausing after would
+    /// cost a keypress to acknowledge a screen they just dismissed. That
+    /// is the question `repl` was deferred on, and the answer was already
+    /// in the tree: `Suspended::EditUnit` has held the terminal that way
+    /// since `systemctl edit` landed.
+    Repl,
+    /// `nixos-rebuild build-vm` - a script that boots this configuration
+    /// in qemu, left at `./result/bin/run-<host>-vm`.
+    ///
+    /// Not a [`RebuildVerb`] for `repl`'s reason one step softer: it
+    /// produces a *runner*, not a system, so `rebuild_verb`'s "these all
+    /// produce a system" no longer describes it.
+    ///
+    /// **Its deferral rested on a distinction that does not survive
+    /// contact with `build`.** The recorded blocker was that "`build-vm`'s
+    /// value is in *running* the `./result/bin/run-*-vm` it produces,
+    /// which masys does not yet do" - but that is equally true of
+    /// [`RebuildVerb::Build`], which masys has offered all along: both
+    /// leave `./result` and print, and the operator takes the next step in
+    /// their own shell. `nixos-rebuild`'s own manual gives the idiom as
+    /// two commands. Offering one and withholding the other was a
+    /// distinction masys was not actually making.
+    BuildVm,
+    /// `nixos-rebuild build-image` with no variant, which prints the
+    /// variants this configuration can build.
+    ///
+    /// A read, and the reason [`NixOp::BuildImage`] is reachable at all:
+    /// the variant list is not knowable without asking, and this is how
+    /// you ask. The blocker recorded against `build-image` said the list
+    /// "has to come from the flake, so it needs the transient's input
+    /// engine before its field shape is knowable" - which turned out to
+    /// be wrong twice over. The tool prints the list itself ("run without
+    /// any options to get a list of available variants"), and the picker
+    /// the note was waiting for was deleted in 2026-08-28 as a shape
+    /// nothing filled.
+    ListImageVariants,
+    /// `nixos-rebuild build-image --image-variant <variant>`.
+    ///
+    /// The variant is typed, like `nix-env --delete-generations`' spec and
+    /// `nix search`'s query: free text, because the candidates come from
+    /// [`NixOp::ListImageVariants`] on the row above rather than from a
+    /// picker masys has. Splitting the two is what lets both stay honest -
+    /// an `Input` that accepted an empty submission to mean "list them
+    /// instead" would make an empty prompt mean something other than
+    /// cancel, and `answer_input` refuses empty submissions precisely so
+    /// it cannot.
+    BuildImage {
+        variant: String,
+    },
+    /// `nixos-rebuild switch --upgrade` - update the channels, then
+    /// switch.
+    ///
+    /// A flag rather than an action, like [`NixOp::Rollback`], and its own
+    /// variant for the same reason read one turn further. `Rollback` earned
+    /// one because it takes no flake reference; this takes none because
+    /// `--upgrade` updates *channels*, and a host with a flake has none to
+    /// update. So it is gated by `with_channels` exactly as
+    /// [`NixOp::ChannelUpdate`] is, and dims on a flake host by the same
+    /// rule.
+    ///
+    /// That is also why it is not an `upgrade: bool` on
+    /// [`NixOp::Rebuild`]. `Rebuild`'s own doc promises its rows "stay live
+    /// where no ref resolves" - a flag meaningful *only* where no ref
+    /// resolves would need an exception written into that sentence, and a
+    /// `Rebuild { upgrade: true }` carrying `--flake` is a command asking
+    /// `nixos-rebuild` to refresh channels the configuration does not read.
+    ///
+    /// `--upgrade` rather than `--upgrade-all`: it takes the `nixos`
+    /// channel and any flagged `.update-on-upgrade`, where `--upgrade-all`
+    /// takes every channel. [`NixOp::ChannelUpdate`] is already the
+    /// take-everything row - its prompt says "update every channel" - so
+    /// offering `--upgrade-all` here would duplicate it with a rebuild
+    /// stapled on. The narrow flag is the one that is not already
+    /// reachable.
+    Upgrade,
     /// `nix store diff-closures <from> <to>`.
     Diff {
         from: String,
@@ -424,7 +561,7 @@ pub enum NixOp {
     /// Local, unlike `nh search options`, which queries
     /// search.nixos.org. masys has no network code and acquiring one
     /// would make it a different kind of program - TLS, timeouts, offline
-    /// behaviour, and a view that can now fail for reasons that have
+    /// behaviour, and a buffer that can now fail for reasons that have
     /// nothing to do with the host.
     SearchPackages {
         query: String,

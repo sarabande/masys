@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProcState {
     Running,
@@ -130,8 +132,6 @@ pub struct Disk {
     /// Its rate of change is utilisation: 1000ms of IO time per elapsed
     /// second means the device was busy the whole time.
     pub io_ms: u64,
-    /// Requests currently queued.
-    pub in_flight: u64,
 }
 
 /// One network interface's cumulative counters, from `/proc/net/dev`.
@@ -252,4 +252,52 @@ pub struct Snapshot {
     pub load: Option<LoadAverage>,
     pub uptime_secs: Option<u64>,
     pub memory: Option<Memory>,
+    /// The kernel's own CPU accounting, for the utilisation figure.
+    ///
+    /// `None` where `/proc/stat` could not be read. Counters, like every
+    /// other figure on this type - what a caller wants is the share of
+    /// one interval, and that is `crate::rate::derive_cpu`'s job.
+    pub cpu_times: Option<CpuTimes>,
+    /// Cumulative milliseconds each core has spent held below its
+    /// requested clock by the thermal governor, since boot, keyed by the
+    /// kernel's own cpu number.
+    ///
+    /// `None` where the kernel accounts for no throttling at all: the
+    /// `thermal_throttle` interface is x86's, absent on ARM and on
+    /// kernels built without it. Optional for the reason `pressure` is -
+    /// a zero here is the claim that the machine has never once been
+    /// held back, and a host that cannot answer must not make it.
+    ///
+    /// Counters, like `cpu_times`, and meaningful only as differences
+    /// between two samples: `crate::rate::derive_thermal` does that.
+    ///
+    /// **Per core, and that is the whole point.** This carried a single
+    /// number - the maximum across cores - until it was measured against
+    /// the arithmetic. Differencing two maxima can only *under*-report,
+    /// because the previous maximum is at least the worst core's own
+    /// previous reading, so one core holding an old throttle event masks
+    /// a different core throttling now: a machine spending 40% of the
+    /// interval throttled reported 0% and produced no finding at all.
+    /// Keyed rather than positional because a host can gain and lose
+    /// cores between samples, and comparing by position would difference
+    /// two different cores.
+    pub thermal_throttled_ms_by_core: Option<BTreeMap<u32, u64>>,
+}
+
+/// `/proc/stat`'s aggregate `cpu` line, summed over every core.
+///
+/// Two numbers rather than the kernel's ten, because one question is
+/// being asked: what fraction of the interval was the machine doing
+/// something. Which fields make up each is `masys-systemd`'s to decide,
+/// and it records why there.
+///
+/// Ticks in whatever unit `Snapshot::clock_ticks_per_sec` names - but
+/// unlike `Proc::cpu_ticks` this never needs converting, because
+/// utilisation is a ratio of two tick counts and the unit cancels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CpuTimes {
+    /// Every tick the kernel accounted for, idle included.
+    pub total_ticks: u64,
+    /// The ticks nothing was runnable on.
+    pub idle_ticks: u64,
 }

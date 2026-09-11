@@ -1,26 +1,87 @@
 use masys_domain::declarative::{Generation, Input};
-use masys_domain::finding::{Finding, PressureResource};
+use masys_domain::finding::Severity;
+use masys_domain::finding::{Finding, FindingKind, PressureResource};
 use masys_domain::journal::{Entry, Priority};
-use masys_domain::platform::PendingReboot;
+use masys_domain::platform::{Package, PendingReboot};
 use masys_domain::proc_detail::{Fd, FdTarget, ProcDetail};
 use masys_domain::rate::ProcRate;
+use masys_domain::rate::Throughput;
 use masys_domain::sample::{Filesystem, Proc, ProcState, SystemState};
 use masys_domain::unit::{ActiveState, Unit, UnitKind};
 use masys_render::theme::Theme;
 use masys_render::view::{
-    GenerationColumns, GenerationRow, NixPolicyRow, ProcColumns, ProcRow, filesystem_lines, finding_line, finding_lines, gauge,
-    generation_line, generation_lines, human_bytes, human_duration, input_lines, interface_line, journal_lines, nix_policy_lines,
-    nix_store_lines, overview_lines, proc_columns_header, proc_detail_lines, proc_group_line, proc_lines, reboot_lines,
-    section_header_line, unit_lines,
+    FindingRow, GenerationColumns, GenerationRow, NixPolicyRow, ProcColumns, ProcRow,
+    filesystem_lines, finding_lines, gauge, generation_line, generation_lines, human_bytes,
+    human_duration, input_lines, interface_line, journal_lines, nix_policy_lines, nix_store_lines,
+    overview_part_line, package_lines, proc_columns_header, proc_detail_lines, proc_group_line,
+    proc_lines, reboot_lines, section_header_line, unit_lines,
 };
-use masys_view::{Node, Overview};
+use masys_view::presentation::Presentation;
+use masys_view::{Node, Overview, OverviewPart, Reading};
 use ratatui::style::{Color, Modifier};
 use ratatui::text::Line;
 use unicode_width::UnicodeWidthStr;
 
+/// One finding row, unpadded — as a test convenience, not as API.
+///
+/// This was a `pub fn` in the crate until 2026-09-07, called by these
+/// tests and by nothing else. A wrapper that exists so tests have a
+/// simpler entry point is a widened interface, not coverage: it hid the
+/// padding argument, which is the thing most likely to be wrong, behind
+/// a constant `0` that `build_items` never passes.
+///
+/// It goes through `finding_lines` now, which is what the renderer
+/// actually calls, and the assertions below are unchanged because a
+/// one-row slice pads to its own label's width - which is no padding.
+fn finding_line(row: &FindingRow, theme: &Theme) -> Line<'static> {
+    finding_lines(std::slice::from_ref(row), theme)
+        .pop()
+        .expect("one row in, one line out")
+}
+
+/// Every line of the System section, in order — likewise.
+///
+/// A walk over `Overview::parts`, which is the same walk `StatusBuffer`
+/// does when it emits one `Node::OverviewLine` per part. The crate had a
+/// `pub fn` doing this, whose own doc said it was "kept because a caller
+/// that wants the whole block at once should not have to know how it is
+/// divided" - and no such caller ever existed. The twenty-nine tests
+/// below were it.
+fn overview_lines(overview: &Overview, theme: &Theme) -> Vec<Line<'static>> {
+    overview
+        .parts()
+        .into_iter()
+        .map(|part| overview_part_line(overview, part, theme))
+        .collect()
+}
+
+/// A finding, as the pair the renderer draws.
+///
+/// The renderer no longer decides anything about a finding: the glyph,
+/// the label and the tail come from `Presentation` and the colour from
+/// `Severity`. What the tests below still pin is what this crate *does*
+/// decide - how those are joined into spans, and how a section's labels
+/// are padded to one width.
+fn finding_row(finding: Finding) -> FindingRow {
+    FindingRow {
+        severity: finding.severity(),
+        presentation: Presentation::of(&finding.kind),
+    }
+}
+
 /// A flat row, for the tests that are not about the tree.
-fn flat(unit: masys_domain::unit::Unit, age_ms: Option<u64>, expanded: bool) -> masys_render::view::UnitRow {
-    masys_render::view::UnitRow { unit, age_ms, expanded, depth: 0, children: false }
+fn flat(
+    unit: masys_domain::unit::Unit,
+    age_ms: Option<u64>,
+    expanded: bool,
+) -> masys_render::view::UnitRow {
+    masys_render::view::UnitRow {
+        unit,
+        age_ms,
+        expanded,
+        depth: 0,
+        children: false,
+    }
 }
 
 fn text(line: &Line) -> String {
@@ -37,7 +98,11 @@ fn human_bytes_matches_the_mockups_units() {
     assert_eq!(human_bytes(18 * (1u64 << 40)), "18T");
     assert_eq!(human_bytes(4 * (1u64 << 40)), "4.0T");
     assert_eq!(human_bytes(12 * (1u64 << 30)), "12G");
-    assert_eq!(human_bytes(1536 * (1u64 << 20)), "1.5G", "the single-digit branch keeps one decimal");
+    assert_eq!(
+        human_bytes(1536 * (1u64 << 20)),
+        "1.5G",
+        "the single-digit branch keeps one decimal"
+    );
     assert_eq!(human_bytes(61 * (1u64 << 20)), "61M");
     assert_eq!(human_bytes(4 * (1u64 << 10)), "4.0K");
     assert_eq!(human_bytes(512), "512B");
@@ -55,34 +120,69 @@ fn human_duration_picks_the_two_biggest_units() {
 #[test]
 fn a_failed_unit_line_shows_exit_code_and_duration() {
     let theme = Theme::default();
-    let finding = Finding::FailedUnit { unit: "restic-backup.service".to_string(), exit_code: Some(1), since_ms: 10_800_000, reason: None };
-    let line = finding_line(&finding, &theme);
-    assert_eq!(text(&line), "x restic-backup.service  failed (exit 1)  3h ago");
+    let finding = Finding::new(FindingKind::FailedUnit {
+        unit: "restic-backup.service".to_string(),
+        exit_code: Some(1),
+        since_ms: 10_800_000,
+        reason: None,
+    });
+    let line = finding_line(&finding_row(finding.clone()), &theme);
+    assert_eq!(
+        text(&line),
+        "x restic-backup.service  failed (exit 1)  3h ago"
+    );
 }
 
 #[test]
 fn a_failed_unit_without_an_exit_code_just_says_failed() {
     let theme = Theme::default();
-    let finding = Finding::FailedUnit { unit: "sshd.service".to_string(), exit_code: None, since_ms: 3_600_000, reason: None };
-    assert_eq!(text(&finding_line(&finding, &theme)), "x sshd.service  failed  1h ago");
+    let finding = Finding::new(FindingKind::FailedUnit {
+        unit: "sshd.service".to_string(),
+        exit_code: None,
+        since_ms: 3_600_000,
+        reason: None,
+    });
+    assert_eq!(
+        text(&finding_line(&finding_row(finding.clone()), &theme)),
+        "x sshd.service  failed  1h ago"
+    );
 }
 
 #[test]
 fn a_pressure_line_omits_a_zero_full_value() {
     let theme = Theme::default();
-    let finding = Finding::Pressure { resource: PressureResource::Io, some_avg60: 22.7, full_avg60: Some(0.0) };
-    let line = finding_line(&finding, &theme);
-    assert_eq!(text(&line), "^ io  some avg60  22.7%", "a measured-zero full value is blank, not printed");
+    let finding = Finding::new(FindingKind::Pressure {
+        resource: PressureResource::Io,
+        some_avg60: 22.7,
+        full_avg60: Some(0.0),
+        severity: Severity::Warning,
+    });
+    let line = finding_line(&finding_row(finding.clone()), &theme);
+    assert_eq!(
+        text(&line),
+        "^ io  some avg60  22.7%",
+        "a measured-zero full value is blank, not printed"
+    );
 }
 
 #[test]
 fn a_pressure_line_omits_a_full_value_that_would_render_as_zero() {
     let theme = Theme::default();
-    let rounds_to_zero = Finding::Pressure { resource: PressureResource::Io, some_avg60: 22.7, full_avg60: Some(0.04) };
-    let exactly_zero = Finding::Pressure { resource: PressureResource::Io, some_avg60: 22.7, full_avg60: Some(0.0) };
+    let rounds_to_zero = Finding::new(FindingKind::Pressure {
+        resource: PressureResource::Io,
+        some_avg60: 22.7,
+        full_avg60: Some(0.04),
+        severity: Severity::Warning,
+    });
+    let exactly_zero = Finding::new(FindingKind::Pressure {
+        resource: PressureResource::Io,
+        some_avg60: 22.7,
+        full_avg60: Some(0.0),
+        severity: Severity::Warning,
+    });
     assert_eq!(
-        text(&finding_line(&rounds_to_zero, &theme)),
-        text(&finding_line(&exactly_zero, &theme)),
+        text(&finding_line(&finding_row(rounds_to_zero.clone()), &theme)),
+        text(&finding_line(&finding_row(exactly_zero.clone()), &theme)),
         "0.04 would print as \"0.0%\" - the string the zero case exists to suppress"
     );
 }
@@ -90,21 +190,45 @@ fn a_pressure_line_omits_a_full_value_that_would_render_as_zero() {
 #[test]
 fn a_pressure_line_shows_a_nonzero_full_value() {
     let theme = Theme::default();
-    let finding = Finding::Pressure { resource: PressureResource::Memory, some_avg60: 41.2, full_avg60: Some(8.1) };
-    let line = finding_line(&finding, &theme);
-    assert_eq!(text(&line), "^ memory  some avg60  41.2%      full avg60  8.1%");
+    let finding = Finding::new(FindingKind::Pressure {
+        resource: PressureResource::Memory,
+        some_avg60: 41.2,
+        full_avg60: Some(8.1),
+        severity: Severity::Warning,
+    });
+    let line = finding_line(&finding_row(finding.clone()), &theme);
+    assert_eq!(
+        text(&line),
+        "^ memory  some avg60  41.2%      full avg60  8.1%"
+    );
 }
 
 #[test]
 fn a_disk_capacity_line_shows_generations_only_for_boot() {
     let theme = Theme::default();
-    let boot =
-        Finding::DiskCapacity { mount_point: "/boot".to_string(), used_percent: 88.0, free_bytes: 61 * (1u64 << 20), generations: Some(9) };
-    assert_eq!(text(&finding_line(&boot, &theme)), "^ /boot  88%   61M free   .  9 generations");
+    let boot = Finding::new(FindingKind::DiskCapacity {
+        mount_point: "/boot".to_string(),
+        used_percent: 88.0,
+        free_bytes: 61 * (1u64 << 20),
+        generations: Some(9),
+        reclaimable_bytes: None,
+    });
+    assert_eq!(
+        text(&finding_line(&finding_row(boot.clone()), &theme)),
+        "^ /boot  88%   61M free   .  9 generations"
+    );
 
-    let nix =
-        Finding::DiskCapacity { mount_point: "/nix".to_string(), used_percent: 91.0, free_bytes: 12 * (1u64 << 30), generations: None };
-    assert_eq!(text(&finding_line(&nix, &theme)), "^ /nix  91%   12G free");
+    let nix = Finding::new(FindingKind::DiskCapacity {
+        mount_point: "/nix".to_string(),
+        used_percent: 91.0,
+        free_bytes: 12 * (1u64 << 30),
+        generations: None,
+        reclaimable_bytes: None,
+    });
+    assert_eq!(
+        text(&finding_line(&finding_row(nix.clone()), &theme)),
+        "^ /nix  91%   12G free"
+    );
 }
 
 /// The severity tier is what the color communicates, and `text` is blind
@@ -114,93 +238,248 @@ fn every_finding_variant_maps_onto_its_severity_tier() {
     let theme = Theme::default();
     let cases = vec![
         (
-            Finding::FailedUnit { unit: "a.service".to_string(), exit_code: Some(2), since_ms: 60_000, reason: None },
+            Finding::new(FindingKind::FailedUnit {
+                unit: "a.service".to_string(),
+                exit_code: Some(2),
+                since_ms: 60_000,
+                reason: None,
+            }),
             "x ",
             theme.severity_dead,
             "x a.service  failed (exit 2)  1m ago",
         ),
         (
-            Finding::FailedUnit { unit: "a.service".to_string(), exit_code: None, since_ms: 60_000, reason: None },
+            Finding::new(FindingKind::FailedUnit {
+                unit: "a.service".to_string(),
+                exit_code: None,
+                since_ms: 60_000,
+                reason: None,
+            }),
             "x ",
             theme.severity_dead,
             "x a.service  failed  1m ago",
         ),
         (
-            Finding::FlappingUnit { unit: "a.service".to_string(), restarts: 5, window_ms: 3_600_000 },
+            Finding::new(FindingKind::FlappingUnit {
+                unit: "a.service".to_string(),
+                restarts: 5,
+                window_ms: 3_600_000,
+            }),
             "~ ",
             theme.severity_warning,
             "~ a.service  5 restarts in 1h",
         ),
         (
-            Finding::Pressure { resource: PressureResource::Cpu, some_avg60: 30.0, full_avg60: None },
+            Finding::new(FindingKind::Pressure {
+                resource: PressureResource::Cpu,
+                some_avg60: 30.0,
+                full_avg60: None,
+                severity: Severity::Warning,
+            }),
             "^ ",
             theme.severity_warning,
             "^ cpu  some avg60  30.0%",
         ),
         (
-            Finding::DiskCapacity { mount_point: "/".to_string(), used_percent: 90.0, free_bytes: 1u64 << 30, generations: None },
+            Finding::new(FindingKind::DiskCapacity {
+                mount_point: "/".to_string(),
+                used_percent: 90.0,
+                free_bytes: 1u64 << 30,
+                generations: None,
+                reclaimable_bytes: None,
+            }),
             "^ ",
             theme.severity_warning,
             "^ /  90%   1.0G free",
         ),
         (
-            Finding::InodeExhaustion { mount_point: "/var".to_string(), inode_used_percent: 94.0 },
+            Finding::new(FindingKind::InodeExhaustion {
+                mount_point: "/var".to_string(),
+                inode_used_percent: 94.0,
+            }),
             "^ ",
             theme.severity_warning,
             "^ /var  94% inodes used",
         ),
-        (Finding::ReadOnlyFilesystem { mount_point: "/home".to_string() }, "^ ", theme.severity_warning, "^ /home  remounted read-only"),
-        (Finding::ClockUnsynchronized, "! ", theme.severity_urgent, "! clock not synchronized"),
         (
-            Finding::OomKill { pid: 4213, comm: "firefox".to_string(), timestamp_ms: 1_000 },
+            Finding::new(FindingKind::ReadOnlyFilesystem {
+                mount_point: "/home".to_string(),
+            }),
+            "^ ",
+            theme.severity_warning,
+            "^ /home  remounted read-only",
+        ),
+        (
+            Finding::new(FindingKind::ClockUnsynchronized),
+            "! ",
+            theme.severity_urgent,
+            "! clock not synchronized",
+        ),
+        (
+            Finding::new(FindingKind::SmartFailing),
+            "! ",
+            theme.severity_urgent,
+            "! disk smart self-assessment failing",
+        ),
+        (
+            Finding::new(FindingKind::OomKill {
+                pid: 4213,
+                comm: "firefox".to_string(),
+                timestamp_ms: 1_000,
+            }),
             "! ",
             theme.severity_urgent,
             "! firefox  killed by OOM (pid 4213)",
         ),
-        (Finding::SystemDegraded { failed_units: 3 }, "! ", theme.severity_urgent, "! system degraded (3 failed units)"),
+        (
+            Finding::new(FindingKind::SystemDegraded { failed_units: 3 }),
+            "! ",
+            theme.severity_urgent,
+            "! system degraded (3 failed units)",
+        ),
     ];
 
     for (finding, glyph, color, expected) in cases {
-        let line = finding_line(&finding, &theme);
+        let line = finding_line(&finding_row(finding.clone()), &theme);
         assert_eq!(tier(&line), (glyph.to_string(), Some(color)), "{finding:?}");
         assert_eq!(text(&line), expected, "{finding:?}");
     }
 }
 
+/// The colour is the finding's severity, not a constant this crate picks
+/// per variant.
+///
+/// Two pressure findings differing in nothing a reader can see except the
+/// verdict their figures earned. They drew the same yellow until
+/// `Finding` began carrying its severity: `triage::pressure` computed
+/// `Urgent` for a full-stall over threshold and `finding_tail` had no way
+/// to ask, so the System line above drew the reading light-red while the
+/// row that exists to detail it stayed warning-yellow - the summary
+/// louder than the detail, from one pair of figures.
+///
+/// Pressure is the case worth pinning because it is the only kind whose
+/// severity varies. The rest are constant, and the table above pins them.
+#[test]
+fn a_finding_draws_the_colour_its_severity_earns() {
+    let theme = Theme::default();
+    let stalling = |severity| {
+        Finding::new(FindingKind::Pressure {
+            resource: PressureResource::Memory,
+            some_avg60: 41.2,
+            full_avg60: Some(8.1),
+            severity,
+        })
+    };
+
+    assert_eq!(
+        tier(&finding_line(
+            &finding_row(stalling(Severity::Urgent)),
+            &theme
+        ))
+        .1,
+        Some(theme.severity_urgent),
+        "a full-stall over threshold is urgent, and has to look it"
+    );
+    assert_eq!(
+        tier(&finding_line(
+            &finding_row(stalling(Severity::Warning)),
+            &theme
+        ))
+        .1,
+        Some(theme.severity_warning),
+        "some-stall alone is a warning"
+    );
+}
+
 #[test]
 fn finding_lines_pads_labels_to_a_common_width() {
     let theme = Theme::default();
-    let pressure = vec![
-        Finding::Pressure { resource: PressureResource::Memory, some_avg60: 41.2, full_avg60: Some(8.1) },
-        Finding::Pressure { resource: PressureResource::Io, some_avg60: 22.7, full_avg60: Some(0.0) },
+    let pressure = [
+        Finding::new(FindingKind::Pressure {
+            resource: PressureResource::Memory,
+            some_avg60: 41.2,
+            full_avg60: Some(8.1),
+            severity: Severity::Warning,
+        }),
+        Finding::new(FindingKind::Pressure {
+            resource: PressureResource::Io,
+            some_avg60: 22.7,
+            full_avg60: Some(0.0),
+            severity: Severity::Warning,
+        }),
     ];
-    let lines = finding_lines(&pressure, &theme);
-    assert_eq!(text(&lines[0]), "^ memory  some avg60  41.2%      full avg60  8.1%");
-    assert_eq!(text(&lines[1]), "^ io      some avg60  22.7%", "io is padded out to memory's width");
+    let lines = finding_lines(
+        &pressure
+            .iter()
+            .cloned()
+            .map(finding_row)
+            .collect::<Vec<_>>(),
+        &theme,
+    );
+    assert_eq!(
+        text(&lines[0]),
+        "^ memory  some avg60  41.2%      full avg60  8.1%"
+    );
+    assert_eq!(
+        text(&lines[1]),
+        "^ io      some avg60  22.7%",
+        "io is padded out to memory's width"
+    );
 
-    let disks = vec![
-        Finding::DiskCapacity { mount_point: "/nix".to_string(), used_percent: 91.0, free_bytes: 12 * (1u64 << 30), generations: None },
-        Finding::DiskCapacity { mount_point: "/boot".to_string(), used_percent: 88.0, free_bytes: 61 * (1u64 << 20), generations: Some(9) },
+    let disks = [
+        Finding::new(FindingKind::DiskCapacity {
+            mount_point: "/nix".to_string(),
+            used_percent: 91.0,
+            free_bytes: 12 * (1u64 << 30),
+            generations: None,
+            reclaimable_bytes: None,
+        }),
+        Finding::new(FindingKind::DiskCapacity {
+            mount_point: "/boot".to_string(),
+            used_percent: 88.0,
+            free_bytes: 61 * (1u64 << 20),
+            generations: Some(9),
+            reclaimable_bytes: None,
+        }),
     ];
-    let lines = finding_lines(&disks, &theme);
+    let lines = finding_lines(
+        &disks.iter().cloned().map(finding_row).collect::<Vec<_>>(),
+        &theme,
+    );
     assert_eq!(text(&lines[0]), "^ /nix   91%   12G free");
-    assert_eq!(text(&lines[1]), "^ /boot  88%   61M free   .  9 generations");
+    assert_eq!(
+        text(&lines[1]),
+        "^ /boot  88%   61M free   .  9 generations"
+    );
 }
 
 #[test]
 fn finding_lines_pads_by_terminal_display_width() {
     let theme = Theme::default();
-    let findings = vec![
+    let findings = [
         // 9 chars, 17 bytes, 13 columns: each CJK glyph is one char but
         // two columns, so this is the *widest* label on screen while
         // being the middle one by char count. Only a display-width
         // measure picks it as the column the others pad out to.
-        Finding::ReadOnlyFilesystem { mount_point: "/mnt/数据数据".to_string() },
+        Finding::new(FindingKind::ReadOnlyFilesystem {
+            mount_point: "/mnt/数据数据".to_string(),
+        }),
         // 12 chars, 13 bytes, 12 columns - where bytes alone go wrong.
-        Finding::ReadOnlyFilesystem { mount_point: "/mnt/données".to_string() },
-        Finding::ReadOnlyFilesystem { mount_point: "/boot".to_string() },
+        Finding::new(FindingKind::ReadOnlyFilesystem {
+            mount_point: "/mnt/données".to_string(),
+        }),
+        Finding::new(FindingKind::ReadOnlyFilesystem {
+            mount_point: "/boot".to_string(),
+        }),
     ];
-    let lines = finding_lines(&findings, &theme);
+    let lines = finding_lines(
+        &findings
+            .iter()
+            .cloned()
+            .map(finding_row)
+            .collect::<Vec<_>>(),
+        &theme,
+    );
     assert_eq!(text(&lines[0]), "^ /mnt/数据数据  remounted read-only");
     assert_eq!(text(&lines[1]), "^ /mnt/données   remounted read-only");
     assert_eq!(text(&lines[2]), "^ /boot          remounted read-only");
@@ -208,33 +487,67 @@ fn finding_lines_pads_by_terminal_display_width() {
     // The invariant those literals encode: every tail starts in the same
     // terminal column, which is the whole point of the function. 17 = 2
     // for the glyph, 13 for the widest label, 2 for the tail separator.
-    let tail_columns: Vec<usize> = lines.iter().map(|line| UnicodeWidthStr::width(text(line).split("remounted").next().unwrap())).collect();
-    assert_eq!(tail_columns, vec![17, 17, 17], "tails must align in columns, not chars");
+    let tail_columns: Vec<usize> = lines
+        .iter()
+        .map(|line| UnicodeWidthStr::width(text(line).split("remounted").next().unwrap()))
+        .collect();
+    assert_eq!(
+        tail_columns,
+        vec![17, 17, 17],
+        "tails must align in columns, not chars"
+    );
 }
 
 #[test]
 fn finding_lines_leaves_a_label_less_finding_unindented() {
     let theme = Theme::default();
-    let findings = vec![
-        Finding::FailedUnit { unit: "restic-backup.service".to_string(), exit_code: Some(1), since_ms: 60_000, reason: None },
-        Finding::ClockUnsynchronized,
+    let findings = [
+        Finding::new(FindingKind::FailedUnit {
+            unit: "restic-backup.service".to_string(),
+            exit_code: Some(1),
+            since_ms: 60_000,
+            reason: None,
+        }),
+        Finding::new(FindingKind::ClockUnsynchronized),
     ];
-    let lines = finding_lines(&findings, &theme);
-    assert_eq!(text(&lines[1]), "! clock not synchronized", "no label means no padding, not a wide indent");
+    let lines = finding_lines(
+        &findings
+            .iter()
+            .cloned()
+            .map(finding_row)
+            .collect::<Vec<_>>(),
+        &theme,
+    );
+    assert_eq!(
+        text(&lines[1]),
+        "! clock not synchronized",
+        "no label means no padding, not a wide indent"
+    );
 }
 
 #[test]
 fn a_lone_finding_is_padded_exactly_as_the_single_finding_entry_point() {
     let theme = Theme::default();
-    let finding = Finding::Pressure { resource: PressureResource::Memory, some_avg60: 41.2, full_avg60: Some(8.1) };
-    assert_eq!(text(&finding_lines(std::slice::from_ref(&finding), &theme)[0]), text(&finding_line(&finding, &theme)));
+    let finding = Finding::new(FindingKind::Pressure {
+        resource: PressureResource::Memory,
+        some_avg60: 41.2,
+        full_avg60: Some(8.1),
+        severity: Severity::Warning,
+    });
+    assert_eq!(
+        text(&finding_lines(&[finding_row(finding.clone())], &theme)[0]),
+        text(&finding_line(&finding_row(finding.clone()), &theme))
+    );
     assert!(finding_lines(&[], &theme).is_empty());
 }
 
 #[test]
 fn a_section_header_shows_its_count() {
     let theme = Theme::default();
-    assert_eq!(text(&section_header_line("Failed units", Some(1), &theme)), "Failed units (1)");
+    assert_eq!(
+        text(&section_header_line("Failed units", Some(1), &theme)),
+        "Failed units (1)"
+    );
     assert_eq!(text(&section_header_line("System", None, &theme)), "System");
 }
 
@@ -243,23 +556,36 @@ fn a_section_header_is_bold_and_themed() {
     let theme = Theme::default();
     let line = section_header_line("Failed units", Some(1), &theme);
     assert_eq!(line.spans[0].style.fg, Some(theme.section_header));
-    assert!(line.spans[0].style.add_modifier.contains(Modifier::BOLD), "{:?}", line.spans[0].style);
+    assert!(
+        line.spans[0].style.add_modifier.contains(Modifier::BOLD),
+        "{:?}",
+        line.spans[0].style
+    );
 }
 
 fn healthy_overview() -> Overview {
     Overview {
         machine: None,
         system_state: SystemState::Running,
-        unit_count: 47,
+        unit_count: Some(47),
         load_1: None,
         load_5: None,
         load_15: None,
         uptime_secs: None,
+        net_throughput: None,
+        disk_throughput: None,
+        cpu_percent: None,
+        cpu_pressure: None,
+        io_pressure: None,
+        memory_pressure: None,
         mem_used_bytes: None,
         mem_total_bytes: None,
         zram_percent: None,
         swap_free_bytes: None,
-        clock_synced: true,
+        clock_synced: Reading {
+            value: true,
+            severity: Severity::Normal,
+        },
         smart_ok: None,
         pending_reboot: None,
     }
@@ -269,48 +595,213 @@ fn healthy_overview() -> Overview {
 fn overview_with_nothing_measured_shows_only_state_and_clock() {
     let theme = Theme::default();
     let lines = overview_lines(&healthy_overview(), &theme);
-    assert_eq!(lines.len(), 2, "line2 (mem/zram/swap) is entirely None, so it's omitted: {lines:#?}");
+    assert_eq!(
+        lines.len(),
+        2,
+        "line2 (mem/zram/swap) is entirely None, so it's omitted: {lines:#?}"
+    );
     assert_eq!(text(&lines[0]), ". running  .  47 units");
     assert_eq!(text(&lines[1]), ". clock synced");
+}
+
+/// The style of the segment that starts with `prefix`, so a test can
+/// assert what colour a reading is drawn in rather than only its text.
+fn segment_style(lines: &[Line], prefix: &str) -> ratatui::style::Style {
+    lines
+        .iter()
+        .flat_map(|line| line.spans.iter())
+        .find(|span| span.content.starts_with(prefix))
+        .unwrap_or_else(|| panic!("no segment starting {prefix:?}: {lines:#?}"))
+        .style
+}
+
+/// The text of the segment that starts with `prefix`.
+fn segment_text(lines: &[Line], prefix: &str) -> String {
+    lines
+        .iter()
+        .flat_map(|line| line.spans.iter())
+        .find(|span| span.content.starts_with(prefix))
+        .unwrap_or_else(|| panic!("no segment starting {prefix:?}: {lines:#?}"))
+        .content
+        .to_string()
+}
+
+fn memory_overview(severity: Severity) -> Overview {
+    Overview {
+        mem_used_bytes: Some(Reading {
+            value: 29_400_000_000,
+            severity,
+        }),
+        mem_total_bytes: Some(32_000_000_000),
+        ..healthy_overview()
+    }
+}
+
+/// The point of the whole exercise: a host under memory pressure does not
+/// look like an idle one.
+#[test]
+fn the_memory_segment_carries_the_colour_of_its_severity() {
+    let theme = Theme::default();
+    let normal = overview_lines(&memory_overview(Severity::Normal), &theme);
+    let warning = overview_lines(&memory_overview(Severity::Warning), &theme);
+    let urgent = overview_lines(&memory_overview(Severity::Urgent), &theme);
+
+    assert_eq!(
+        segment_style(&warning, "mem ").fg,
+        Some(theme.severity_warning)
+    );
+    assert_eq!(
+        segment_style(&urgent, "mem ").fg,
+        Some(theme.severity_urgent)
+    );
+    assert_ne!(
+        segment_style(&normal, "mem ").fg,
+        Some(theme.severity_warning),
+        "an unpressured host is not warned about"
+    );
+    assert_ne!(
+        segment_style(&normal, "mem ").fg,
+        Some(theme.severity_urgent),
+        "an unpressured host is not warned about"
+    );
+}
+
+/// Absent is not healthy. A kernel with no PSI cannot be said to be fine,
+/// and the segment must not be drawn as though somebody had checked.
+#[test]
+fn an_unmeasured_memory_reading_does_not_render_as_a_normal_one() {
+    let theme = Theme::default();
+    let unknown = overview_lines(&memory_overview(Severity::Unknown), &theme);
+    let normal = overview_lines(&memory_overview(Severity::Normal), &theme);
+    assert_ne!(
+        segment_style(&unknown, "mem "),
+        segment_style(&normal, "mem "),
+        "unmeasured and measured-and-fine must be distinguishable"
+    );
+}
+
+/// The renderer's half of the split: it maps a severity to a colour and
+/// never looks at a figure. Same severity, wildly different numbers, same
+/// colour.
+#[test]
+fn the_renderer_colours_from_severity_alone_and_not_from_the_figure() {
+    let theme = Theme::default();
+    let nearly_empty = Overview {
+        mem_used_bytes: Some(Reading {
+            value: 100_000_000,
+            severity: Severity::Urgent,
+        }),
+        mem_total_bytes: Some(32_000_000_000),
+        ..healthy_overview()
+    };
+    let nearly_full = memory_overview(Severity::Urgent);
+    assert_eq!(
+        segment_style(&overview_lines(&nearly_empty, &theme), "mem ").fg,
+        segment_style(&overview_lines(&nearly_full, &theme), "mem ").fg,
+        "3% used and 92% used, both urgent: the figure is not the renderer's business"
+    );
+}
+
+/// A fact with no rule behind it keeps the colour the System block has
+/// always drawn plain facts in - the type has nowhere to put a verdict,
+/// and the renderer invents none.
+#[test]
+fn a_reading_with_no_threshold_is_drawn_as_a_plain_fact() {
+    let theme = Theme::default();
+    let overview = Overview {
+        uptime_secs: Some(2 * 86_400 + 4 * 3600),
+        ..memory_overview(Severity::Urgent)
+    };
+    let lines = overview_lines(&overview, &theme);
+    assert_eq!(segment_style(&lines, "up ").fg, Some(theme.info));
 }
 
 #[test]
 fn overview_reports_the_unhealthy_side_of_each_flag() {
     let theme = Theme::default();
-    let overview = Overview { clock_synced: false, smart_ok: Some(false), ..healthy_overview() };
+    let overview = Overview {
+        clock_synced: Reading {
+            value: false,
+            severity: Severity::Urgent,
+        },
+        smart_ok: Some(Reading {
+            value: false,
+            severity: Severity::Urgent,
+        }),
+        ..healthy_overview()
+    };
     let lines = overview_lines(&overview, &theme);
     assert_eq!(text(&lines[1]), ". clock not synced  .  smart failing");
 }
 
 #[test]
-fn overview_with_everything_measured_shows_all_three_lines() {
+fn overview_with_everything_measured_shows_every_line() {
     let theme = Theme::default();
     let overview = Overview {
         load_1: Some(1.82),
         load_5: Some(1.44),
         load_15: Some(1.20),
         uptime_secs: Some(2 * 86_400 + 4 * 3600),
-        mem_used_bytes: Some(29_400_000_000),
+        mem_used_bytes: Some(Reading {
+            value: 29_400_000_000,
+            severity: Severity::Unknown,
+        }),
         mem_total_bytes: Some(32_000_000_000),
         zram_percent: Some(100.0),
         swap_free_bytes: Some(0),
-        smart_ok: Some(true),
-        pending_reboot: Some(PendingReboot { reason: "generation 412 not yet booted".to_string() }),
+        smart_ok: Some(Reading {
+            value: true,
+            severity: Severity::Normal,
+        }),
+        pending_reboot: Some(Reading {
+            value: PendingReboot {
+                reason: "generation 412 not yet booted".to_string(),
+            },
+            severity: Severity::Warning,
+        }),
         ..healthy_overview()
     };
-    let lines = overview_lines(&overview, &theme);
-    assert_eq!(lines.len(), 3, "{lines:#?}");
-    assert!(text(&lines[0]).contains("load 1.82 1.44 1.20"), "{}", text(&lines[0]));
-    assert!(text(&lines[0]).contains("up 2d 4h"), "{}", text(&lines[0]));
-    assert_eq!(text(&lines[1]), ". mem 27G/30G  .  zram 100%  .  swap 0B free", "a measured-zero swap prints as 0B, not omitted");
-    assert!(text(&lines[2]).contains("reboot pending: generation 412 not yet booted"), "{}", text(&lines[2]));
+    let lines: Vec<String> = overview_lines(&overview, &theme).iter().map(text).collect();
+    assert_eq!(lines.len(), 4, "{lines:#?}");
+    assert!(lines[0].contains("load 1.82 1.44 1.20"), "{}", lines[0]);
+    assert!(lines[0].contains("up 2d 4h"), "{}", lines[0]);
+    assert_eq!(
+        lines[1], ". mem 27G/30G [#######-]  .  zram 100% [########]",
+        "the two percentages here are gauged; a memory figure alone is not"
+    );
+    assert_eq!(
+        lines[2], ". swap 0B free",
+        "a measured-zero swap prints as 0B, not omitted - and carries no bar, \
+         because free bytes are a quantity with no ceiling to fill"
+    );
+    assert!(
+        lines[3].contains("reboot pending: generation 412 not yet booted"),
+        "{}",
+        lines[3]
+    );
 }
 
 #[test]
 fn a_single_failed_unit_is_not_pluralised() {
     let theme = Theme::default();
-    assert_eq!(text(&finding_line(&Finding::SystemDegraded { failed_units: 1 }, &theme)), "! system degraded (1 failed unit)");
-    assert_eq!(text(&finding_line(&Finding::SystemDegraded { failed_units: 3 }, &theme)), "! system degraded (3 failed units)");
+    assert_eq!(
+        text(&finding_line(
+            &finding_row(Finding::new(FindingKind::SystemDegraded {
+                failed_units: 1
+            })),
+            &theme
+        )),
+        "! system degraded (1 failed unit)"
+    );
+    assert_eq!(
+        text(&finding_line(
+            &finding_row(Finding::new(FindingKind::SystemDegraded {
+                failed_units: 3
+            })),
+            &theme
+        )),
+        "! system degraded (3 failed units)"
+    );
 }
 
 fn a_proc(pid: u32, comm: &str, rss_mb: u64) -> Proc {
@@ -334,7 +825,12 @@ fn a_proc(pid: u32, comm: &str, rss_mb: u64) -> Proc {
 /// cumulative CPU seconds the app derived. Ageless, because most of these
 /// tests are about the columns rather than the clock.
 fn row(proc: Proc, rate: Option<ProcRate>, cpu_seconds: u64) -> ProcRow {
-    ProcRow { proc, rate, cpu_seconds, age_ms: None }
+    ProcRow {
+        proc,
+        rate,
+        cpu_seconds,
+        age_ms: None,
+    }
 }
 
 /// The layout every test below uses unless it is specifically about the
@@ -353,17 +849,28 @@ fn proc_group_line_narrow(node: &Node, theme: &Theme) -> Line<'static> {
 }
 
 fn a_rate(pid: u32, cpu: f32) -> ProcRate {
-    ProcRate { pid, cpu_percent: cpu, io_read_bytes_per_sec: 0.0, io_write_bytes_per_sec: 0.0 }
+    ProcRate {
+        pid,
+        cpu_percent: cpu,
+        io_read_bytes_per_sec: 0.0,
+        io_write_bytes_per_sec: 0.0,
+    }
 }
 
 #[test]
 fn a_process_row_shows_its_name_cpu_and_memory() {
     let theme = Theme::default();
-    let lines = proc_lines_narrow(&[row(a_proc(1, "chrome", 649), Some(a_rate(1, 35.4)), 0)], &theme);
+    let lines = proc_lines_narrow(
+        &[row(a_proc(1, "chrome", 649), Some(a_rate(1, 35.4)), 0)],
+        &theme,
+    );
     let rendered = text(&lines[0]);
     // The pid leads the row now, which is what disambiguates the several
     // processes a machine runs under one name.
-    assert!(rendered.trim_start().starts_with("1  chrome"), "{rendered:?}");
+    assert!(
+        rendered.trim_start().starts_with("1  chrome"),
+        "{rendered:?}"
+    );
     assert!(rendered.contains("35.4%"), "{rendered:?}");
     assert!(rendered.contains("649M"), "{rendered:?}");
 }
@@ -376,7 +883,10 @@ fn an_unmeasured_process_shows_a_dash_not_zero() {
     let lines = proc_lines_narrow(&[row(a_proc(1, "chrome", 649), None, 0)], &theme);
     let rendered = text(&lines[0]);
     assert!(rendered.contains('-'), "{rendered:?}");
-    assert!(!rendered.contains("0.0%"), "not-yet-measured must not read as idle: {rendered:?}");
+    assert!(
+        !rendered.contains("0.0%"),
+        "not-yet-measured must not read as idle: {rendered:?}"
+    );
 }
 
 /// A genuinely idle process is measured, and reads as zero rather than
@@ -384,9 +894,15 @@ fn an_unmeasured_process_shows_a_dash_not_zero() {
 #[test]
 fn a_measured_idle_process_shows_zero_not_a_dash() {
     let theme = Theme::default();
-    let lines = proc_lines_narrow(&[row(a_proc(1, "chrome", 649), Some(a_rate(1, 0.0)), 0)], &theme);
+    let lines = proc_lines_narrow(
+        &[row(a_proc(1, "chrome", 649), Some(a_rate(1, 0.0)), 0)],
+        &theme,
+    );
     let rendered = text(&lines[0]);
-    assert!(rendered.contains("0.0%"), "measured-idle reads as zero: {rendered:?}");
+    assert!(
+        rendered.contains("0.0%"),
+        "measured-idle reads as zero: {rendered:?}"
+    );
     assert!(!rendered.contains('-'), "{rendered:?}");
 }
 
@@ -396,11 +912,22 @@ fn a_measured_idle_process_shows_zero_not_a_dash() {
 fn names_are_padded_so_the_columns_align() {
     let theme = Theme::default();
     let lines = proc_lines_narrow(
-        &[row(a_proc(1, "chrome", 649), Some(a_rate(1, 35.4)), 0), row(a_proc(2, "rust-analyzer", 1601), Some(a_rate(2, 0.1)), 0)],
+        &[
+            row(a_proc(1, "chrome", 649), Some(a_rate(1, 35.4)), 0),
+            row(a_proc(2, "rust-analyzer", 1601), Some(a_rate(2, 0.1)), 0),
+        ],
         &theme,
     );
-    let columns: Vec<usize> = lines.iter().map(|l| text(l).find('%').expect("a percent sign")).collect();
-    assert_eq!(columns[0], columns[1], "{:#?}", lines.iter().map(text).collect::<Vec<_>>());
+    let columns: Vec<usize> = lines
+        .iter()
+        .map(|l| text(l).find('%').expect("a percent sign"))
+        .collect();
+    assert_eq!(
+        columns[0],
+        columns[1],
+        "{:#?}",
+        lines.iter().map(text).collect::<Vec<_>>()
+    );
 }
 
 /// The two rankings render as separate batches and stack directly on top
@@ -410,8 +937,18 @@ fn names_are_padded_so_the_columns_align() {
 #[test]
 fn the_columns_agree_across_two_separately_rendered_sections() {
     let theme = Theme::default();
-    let cpu_section = proc_lines_narrow(&[row(a_proc(1, "chrome", 649), Some(a_rate(1, 35.4)), 0)], &theme);
-    let memory_section = proc_lines_narrow(&[row(a_proc(2, "rust-analyzer", 1601), Some(a_rate(2, 0.1)), 0)], &theme);
+    let cpu_section = proc_lines_narrow(
+        &[row(a_proc(1, "chrome", 649), Some(a_rate(1, 35.4)), 0)],
+        &theme,
+    );
+    let memory_section = proc_lines_narrow(
+        &[row(
+            a_proc(2, "rust-analyzer", 1601),
+            Some(a_rate(2, 0.1)),
+            0,
+        )],
+        &theme,
+    );
     let percent_at = |l: &Line| text(l).find('%').expect("a percent sign");
     assert_eq!(
         percent_at(&cpu_section[0]),
@@ -428,8 +965,19 @@ fn the_columns_agree_across_two_separately_rendered_sections() {
 #[test]
 fn the_widest_possible_comm_needs_no_truncation() {
     let theme = Theme::default();
-    let lines = proc_lines_narrow(&[row(a_proc(1, "123456789012345", 1), Some(a_rate(1, 1.0)), 0)], &theme);
-    assert!(text(&lines[0]).contains("123456789012345"), "{:?}", text(&lines[0]));
+    let lines = proc_lines_narrow(
+        &[row(
+            a_proc(1, "123456789012345", 1),
+            Some(a_rate(1, 1.0)),
+            0,
+        )],
+        &theme,
+    );
+    assert!(
+        text(&lines[0]).contains("123456789012345"),
+        "{:?}",
+        text(&lines[0])
+    );
 }
 
 /// `io` is split evenly between read and write, so the narrow layout's
@@ -444,7 +992,6 @@ fn a_group(name: &str, cpu: f32, mem_mb: u64, io: f64, count: u32, expanded: boo
         read_bytes_per_sec: io / 2.0,
         write_bytes_per_sec: io / 2.0,
         proc_count: count,
-        sparkline: Vec::new(),
     }
 }
 
@@ -456,13 +1003,26 @@ fn a_group(name: &str, cpu: f32, mem_mb: u64, io: f64, count: u32, expanded: boo
 #[test]
 fn a_group_row_shows_the_leaf_cgroup_not_the_whole_path() {
     let theme = Theme::default();
-    let node = a_group("/user.slice/user-1000.slice/user@1000.service", 1.0, 10, 0.0, 3, true);
+    let node = a_group(
+        "/user.slice/user-1000.slice/user@1000.service",
+        1.0,
+        10,
+        0.0,
+        3,
+        true,
+    );
     let rendered = text(&proc_group_line(&node, &theme, &narrow()));
     assert!(rendered.contains("user@1000.service"), "{rendered:?}");
-    assert!(!rendered.contains("/user.slice"), "the shared prefix is dropped: {rendered:?}");
+    assert!(
+        !rendered.contains("/user.slice"),
+        "the shared prefix is dropped: {rendered:?}"
+    );
 
     // The kernel bucket has no path separators and survives unchanged.
-    let kernel = text(&proc_group_line_narrow(&a_group("kernel", 0.0, 0, 0.0, 145, false), &theme));
+    let kernel = text(&proc_group_line_narrow(
+        &a_group("kernel", 0.0, 0, 0.0, 145, false),
+        &theme,
+    ));
     assert!(kernel.contains("kernel"), "{kernel:?}");
 }
 
@@ -472,22 +1032,46 @@ fn a_group_row_shows_the_leaf_cgroup_not_the_whole_path() {
 #[test]
 fn group_and_process_rows_share_their_columns() {
     let theme = Theme::default();
-    let group = text(&proc_group_line_narrow(&a_group("/system.slice/sshd.service", 44.1, 1433, 0.0, 38, true), &theme));
-    let proc = text(&proc_lines_narrow(&[row(a_proc(1204, "sshd", 649), Some(a_rate(1204, 2.3)), 0)], &theme)[0]);
-    assert_eq!(group.find('%').expect("a group percent"), proc.find('%').expect("a process percent"), "{group:?} vs {proc:?}");
+    let group = text(&proc_group_line_narrow(
+        &a_group("/system.slice/sshd.service", 44.1, 1433, 0.0, 38, true),
+        &theme,
+    ));
+    let proc = text(
+        &proc_lines_narrow(
+            &[row(a_proc(1204, "sshd", 649), Some(a_rate(1204, 2.3)), 0)],
+            &theme,
+        )[0],
+    );
+    assert_eq!(
+        group.find('%').expect("a group percent"),
+        proc.find('%').expect("a process percent"),
+        "{group:?} vs {proc:?}"
+    );
 }
 
 #[test]
 fn a_group_row_shows_its_fold_marker_and_aggregates() {
     let theme = Theme::default();
-    let open = text(&proc_group_line_narrow(&a_group("/system.slice", 44.1, 1433, 2_100_000.0, 38, true), &theme));
-    assert!(open.starts_with("v "), "an expanded group points down: {open:?}");
+    let open = text(&proc_group_line_narrow(
+        &a_group("/system.slice", 44.1, 1433, 2_100_000.0, 38, true),
+        &theme,
+    ));
+    assert!(
+        open.starts_with("v "),
+        "an expanded group points down: {open:?}"
+    );
     assert!(open.contains("system.slice"), "{open:?}");
     assert!(open.contains("44.1%"), "{open:?}");
     assert!(open.contains("38"), "the process count: {open:?}");
 
-    let shut = text(&proc_group_line_narrow(&a_group("/system.slice", 44.1, 1433, 2_100_000.0, 38, false), &theme));
-    assert!(shut.starts_with("> "), "a collapsed group points right: {shut:?}");
+    let shut = text(&proc_group_line_narrow(
+        &a_group("/system.slice", 44.1, 1433, 2_100_000.0, 38, false),
+        &theme,
+    ));
+    assert!(
+        shut.starts_with("> "),
+        "a collapsed group points right: {shut:?}"
+    );
 }
 
 /// The design's rendering rule for this buffer, in its own words: blank
@@ -496,15 +1080,30 @@ fn a_group_row_shows_its_fold_marker_and_aggregates() {
 #[test]
 fn a_group_with_no_io_shows_blank_not_zero() {
     let theme = Theme::default();
-    let rendered = text(&proc_group_line_narrow(&a_group("/kernel", 0.0, 0, 0.0, 112, true), &theme));
-    assert!(!rendered.contains("0B"), "measured-zero memory and io are blank, not 0B: {rendered:?}");
-    assert!(rendered.contains("112"), "the process count still shows: {rendered:?}");
+    let rendered = text(&proc_group_line_narrow(
+        &a_group("/kernel", 0.0, 0, 0.0, 112, true),
+        &theme,
+    ));
+    assert!(
+        !rendered.contains("0B"),
+        "measured-zero memory and io are blank, not 0B: {rendered:?}"
+    );
+    assert!(
+        rendered.contains("112"),
+        "the process count still shows: {rendered:?}"
+    );
 
     // A group that genuinely moves bytes still reports them. No `/s`
     // suffix on the value - the column heading already says IO/s, and
     // the process rows beneath omit it for the same reason.
-    let busy = text(&proc_group_line_narrow(&a_group("/system.slice", 1.0, 1433, 2_100_000.0, 38, true), &theme));
-    assert!(busy.contains("2.0M"), "a busy group shows an io rate: {busy:?}");
+    let busy = text(&proc_group_line_narrow(
+        &a_group("/system.slice", 1.0, 1433, 2_100_000.0, 38, true),
+        &theme,
+    ));
+    assert!(
+        busy.contains("2.0M"),
+        "a busy group shows an io rate: {busy:?}"
+    );
 }
 
 /// Every column the Procs buffer offers, all of it from data `Proc`
@@ -524,10 +1123,16 @@ fn a_process_row_carries_every_column() {
     assert!(rendered.contains("chrome"), "{rendered:?}");
     assert!(rendered.contains("2.3%"), "{rendered:?}");
     assert!(rendered.contains("486M"), "{rendered:?}");
-    assert!(rendered.contains("1.1M"), "io/s is read plus write: {rendered:?}");
+    assert!(
+        rendered.contains("1.1M"),
+        "io/s is read plus write: {rendered:?}"
+    );
     assert!(rendered.contains("31"), "thread count: {rendered:?}");
     assert!(rendered.contains(" R "), "the state letter: {rendered:?}");
-    assert!(rendered.contains("22:04"), "1324 seconds is 22m04s: {rendered:?}");
+    assert!(
+        rendered.contains("22:04"),
+        "1324 seconds is 22m04s: {rendered:?}"
+    );
 }
 
 /// Over an hour, TIME grows a field rather than rolling over - a process
@@ -536,7 +1141,10 @@ fn a_process_row_carries_every_column() {
 fn cumulative_cpu_time_shows_hours_when_it_has_them() {
     let theme = Theme::default();
     let rendered = text(&proc_lines_narrow(&[row(a_proc(1, "x", 1), None, 4_462)], &theme)[0]);
-    assert!(rendered.contains("1:14:22"), "4462 seconds is 1h14m22s: {rendered:?}");
+    assert!(
+        rendered.contains("1:14:22"),
+        "4462 seconds is 1h14m22s: {rendered:?}"
+    );
 }
 
 /// Kernel threads use no memory and do no IO. Both blank, for the same
@@ -557,9 +1165,28 @@ fn a_process_with_no_memory_or_io_leaves_those_columns_blank() {
 fn the_name_column_absorbs_whatever_the_terminal_has_spare() {
     let theme = Theme::default();
     let wide = ProcColumns::fit(140);
-    let rendered = text(&proc_lines(&[row(a_proc(1, "chrome", 649), Some(a_rate(1, 35.4)), 0)], &theme, &wide)[0]);
-    assert_eq!(rendered.width(), 140, "the row reaches the right edge: {rendered:?}");
-    assert!(rendered.width() > text(&proc_lines_narrow(&[row(a_proc(1, "chrome", 649), Some(a_rate(1, 35.4)), 0)], &theme)[0]).width());
+    let rendered = text(
+        &proc_lines(
+            &[row(a_proc(1, "chrome", 649), Some(a_rate(1, 35.4)), 0)],
+            &theme,
+            &wide,
+        )[0],
+    );
+    assert_eq!(
+        rendered.width(),
+        140,
+        "the row reaches the right edge: {rendered:?}"
+    );
+    assert!(
+        rendered.width()
+            > text(
+                &proc_lines_narrow(
+                    &[row(a_proc(1, "chrome", 649), Some(a_rate(1, 35.4)), 0)],
+                    &theme
+                )[0]
+            )
+            .width()
+    );
 }
 
 /// The header is laid out from the same `ProcColumns` the rows are, so
@@ -574,11 +1201,25 @@ fn the_header_lines_up_with_the_rows_at_any_width() {
         // left-aligned and shifts nothing - rather than inside the
         // right-aligned column this compares.
         let header = proc_columns_header(masys_view::ProcSort::Name, true, &columns);
-        let rendered = text(&proc_lines(&[row(a_proc(1204, "sshd", 649), Some(a_rate(1204, 2.3)), 0)], &theme, &columns)[0]);
-        assert_eq!(header.width(), rendered.width(), "at {width}: {header:?} vs {rendered:?}");
+        let rendered = text(
+            &proc_lines(
+                &[row(a_proc(1204, "sshd", 649), Some(a_rate(1204, 2.3)), 0)],
+                &theme,
+                &columns,
+            )[0],
+        );
+        assert_eq!(
+            header.width(),
+            rendered.width(),
+            "at {width}: {header:?} vs {rendered:?}"
+        );
         // `%CPU` is right-aligned in its column and so is `2.3%`, so
         // their trailing edges are the column's edge.
-        assert_eq!(header.find("%CPU").map(|at| at + 4), rendered.find("2.3%").map(|at| at + 4), "at {width}: {header:?} vs {rendered:?}");
+        assert_eq!(
+            header.find("%CPU").map(|at| at + 4),
+            rendered.find("2.3%").map(|at| at + 4),
+            "at {width}: {header:?} vs {rendered:?}"
+        );
     }
 }
 
@@ -591,7 +1232,11 @@ fn extra_columns_switch_on_left_to_right_as_the_width_allows() {
         let c = ProcColumns::fit(width);
         (c.split_io, c.uptime, c.nice, c.oom)
     };
-    assert_eq!(seen(65), (false, false, false, false), "the narrowest table is what it always was");
+    assert_eq!(
+        seen(65),
+        (false, false, false, false),
+        "the narrowest table is what it always was"
+    );
     assert_eq!(seen(73), (true, false, false, false));
     assert_eq!(seen(81), (true, true, false, false));
     assert_eq!(seen(85), (true, true, true, false));
@@ -602,7 +1247,10 @@ fn extra_columns_switch_on_left_to_right_as_the_width_allows() {
     for width in 0..200 {
         let c = ProcColumns::fit(width);
         let on = [c.split_io, c.uptime, c.nice, c.oom];
-        assert!(on.windows(2).all(|w| w[0] || !w[1]), "a gap at width {width}: {on:?}");
+        assert!(
+            on.windows(2).all(|w| w[0] || !w[1]),
+            "a gap at width {width}: {on:?}"
+        );
     }
 }
 
@@ -616,11 +1264,25 @@ fn a_narrow_table_sums_read_and_write_back_into_one_column() {
     rate.io_read_bytes_per_sec = 1_000_000.0;
     rate.io_write_bytes_per_sec = 1_000_000.0;
 
-    let narrow = text(&proc_lines_narrow(&[row(a_proc(1, "chrome", 649), Some(rate), 0)], &theme)[0]);
-    assert!(narrow.contains("1.9M"), "one column carrying both halves: {narrow:?}");
+    let narrow =
+        text(&proc_lines_narrow(&[row(a_proc(1, "chrome", 649), Some(rate), 0)], &theme)[0]);
+    assert!(
+        narrow.contains("1.9M"),
+        "one column carrying both halves: {narrow:?}"
+    );
 
-    let wide = text(&proc_lines(&[row(a_proc(1, "chrome", 649), Some(rate), 0)], &theme, &ProcColumns::fit(140))[0]);
-    assert_eq!(wide.matches("977K").count(), 2, "read and write, each in its own column: {wide:?}");
+    let wide = text(
+        &proc_lines(
+            &[row(a_proc(1, "chrome", 649), Some(rate), 0)],
+            &theme,
+            &ProcColumns::fit(140),
+        )[0],
+    );
+    assert_eq!(
+        wide.matches("977K").count(),
+        2,
+        "read and write, each in its own column: {wide:?}"
+    );
 }
 
 /// Wall-clock age, not CPU time. A daemon up for a week having spent four
@@ -630,12 +1292,29 @@ fn a_narrow_table_sums_read_and_write_back_into_one_column() {
 fn the_uptime_column_reads_wall_clock_age() {
     let theme = Theme::default();
     let wide = ProcColumns::fit(140);
-    let veteran = ProcRow { proc: a_proc(1, "sshd", 8), rate: None, cpu_seconds: 4, age_ms: Some(7 * 24 * 3_600_000) };
-    let restarted = ProcRow { proc: a_proc(2, "flapping", 8), rate: None, cpu_seconds: 4, age_ms: Some(40_000) };
+    let veteran = ProcRow {
+        proc: a_proc(1, "sshd", 8),
+        rate: None,
+        cpu_seconds: 4,
+        age_ms: Some(7 * 24 * 3_600_000),
+    };
+    let restarted = ProcRow {
+        proc: a_proc(2, "flapping", 8),
+        rate: None,
+        cpu_seconds: 4,
+        age_ms: Some(40_000),
+    };
 
-    let lines: Vec<String> = proc_lines(&[veteran, restarted], &theme, &wide).iter().map(text).collect();
+    let lines: Vec<String> = proc_lines(&[veteran, restarted], &theme, &wide)
+        .iter()
+        .map(text)
+        .collect();
     assert!(lines[0].contains("7d"), "a week of uptime: {:?}", lines[0]);
-    assert!(lines[1].contains("0m"), "forty seconds rounds down, and that is the tell: {:?}", lines[1]);
+    assert!(
+        lines[1].contains("0m"),
+        "forty seconds rounds down, and that is the tell: {:?}",
+        lines[1]
+    );
 }
 
 /// A process whose start time never arrived shows `-`, the same
@@ -644,8 +1323,17 @@ fn the_uptime_column_reads_wall_clock_age() {
 #[test]
 fn an_unknown_start_time_shows_a_dash_not_zero() {
     let theme = Theme::default();
-    let rendered = text(&proc_lines(&[row(a_proc(1, "sshd", 8), None, 4)], &theme, &ProcColumns::fit(140))[0]);
-    assert!(!rendered.contains("0m"), "an unknown age must not read as freshly started: {rendered:?}");
+    let rendered = text(
+        &proc_lines(
+            &[row(a_proc(1, "sshd", 8), None, 4)],
+            &theme,
+            &ProcColumns::fit(140),
+        )[0],
+    );
+    assert!(
+        !rendered.contains("0m"),
+        "an unknown age must not read as freshly started: {rendered:?}"
+    );
 }
 
 /// `nice` and `oom_score` are 0 for almost every process, and a column of
@@ -660,7 +1348,10 @@ fn nice_and_oom_are_blank_at_their_defaults() {
     let ni = header.find("NI").expect("a nice heading");
     let oom = header.find("OOM").expect("an oom heading");
     let ordinary = text(&proc_lines(&[row(a_proc(1, "sshd", 8), None, 0)], &theme, &wide)[0]);
-    assert!(ordinary[ni..oom + 3].trim().is_empty(), "no zeroes in NI or OOM on an ordinary process: {ordinary:?}");
+    assert!(
+        ordinary[ni..oom + 3].trim().is_empty(),
+        "no zeroes in NI or OOM on an ordinary process: {ordinary:?}"
+    );
 
     let mut hungry = a_proc(2, "chrome", 2048);
     hungry.nice = 19;
@@ -677,8 +1368,25 @@ fn group_and_process_rows_share_their_columns_when_stretched() {
     let theme = Theme::default();
     for width in [65, 80, 100, 140, 200] {
         let columns = ProcColumns::fit(width);
-        let group = text(&proc_group_line(&a_group("/system.slice/sshd.service", 44.1, 1433, 4_200_000.0, 38, true), &theme, &columns));
-        let proc = text(&proc_lines(&[row(a_proc(1204, "sshd", 649), Some(a_rate(1204, 2.3)), 0)], &theme, &columns)[0]);
+        let group = text(&proc_group_line(
+            &a_group(
+                "/system.slice/sshd.service",
+                44.1,
+                1433,
+                4_200_000.0,
+                38,
+                true,
+            ),
+            &theme,
+            &columns,
+        ));
+        let proc = text(
+            &proc_lines(
+                &[row(a_proc(1204, "sshd", 649), Some(a_rate(1204, 2.3)), 0)],
+                &theme,
+                &columns,
+            )[0],
+        );
         assert_eq!(
             group.find('%').expect("a group percent"),
             proc.find('%').expect("a process percent"),
@@ -687,7 +1395,11 @@ fn group_and_process_rows_share_their_columns_when_stretched() {
         // The process count sits in the THR column, which is the last
         // thing a group row draws - so a group row is exactly the S and
         // TIME columns shorter than the process rows beneath it.
-        assert_eq!(group.width() + 3 + 10, proc.width(), "at {width}: {group:?} vs {proc:?}");
+        assert_eq!(
+            group.width() + 3 + 10,
+            proc.width(),
+            "at {width}: {group:?} vs {proc:?}"
+        );
     }
 }
 
@@ -699,9 +1411,25 @@ fn a_group_row_leaves_the_per_process_columns_blank() {
     let mut proc = a_proc(1204, "sshd", 649);
     proc.nice = 19;
     let columns = ProcColumns::fit(140);
-    let group = text(&proc_group_line(&a_group("/system.slice/sshd.service", 44.1, 1433, 4_200_000.0, 38, true), &theme, &columns));
-    let ni_at = proc_columns_header(masys_view::ProcSort::Cpu, true, &columns).find("NI").expect("a nice heading");
-    assert!(group[ni_at..].trim_start().starts_with("38"), "nothing between IO and the process count: {group:?}");
+    let group = text(&proc_group_line(
+        &a_group(
+            "/system.slice/sshd.service",
+            44.1,
+            1433,
+            4_200_000.0,
+            38,
+            true,
+        ),
+        &theme,
+        &columns,
+    ));
+    let ni_at = proc_columns_header(masys_view::ProcSort::Cpu, true, &columns)
+        .find("NI")
+        .expect("a nice heading");
+    assert!(
+        group[ni_at..].trim_start().starts_with("38"),
+        "nothing between IO and the process count: {group:?}"
+    );
 }
 
 fn a_full_detail() -> ProcDetail {
@@ -712,26 +1440,65 @@ fn a_full_detail() -> ProcDetail {
         ppid: Some(1),
         virt_bytes: Some(4_300_000_000),
         swap_bytes: Some(2_000_000),
-        env: vec![("PGDATA".into(), "/var/lib/postgresql/16".into()), ("LS_COLORS".into(), "rs=0:di=01;34".into())],
+        env: vec![
+            ("PGDATA".into(), "/var/lib/postgresql/16".into()),
+            ("LS_COLORS".into(), "rs=0:di=01;34".into()),
+        ],
         fds: vec![
-            Fd { number: 0, target: FdTarget::Path("/dev/null".into()) },
-            Fd { number: 1, target: FdTarget::Pipe },
-            Fd { number: 2, target: FdTarget::Pipe },
-            Fd { number: 7, target: FdTarget::Tcp { local: "0.0.0.0:5432".into(), peer: None, state: "LISTEN".into() } },
-            Fd { number: 8, target: FdTarget::Unix { path: Some("/run/postgresql/.s.PGSQL.5432".into()), listening: true } },
+            Fd {
+                number: 0,
+                target: FdTarget::Path("/dev/null".into()),
+            },
+            Fd {
+                number: 1,
+                target: FdTarget::Pipe,
+            },
+            Fd {
+                number: 2,
+                target: FdTarget::Pipe,
+            },
+            Fd {
+                number: 7,
+                target: FdTarget::Tcp {
+                    local: "0.0.0.0:5432".into(),
+                    peer: None,
+                    state: "LISTEN".into(),
+                },
+            },
+            Fd {
+                number: 8,
+                target: FdTarget::Unix {
+                    path: Some("/run/postgresql/.s.PGSQL.5432".into()),
+                    listening: true,
+                },
+            },
             // A client of that same socket names the same path and is
             // not a listener - the distinction only `SO_ACCEPTCON` makes.
-            Fd { number: 10, target: FdTarget::Unix { path: Some("/run/postgresql/.s.PGSQL.5432".into()), listening: false } },
+            Fd {
+                number: 10,
+                target: FdTarget::Unix {
+                    path: Some("/run/postgresql/.s.PGSQL.5432".into()),
+                    listening: false,
+                },
+            },
             Fd {
                 number: 9,
-                target: FdTarget::Tcp { local: "127.0.0.1:5432".into(), peer: Some("127.0.0.1:40000".into()), state: "ESTABLISHED".into() },
+                target: FdTarget::Tcp {
+                    local: "127.0.0.1:5432".into(),
+                    peer: Some("127.0.0.1:40000".into()),
+                    state: "ESTABLISHED".into(),
+                },
             },
         ],
     }
 }
 
 fn proc_detail_text(proc: &Proc, detail: Option<&ProcDetail>) -> String {
-    proc_detail_lines(proc, detail, &Theme::default()).iter().map(text).collect::<Vec<_>>().join("\n")
+    proc_detail_lines(proc, detail, &Theme::default())
+        .iter()
+        .map(text)
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// `Proc::comm` is capped at 15 bytes by the kernel, so the table cannot
@@ -750,10 +1517,16 @@ fn the_detail_block_leads_with_the_command_line() {
 fn a_listening_socket_reads_as_an_address_not_an_inode() {
     let rendered = proc_detail_text(&a_proc(9932, "postgres", 1402), Some(&a_full_detail()));
     assert!(rendered.contains("tcp 0.0.0.0:5432 LISTEN"), "{rendered}");
-    assert!(rendered.contains("unix /run/postgresql/.s.PGSQL.5432"), "{rendered}");
+    assert!(
+        rendered.contains("unix /run/postgresql/.s.PGSQL.5432"),
+        "{rendered}"
+    );
     // The established connection is a socket, not a listener, so it is
     // counted but not pulled to the front.
-    assert!(!rendered.contains("127.0.0.1:40000"), "only listeners are named: {rendered}");
+    assert!(
+        !rendered.contains("127.0.0.1:40000"),
+        "only listeners are named: {rendered}"
+    );
 }
 
 /// The three the shell hands every process, by the names people use for
@@ -772,7 +1545,10 @@ fn the_standard_streams_are_named_rather_than_numbered() {
 #[test]
 fn descriptors_are_counted_by_kind() {
     let rendered = proc_detail_text(&a_proc(9932, "postgres", 1402), Some(&a_full_detail()));
-    let fds = rendered.lines().find(|l| l.contains("fds")).expect("an fds line");
+    let fds = rendered
+        .lines()
+        .find(|l| l.contains("fds"))
+        .expect("an fds line");
     assert!(fds.contains("7 open"), "{fds:?}");
     assert!(fds.contains("4 sockets"), "{fds:?}");
     assert!(fds.contains("2 pipes"), "{fds:?}");
@@ -785,7 +1561,10 @@ fn descriptors_are_counted_by_kind() {
 #[test]
 fn environment_values_are_shown_verbatim() {
     let rendered = proc_detail_text(&a_proc(9932, "postgres", 1402), Some(&a_full_detail()));
-    assert!(rendered.contains("PGDATA=/var/lib/postgresql/16"), "{rendered}");
+    assert!(
+        rendered.contains("PGDATA=/var/lib/postgresql/16"),
+        "{rendered}"
+    );
     // `LS_COLORS=rs=0:di=01;34` is a real variable, and splitting on
     // every `=` would truncate it at the first.
     assert!(rendered.contains("LS_COLORS=rs=0:di=01;34"), "{rendered}");
@@ -800,7 +1579,10 @@ fn a_process_with_no_readable_detail_still_renders_what_proc_carries() {
     proc.cgroup = Some("/system.slice/postgresql.service".into());
     proc.threads = 9;
     let rendered = proc_detail_text(&proc, None);
-    assert!(rendered.contains("/system.slice/postgresql.service"), "{rendered}");
+    assert!(
+        rendered.contains("/system.slice/postgresql.service"),
+        "{rendered}"
+    );
     assert!(rendered.contains("1.4G rss"), "{rendered}");
     assert!(rendered.contains("9 threads"), "{rendered}");
     // Nothing is invented for the fields that could not be read.
@@ -813,7 +1595,10 @@ fn a_process_with_no_readable_detail_still_renders_what_proc_carries() {
 #[test]
 fn memory_separates_resident_from_mapped_from_swapped() {
     let rendered = proc_detail_text(&a_proc(9932, "postgres", 1402), Some(&a_full_detail()));
-    let memory = rendered.lines().find(|l| l.contains("memory")).expect("a memory line");
+    let memory = rendered
+        .lines()
+        .find(|l| l.contains("memory"))
+        .expect("a memory line");
     assert!(memory.contains("1.4G rss"), "{memory:?}");
     assert!(memory.contains("4.0G virt"), "{memory:?}");
     assert!(memory.contains("1.9M swap"), "{memory:?}");
@@ -823,7 +1608,10 @@ fn memory_separates_resident_from_mapped_from_swapped() {
 /// column - the same rule the table's NI and OOM follow.
 #[test]
 fn zero_swap_earns_no_mention() {
-    let detail = ProcDetail { swap_bytes: Some(0), ..a_full_detail() };
+    let detail = ProcDetail {
+        swap_bytes: Some(0),
+        ..a_full_detail()
+    };
     let rendered = proc_detail_text(&a_proc(9932, "postgres", 1402), Some(&detail));
     assert!(!rendered.contains("swap"), "{rendered}");
 }
@@ -835,21 +1623,34 @@ fn zero_swap_earns_no_mention() {
 /// most of them nowhere.
 #[test]
 fn a_very_long_block_is_capped_and_says_how_much_it_dropped() {
-    let detail = ProcDetail { env: (0..400).map(|n| (format!("V{n}"), "x".into())).collect(), ..a_full_detail() };
+    let detail = ProcDetail {
+        env: (0..400).map(|n| (format!("V{n}"), "x".into())).collect(),
+        ..a_full_detail()
+    };
     let rendered = proc_detail_text(&a_proc(9932, "postgres", 1402), Some(&detail));
     let lines: Vec<&str> = rendered.lines().collect();
     assert!(lines.len() <= 24, "capped: {} lines", lines.len());
-    assert!(lines.last().unwrap().contains("more lines not shown"), "{:?}", lines.last());
+    assert!(
+        lines.last().unwrap().contains("more lines not shown"),
+        "{:?}",
+        lines.last()
+    );
 }
 
 /// The cut lands on the tail, which is why the block is ordered with the
 /// identifying facts first: the command line survives a long environment.
 #[test]
 fn the_cap_takes_the_environment_before_the_command_line() {
-    let detail = ProcDetail { env: (0..400).map(|n| (format!("V{n}"), "x".into())).collect(), ..a_full_detail() };
+    let detail = ProcDetail {
+        env: (0..400).map(|n| (format!("V{n}"), "x".into())).collect(),
+        ..a_full_detail()
+    };
     let rendered = proc_detail_text(&a_proc(9932, "postgres", 1402), Some(&detail));
     assert!(rendered.contains("cmdline"), "{rendered}");
-    assert!(rendered.contains("tcp 0.0.0.0:5432 LISTEN"), "the descriptors survive too: {rendered}");
+    assert!(
+        rendered.contains("tcp 0.0.0.0:5432 LISTEN"),
+        "the descriptors survive too: {rendered}"
+    );
 }
 
 /// A block that fits says nothing about trimming, because nothing was.
@@ -880,7 +1681,10 @@ fn a_failed_unit_row_shows_its_exit_code() {
     let mut unit = a_unit("restic-backup.service", ActiveState::Failed);
     unit.exit_code = Some(1);
     let rendered = text(&unit_lines(&[flat(unit, Some(10_800_000), false)], &theme)[0]);
-    assert!(rendered.starts_with("x "), "a failed unit is the dead tier: {rendered:?}");
+    assert!(
+        rendered.starts_with("x "),
+        "a failed unit is the dead tier: {rendered:?}"
+    );
     assert!(rendered.contains("failed (exit 1)"), "{rendered:?}");
     assert!(rendered.contains("3h"), "the age: {rendered:?}");
 }
@@ -893,7 +1697,19 @@ fn enabled_earns_a_column_only_when_true() {
     let mut off = a_unit("a.service", ActiveState::Active);
     off.enabled = false;
     assert!(!text(&unit_lines(&[flat(off, Some(0), false)], &theme)[0]).contains("enabled"));
-    assert!(text(&unit_lines(&[flat(a_unit("a.service", ActiveState::Active), Some(0), false)], &theme)[0]).contains("enabled"));
+    assert!(
+        text(
+            &unit_lines(
+                &[flat(
+                    a_unit("a.service", ActiveState::Active),
+                    Some(0),
+                    false
+                )],
+                &theme
+            )[0]
+        )
+        .contains("enabled")
+    );
 }
 
 /// The marker is the affordance that says the row opens onto what is
@@ -907,7 +1723,10 @@ fn an_open_filesystem_row_draws_the_fold_marker() {
     let open = text(&filesystem_lines(&[(a_fs("/", 81.0, false), true)], &theme)[0]);
     assert!(open.starts_with("v "), "{open:?}");
     let broken = text(&filesystem_lines(&[(a_fs("/", 81.0, true), true)], &theme)[0]);
-    assert!(broken.starts_with("! "), "read-only outranks the marker: {broken:?}");
+    assert!(
+        broken.starts_with("! "),
+        "read-only outranks the marker: {broken:?}"
+    );
 }
 
 #[test]
@@ -925,9 +1744,18 @@ fn a_read_only_filesystem_is_flagged_urgent() {
 #[test]
 fn a_journal_entry_without_a_unit_says_kernel() {
     let theme = Theme::default();
-    let entry = Entry { timestamp_ms: 0, unit: None, priority: Priority::Warning, message: "i915 GPU hang".to_string() };
+    let entry = Entry {
+        timestamp_ms: 0,
+        unit: None,
+        priority: Priority::Warning,
+        message: "i915 GPU hang".to_string(),
+        origin: masys_domain::journal::Origin::Userspace,
+    };
     let rendered = text(&journal_lines(&[entry], &theme, None)[0]);
-    assert!(rendered.starts_with("~ "), "a warning is the middle tier: {rendered:?}");
+    assert!(
+        rendered.starts_with("~ "),
+        "a warning is the middle tier: {rendered:?}"
+    );
     assert!(rendered.contains("kernel"), "{rendered:?}");
     assert!(rendered.contains("i915 GPU hang"), "{rendered:?}");
 }
@@ -936,26 +1764,35 @@ fn a_journal_entry_without_a_unit_says_kernel() {
 #[test]
 fn a_multiline_journal_message_stays_one_row() {
     let theme = Theme::default();
-    let entry =
-        Entry { timestamp_ms: 0, unit: Some("sshd.service".to_string()), priority: Priority::Error, message: "first\nsecond".to_string() };
+    let entry = Entry {
+        timestamp_ms: 0,
+        unit: Some("sshd.service".to_string()),
+        priority: Priority::Error,
+        message: "first\nsecond".to_string(),
+        origin: masys_domain::journal::Origin::Userspace,
+    };
     let rendered = text(&journal_lines(&[entry], &theme, None)[0]);
     assert!(!rendered.contains('\n'), "{rendered:?}");
     assert!(rendered.contains("first second"), "{rendered:?}");
 }
 
-/// Every row in the log view belongs to the unit the header names, so
+/// Every row in the log buffer belongs to the unit the header names, so
 /// repeating it 2,000 times says nothing.
 #[test]
-fn a_row_whose_unit_is_the_views_own_does_not_repeat_it() {
+fn a_row_whose_unit_is_the_buffers_own_does_not_repeat_it() {
     let theme = Theme::default();
     let entry = Entry {
         timestamp_ms: 0,
         unit: Some("sshd.service".to_string()),
         priority: Priority::Info,
         message: "Server listening on 0.0.0.0 port 22.".to_string(),
+        origin: masys_domain::journal::Origin::Userspace,
     };
     let rendered = text(&journal_lines(&[entry], &theme, Some("sshd.service"))[0]);
-    assert!(!rendered.contains("sshd.service"), "the scope is in the header: {rendered:?}");
+    assert!(
+        !rendered.contains("sshd.service"),
+        "the scope is in the header: {rendered:?}"
+    );
     assert!(rendered.contains("Server listening"), "{rendered:?}");
 }
 
@@ -970,9 +1807,13 @@ fn a_row_from_another_unit_names_itself() {
         unit: Some("init.scope".to_string()),
         priority: Priority::Info,
         message: "Starting SSH Daemon...".to_string(),
+        origin: masys_domain::journal::Origin::Userspace,
     };
     let rendered = text(&journal_lines(&[entry], &theme, Some("sshd.service"))[0]);
-    assert!(rendered.contains("init.scope"), "systemd said this, not sshd: {rendered:?}");
+    assert!(
+        rendered.contains("init.scope"),
+        "systemd said this, not sshd: {rendered:?}"
+    );
 }
 
 /// A daemon that stamps its own lines - syncthing, and 12% of the lines
@@ -988,11 +1829,21 @@ fn a_senders_own_timestamp_is_dropped_from_the_message() {
         unit: Some("syncthing.service".to_string()),
         priority: Priority::Info,
         message: "2026-05-19 21:17:57 INF Completed initial scan".to_string(),
+        origin: masys_domain::journal::Origin::Userspace,
     };
     let rendered = text(&journal_lines(&[entry], &theme, None)[0]);
-    assert!(rendered.contains("INF Completed initial scan"), "{rendered:?}");
-    assert!(!rendered.contains("2026-05-19"), "the date is gone: {rendered:?}");
-    assert!(!rendered.contains("21:17:57 INF"), "and so is the duplicated time: {rendered:?}");
+    assert!(
+        rendered.contains("INF Completed initial scan"),
+        "{rendered:?}"
+    );
+    assert!(
+        !rendered.contains("2026-05-19"),
+        "the date is gone: {rendered:?}"
+    );
+    assert!(
+        !rendered.contains("21:17:57 INF"),
+        "and so is the duplicated time: {rendered:?}"
+    );
 }
 
 /// The other shape that actually occurs here: RFC 3339, with fractional
@@ -1005,6 +1856,7 @@ fn an_rfc3339_sender_timestamp_is_dropped_too() {
         unit: Some("docker.service".to_string()),
         priority: Priority::Warning,
         message: "2026-05-19T21:17:57.123456-0400 level=warn msg=\"slow\"".to_string(),
+        origin: masys_domain::journal::Origin::Userspace,
     };
     let rendered = text(&journal_lines(&[entry], &theme, None)[0]);
     assert!(rendered.contains("level=warn"), "{rendered:?}");
@@ -1020,7 +1872,9 @@ fn a_sender_timestamp_followed_by_a_tab_is_dropped() {
         timestamp_ms: 0,
         unit: Some("otel-collector-host-logs.service".to_string()),
         priority: Priority::Info,
-        message: "2026-05-19T08:15:48.450-0600\tinfo\tadapter/receiver.go:41\tStarting stanza".to_string(),
+        message: "2026-05-19T08:15:48.450-0600\tinfo\tadapter/receiver.go:41\tStarting stanza"
+            .to_string(),
+        origin: masys_domain::journal::Origin::Userspace,
     };
     let rendered = text(&journal_lines(&[entry], &theme, None)[0]);
     assert!(!rendered.contains("2026-05-19"), "{rendered:?}");
@@ -1038,9 +1892,13 @@ fn tabs_in_a_message_become_spaces_rather_than_vanishing() {
         unit: Some("otel-collector-host-logs.service".to_string()),
         priority: Priority::Info,
         message: "info\tadapter/receiver.go:41\tStarting stanza".to_string(),
+        origin: masys_domain::journal::Origin::Userspace,
     };
     let rendered = text(&journal_lines(&[entry], &theme, None)[0]);
-    assert!(rendered.contains("info adapter/receiver.go:41 Starting stanza"), "{rendered:?}");
+    assert!(
+        rendered.contains("info adapter/receiver.go:41 Starting stanza"),
+        "{rendered:?}"
+    );
 }
 
 /// Only a *leading* stamp is the sender's own. A date inside a sentence is
@@ -1053,9 +1911,13 @@ fn a_date_in_the_middle_of_a_message_survives() {
         unit: Some("restic.service".to_string()),
         priority: Priority::Info,
         message: "snapshot for 2026-05-19 21:17:57 completed".to_string(),
+        origin: masys_domain::journal::Origin::Userspace,
     };
     let rendered = text(&journal_lines(&[entry], &theme, None)[0]);
-    assert!(rendered.contains("snapshot for 2026-05-19 21:17:57 completed"), "{rendered:?}");
+    assert!(
+        rendered.contains("snapshot for 2026-05-19 21:17:57 completed"),
+        "{rendered:?}"
+    );
 }
 
 /// A line that is *only* a timestamp leaves nothing behind, and a blank
@@ -1068,6 +1930,7 @@ fn a_message_that_is_nothing_but_a_timestamp_is_left_alone() {
         unit: Some("odd.service".to_string()),
         priority: Priority::Info,
         message: "2026-05-19 21:17:57".to_string(),
+        origin: masys_domain::journal::Origin::Userspace,
     };
     let rendered = text(&journal_lines(&[entry], &theme, None)[0]);
     assert!(rendered.contains("2026-05-19 21:17:57"), "{rendered:?}");
@@ -1095,10 +1958,13 @@ fn an_interface_row_shows_throughput_both_ways() {
     let rate = masys_domain::rate::NetRate {
         rx_bytes_per_sec: 1_258_291.0,
         tx_bytes_per_sec: 348_160.0,
-        rx_packets_per_sec: 900.0,
-        tx_packets_per_sec: 400.0,
     };
-    let rendered = text(&interface_line(&an_interface("enp0s31f6", 0), Some(rate), &theme, 12));
+    let rendered = text(&interface_line(
+        &an_interface("enp0s31f6", 0),
+        Some(rate),
+        &theme,
+        12,
+    ));
     assert!(rendered.contains("enp0s31f6"), "{rendered:?}");
     assert!(rendered.contains("1.2M/s"), "down: {rendered:?}");
     assert!(rendered.contains("340K/s"), "up: {rendered:?}");
@@ -1110,10 +1976,20 @@ fn an_interface_row_shows_throughput_both_ways() {
 #[test]
 fn drops_appear_only_when_there_are_some() {
     let theme = Theme::default();
-    let clean = text(&interface_line(&an_interface("enp0s31f6", 0), None, &theme, 12));
+    let clean = text(&interface_line(
+        &an_interface("enp0s31f6", 0),
+        None,
+        &theme,
+        12,
+    ));
     assert!(!clean.contains("drop"), "{clean:?}");
 
-    let dropping = text(&interface_line(&an_interface("enp0s31f6", 37), None, &theme, 12));
+    let dropping = text(&interface_line(
+        &an_interface("enp0s31f6", 37),
+        None,
+        &theme,
+        12,
+    ));
     assert!(dropping.contains("37 drop"), "{dropping:?}");
 }
 
@@ -1124,7 +2000,10 @@ fn an_interface_with_no_rate_yet_draws_a_dash() {
     let theme = Theme::default();
     let rendered = text(&interface_line(&an_interface("wg0", 0), None, &theme, 12));
     assert!(rendered.contains('-'), "{rendered:?}");
-    assert!(!rendered.contains("0B/s"), "a measured zero would say that: {rendered:?}");
+    assert!(
+        !rendered.contains("0B/s"),
+        "a measured zero would say that: {rendered:?}"
+    );
 }
 
 fn a_unit(name: &str, state: ActiveState) -> Unit {
@@ -1145,7 +2024,13 @@ fn a_unit(name: &str, state: ActiveState) -> Unit {
 }
 
 fn a_fs(mount: &str, used: f32, read_only: bool) -> Filesystem {
-    Filesystem { mount_point: mount.to_string(), used_percent: used, free_bytes: 12 * (1u64 << 30), inode_used_percent: 6.0, read_only }
+    Filesystem {
+        mount_point: mount.to_string(),
+        used_percent: used,
+        free_bytes: 12 * (1u64 << 30),
+        inode_used_percent: 6.0,
+        read_only,
+    }
 }
 
 /// systemd escapes device and mount paths into unit names, so they are
@@ -1155,11 +2040,21 @@ fn a_fs(mount: &str, used: f32, read_only: bool) -> Filesystem {
 #[test]
 fn a_very_long_unit_name_does_not_push_the_columns_off_screen() {
     let theme = Theme::default();
-    let long = a_unit("dev-disk-by\\x2duuid-1b899112\\x2d0386\\x2d42b2\\x2d8784\\x2d642ad5a73356.swap", ActiveState::Active);
+    let long = a_unit(
+        "dev-disk-by\\x2duuid-1b899112\\x2d0386\\x2d42b2\\x2d8784\\x2d642ad5a73356.swap",
+        ActiveState::Active,
+    );
     let short = a_unit("a.service", ActiveState::Active);
-    let lines = unit_lines(&[flat(long, Some(0), false), flat(short, Some(0), false)], &theme);
+    let lines = unit_lines(
+        &[flat(long, Some(0), false), flat(short, Some(0), false)],
+        &theme,
+    );
     for line in &lines {
-        assert!(UnicodeWidthStr::width(text(line).as_str()) <= 80, "{:?}", text(line));
+        assert!(
+            UnicodeWidthStr::width(text(line).as_str()) <= 80,
+            "{:?}",
+            text(line)
+        );
     }
     // Both rows still agree on where the state column starts.
     let state_at = |l: &Line| text(l).find("running").expect("a state");
@@ -1173,12 +2068,32 @@ fn a_very_long_unit_name_does_not_push_the_columns_off_screen() {
 #[test]
 fn a_unit_with_no_recorded_transition_shows_no_age() {
     let theme = Theme::default();
-    let unknown = text(&unit_lines(&[flat(a_unit("-.mount", ActiveState::Active), None, false)], &theme)[0]);
-    let known = text(&unit_lines(&[flat(a_unit("-.mount", ActiveState::Active), Some(10_800_000), false)], &theme)[0]);
+    let unknown = text(
+        &unit_lines(
+            &[flat(a_unit("-.mount", ActiveState::Active), None, false)],
+            &theme,
+        )[0],
+    );
+    let known = text(
+        &unit_lines(
+            &[flat(
+                a_unit("-.mount", ActiveState::Active),
+                Some(10_800_000),
+                false,
+            )],
+            &theme,
+        )[0],
+    );
 
     assert!(unknown.contains("-.mount"), "{unknown:?}");
-    assert!(unknown.trim_end().ends_with("enabled"), "the age column is simply empty: {unknown:?}");
-    assert!(known.trim_end().ends_with("3h"), "a known age still renders: {known:?}");
+    assert!(
+        unknown.trim_end().ends_with("enabled"),
+        "the age column is simply empty: {unknown:?}"
+    );
+    assert!(
+        known.trim_end().ends_with("3h"),
+        "a known age still renders: {known:?}"
+    );
 }
 
 /// "exit 6" against "curl: (6) Could not resolve host" is the difference
@@ -1186,16 +2101,19 @@ fn a_unit_with_no_recorded_transition_shows_no_age() {
 #[test]
 fn a_failed_unit_shows_why_when_the_reason_is_known() {
     let theme = Theme::default();
-    let finding = Finding::FailedUnit {
+    let finding = Finding::new(FindingKind::FailedUnit {
         unit: "nightly-backup.service".to_string(),
         exit_code: Some(6),
         since_ms: 10_800_000,
         reason: Some("curl: (6) Could not resolve host: storage.googleapis.com".to_string()),
-    };
-    let rendered = text(&finding_line(&finding, &theme));
+    });
+    let rendered = text(&finding_line(&finding_row(finding.clone()), &theme));
     assert!(rendered.contains("failed (exit 6)"), "{rendered}");
     assert!(rendered.contains("3h ago"), "{rendered}");
-    assert!(rendered.ends_with("Could not resolve host: storage.googleapis.com"), "{rendered}");
+    assert!(
+        rendered.ends_with("Could not resolve host: storage.googleapis.com"),
+        "{rendered}"
+    );
 }
 
 /// A unit that said nothing of its own, or whose journal is gone, reads
@@ -1203,8 +2121,16 @@ fn a_failed_unit_shows_why_when_the_reason_is_known() {
 #[test]
 fn a_failed_unit_with_no_known_reason_is_unchanged() {
     let theme = Theme::default();
-    let finding = Finding::FailedUnit { unit: "a.service".to_string(), exit_code: Some(1), since_ms: 10_800_000, reason: None };
-    assert_eq!(text(&finding_line(&finding, &theme)), "x a.service  failed (exit 1)  3h ago");
+    let finding = Finding::new(FindingKind::FailedUnit {
+        unit: "a.service".to_string(),
+        exit_code: Some(1),
+        since_ms: 10_800_000,
+        reason: None,
+    });
+    assert_eq!(
+        text(&finding_line(&finding_row(finding.clone()), &theme)),
+        "x a.service  failed (exit 1)  3h ago"
+    );
 }
 
 /// An opened unit shows what `systemctl status` leads with - description,
@@ -1246,11 +2172,23 @@ fn an_opened_unit_shows_status_facts() {
     let block = detail_text(&unit, Some(&detail));
 
     assert!(block.contains("SSH Daemon"), "{block}");
-    assert!(block.contains("/etc/systemd/system/sshd.service"), "{block}");
+    assert!(
+        block.contains("/etc/systemd/system/sshd.service"),
+        "{block}"
+    );
     assert!(block.contains("pid 897"), "{block}");
-    assert!(block.contains("1 task"), "and singular, not `1 tasks`: {block}");
-    assert!(block.contains("4.6M"), "memory is scaled, not raw bytes: {block}");
-    assert!(block.contains("cpu 96ms"), "nanoseconds are scaled the way systemctl scales them: {block}");
+    assert!(
+        block.contains("1 task"),
+        "and singular, not `1 tasks`: {block}"
+    );
+    assert!(
+        block.contains("4.6M"),
+        "memory is scaled, not raw bytes: {block}"
+    );
+    assert!(
+        block.contains("cpu 96ms"),
+        "nanoseconds are scaled the way systemctl scales them: {block}"
+    );
     assert!(block.contains("/system.slice/sshd.service"), "{block}");
 }
 
@@ -1272,12 +2210,21 @@ fn a_unit_without_process_facts_omits_them() {
         triggers: Vec::new(),
         timer: None,
     };
-    let detail = masys_domain::unit::UnitDetail { description: Some("Basic System".to_string()), ..Default::default() };
+    let detail = masys_domain::unit::UnitDetail {
+        description: Some("Basic System".to_string()),
+        ..Default::default()
+    };
     let block = detail_text(&unit, Some(&detail));
 
     assert!(block.contains("Basic System"), "{block}");
-    assert!(!block.contains("running"), "no process facts line at all: {block}");
-    assert!(block.contains("no unit file"), "and it says so rather than leaving the line blank: {block}");
+    assert!(
+        !block.contains("running"),
+        "no process facts line at all: {block}"
+    );
+    assert!(
+        block.contains("no unit file"),
+        "and it says so rather than leaving the line blank: {block}"
+    );
 }
 
 /// An open unit shows a `v` where a closed one shows nothing, so the fold
@@ -1301,14 +2248,25 @@ fn an_open_unit_is_marked_in_its_own_row() {
     let closed = text(&unit_lines(&[flat(unit.clone(), Some(10), false)], &Theme::default())[0]);
     let open = text(&unit_lines(&[flat(unit, Some(10), true)], &Theme::default())[0]);
     assert!(open.starts_with(". v "), "an open unit is marked: {open:?}");
-    assert!(closed.starts_with(".   "), "a closed one is not: {closed:?}");
+    assert!(
+        closed.starts_with(".   "),
+        "a closed one is not: {closed:?}"
+    );
     assert_eq!(open.len(), closed.len(), "and the row does not shift");
 }
 
-fn detail_text(unit: &masys_domain::unit::Unit, detail: Option<&masys_domain::unit::UnitDetail>) -> String {
+fn detail_text(
+    unit: &masys_domain::unit::Unit,
+    detail: Option<&masys_domain::unit::UnitDetail>,
+) -> String {
     masys_render::view::unit_detail_lines(unit, detail, &Theme::default())
         .iter()
-        .map(|l| l.spans.iter().map(|s| s.content.clone()).collect::<String>())
+        .map(|l| {
+            l.spans
+                .iter()
+                .map(|s| s.content.clone())
+                .collect::<String>()
+        })
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -1329,11 +2287,27 @@ fn a_unit_row_is_coloured_by_its_state() {
         line.spans.last().expect("a name span").style.fg
     };
 
-    assert_eq!(colour(ActiveState::Failed), Some(theme.severity_dead), "a failure is findable without reading");
-    assert_eq!(colour(ActiveState::Activating), Some(theme.severity_warning), "mid-transition is not settled");
+    assert_eq!(
+        colour(ActiveState::Failed),
+        Some(theme.severity_dead),
+        "a failure is findable without reading"
+    );
+    assert_eq!(
+        colour(ActiveState::Activating),
+        Some(theme.severity_warning),
+        "mid-transition is not settled"
+    );
     assert_eq!(colour(ActiveState::Reloading), Some(theme.severity_warning));
-    assert_eq!(colour(ActiveState::Inactive), Some(theme.info), "inactive recedes");
-    assert_eq!(colour(ActiveState::Active), None, "and a healthy unit is plain text, so the others stand out");
+    assert_eq!(
+        colour(ActiveState::Inactive),
+        Some(theme.info),
+        "inactive recedes"
+    );
+    assert_eq!(
+        colour(ActiveState::Active),
+        None,
+        "and a healthy unit is plain text, so the others stand out"
+    );
 }
 
 /// A system-profile generation: numbered, versioned, and with a kernel.
@@ -1353,15 +2327,30 @@ fn a_generation(id: u64, current: bool, booted: bool, label: &str) -> Generation
 
 /// A generation with no version and no kernel, as the home profile's are.
 fn a_bare_generation(id: u64, current: bool, booted: bool) -> Generation {
-    Generation { label: None, kernel: None, ..a_generation(id, current, booted, "") }
+    Generation {
+        label: None,
+        kernel: None,
+        ..a_generation(id, current, booted, "")
+    }
 }
 
 fn generation_row(generation: Generation, age_ms: Option<u64>) -> GenerationRow {
     GenerationRow { generation, age_ms }
 }
 
-fn an_input(name: &str, origin: Option<&str>, last_modified_secs: Option<u64>, direct: bool) -> Input {
-    Input { name: name.to_string(), origin: origin.map(str::to_string), rev: None, last_modified_secs, direct }
+fn an_input(
+    name: &str,
+    origin: Option<&str>,
+    last_modified_secs: Option<u64>,
+    direct: bool,
+) -> Input {
+    Input {
+        name: name.to_string(),
+        origin: origin.map(str::to_string),
+        rev: None,
+        last_modified_secs,
+        direct,
+    }
 }
 
 /// `retention` is the *read* answer: `None` here is the port saying this
@@ -1393,25 +2382,50 @@ fn block(lines: &[Line]) -> String {
 fn the_current_generation_is_marked_and_the_booted_one_is_named() {
     let theme = Theme::default();
     let columns = GenerationColumns::measure(&[]);
-    let current = text(&generation_line(&a_generation(437, true, false, "26.11"), Some(3_600_000), &theme, columns));
-    let booted = text(&generation_line(&a_generation(427, false, true, "26.11"), Some(3_600_000), &theme, columns));
+    let current = text(&generation_line(
+        &a_generation(437, true, false, "26.11"),
+        Some(3_600_000),
+        &theme,
+        columns,
+    ));
+    let booted = text(&generation_line(
+        &a_generation(427, false, true, "26.11"),
+        Some(3_600_000),
+        &theme,
+        columns,
+    ));
 
-    assert!(current.contains("437") && current.contains("current"), "{current:?}");
-    assert!(booted.contains("427") && booted.contains("booted"), "{booted:?}");
+    assert!(
+        current.contains("437") && current.contains("current"),
+        "{current:?}"
+    );
+    assert!(
+        booted.contains("427") && booted.contains("booted"),
+        "{booted:?}"
+    );
     // The asterisk answers "which will I get at the next boot"; only the
     // word answers "which am I running".
     assert!(current.starts_with('*'), "{current:?}");
     assert!(!booted.starts_with('*'), "{booted:?}");
-    assert!(!booted.contains("current"), "and the row that is not current does not say it is: {booted:?}");
+    assert!(
+        !booted.contains("current"),
+        "and the row that is not current does not say it is: {booted:?}"
+    );
 }
 
 #[test]
 fn a_generation_shows_its_version_and_kernel() {
     let theme = Theme::default();
-    let rows = [generation_row(a_generation(437, true, false, "26.11.20260804.e72e4f2"), Some(3_600_000))];
+    let rows = [generation_row(
+        a_generation(437, true, false, "26.11.20260804.e72e4f2"),
+        Some(3_600_000),
+    )];
     let line = text(&generation_lines(&rows, &theme)[0]);
     assert!(line.contains("26.11.20260804.e72e4f2"), "{line:?}");
-    assert!(line.contains("6.18.42"), "the version out of the kernel store path, not the path: {line:?}");
+    assert!(
+        line.contains("6.18.42"),
+        "the version out of the kernel store path, not the path: {line:?}"
+    );
     assert!(!line.contains("/nix/store"), "{line:?}");
 }
 
@@ -1422,8 +2436,12 @@ fn a_kernel_path_that_names_no_version_leaves_the_column_blank() {
     let theme = Theme::default();
     let mut generation = a_generation(437, true, false, "26.11");
     generation.kernel = Some("/nix/store/h4sh-not-a-kernel/bzImage".to_string());
-    let line = trimmed(&generation_lines(&[generation_row(generation, Some(3_600_000))], &theme)[0]);
-    assert!(line.ends_with("26.11"), "nothing follows the version: {line:?}");
+    let line =
+        trimmed(&generation_lines(&[generation_row(generation, Some(3_600_000))], &theme)[0]);
+    assert!(
+        line.ends_with("26.11"),
+        "nothing follows the version: {line:?}"
+    );
 
     let mut none = a_generation(437, true, false, "26.11");
     none.kernel = None;
@@ -1439,16 +2457,28 @@ fn a_kernel_path_that_names_no_version_leaves_the_column_blank() {
 fn a_generation_with_no_readable_mtime_shows_a_dash_rather_than_an_age() {
     let theme = Theme::default();
     let rows = [
-        generation_row(a_generation(437, true, false, "26.11.20260804.e72e4f2"), Some(187_200_000)),
-        generation_row(a_generation(427, false, true, "26.11.20260804.e72e4f2"), None),
+        generation_row(
+            a_generation(437, true, false, "26.11.20260804.e72e4f2"),
+            Some(187_200_000),
+        ),
+        generation_row(
+            a_generation(427, false, true, "26.11.20260804.e72e4f2"),
+            None,
+        ),
     ];
     let lines = generation_lines(&rows, &theme);
     let known = text(&lines[0]);
     let unknown = text(&lines[1]);
 
     assert!(known.contains("2d 4h"), "{known:?}");
-    assert!(!unknown.contains("0m"), "a zero would be a reading: {unknown:?}");
-    assert!(!unknown.contains("20684d"), "and an epoch date would be a fabrication: {unknown:?}");
+    assert!(
+        !unknown.contains("0m"),
+        "a zero would be a reading: {unknown:?}"
+    );
+    assert!(
+        !unknown.contains("20684d"),
+        "and an epoch date would be a fabrication: {unknown:?}"
+    );
     assert!(unknown.contains('-'), "{unknown:?}");
     // The dash sits in the age column rather than the row losing it, so
     // everything to the right still lines up with the row above.
@@ -1464,15 +2494,30 @@ fn a_generations_section_measures_its_own_columns() {
     let theme = Theme::default();
     let system = generation_lines(
         &[
-            generation_row(a_generation(437, true, false, "26.11.20260804.e72e4f2"), Some(187_200_000)),
+            generation_row(
+                a_generation(437, true, false, "26.11.20260804.e72e4f2"),
+                Some(187_200_000),
+            ),
             generation_row(a_generation(9, false, true, "26.11.20260101.aaaaaaa"), None),
         ],
         &theme,
     );
-    assert_eq!(trimmed(&system[0]), "* 437  current     2d 4h  26.11.20260804.e72e4f2  6.18.42");
-    assert_eq!(trimmed(&system[1]), "    9  booted          -  26.11.20260101.aaaaaaa  6.18.42");
+    assert_eq!(
+        trimmed(&system[0]),
+        "* 437  current     2d 4h  26.11.20260804.e72e4f2  6.18.42"
+    );
+    assert_eq!(
+        trimmed(&system[1]),
+        "    9  booted          -  26.11.20260101.aaaaaaa  6.18.42"
+    );
 
-    let home = generation_lines(&[generation_row(a_bare_generation(7, true, true), Some(3_600_000))], &theme);
+    let home = generation_lines(
+        &[generation_row(
+            a_bare_generation(7, true, true),
+            Some(3_600_000),
+        )],
+        &theme,
+    );
     assert_eq!(
         trimmed(&home[0]),
         "* 7  current, booted        1h",
@@ -1484,19 +2529,35 @@ fn a_generations_section_measures_its_own_columns() {
 #[test]
 fn an_unchanged_kernel_is_stated_rather_than_a_bare_reboot_required() {
     let theme = Theme::default();
-    let node = Node::RebootPending { booted: Some(427), current: Some(437), kernel_changed: false, initrd_changed: false };
+    let node = Node::RebootPending {
+        booted: Some(427),
+        current: Some(437),
+        kernel_changed: false,
+        initrd_changed: false,
+    };
     let rendered = block(&reboot_lines(&node, &theme));
 
-    assert!(rendered.contains("427") && rendered.contains("437"), "{rendered:?}");
+    assert!(
+        rendered.contains("427") && rendered.contains("437"),
+        "{rendered:?}"
+    );
     assert!(rendered.contains("kernel unchanged"), "{rendered:?}");
     assert!(rendered.contains("this can wait"), "{rendered:?}");
-    assert!(!rendered.to_lowercase().contains("reboot required"), "{rendered:?}");
+    assert!(
+        !rendered.to_lowercase().contains("reboot required"),
+        "{rendered:?}"
+    );
 }
 
 #[test]
 fn a_changed_kernel_says_so() {
     let theme = Theme::default();
-    let node = Node::RebootPending { booted: Some(427), current: Some(437), kernel_changed: true, initrd_changed: false };
+    let node = Node::RebootPending {
+        booted: Some(427),
+        current: Some(437),
+        kernel_changed: true,
+        initrd_changed: false,
+    };
     let rendered = block(&reboot_lines(&node, &theme));
     assert!(rendered.contains("kernel changed"), "{rendered:?}");
     assert!(!rendered.contains("kernel unchanged"), "{rendered:?}");
@@ -1509,7 +2570,12 @@ fn a_changed_kernel_says_so() {
 #[test]
 fn a_changed_initrd_is_not_the_activation_only_case() {
     let theme = Theme::default();
-    let node = Node::RebootPending { booted: Some(427), current: Some(437), kernel_changed: false, initrd_changed: true };
+    let node = Node::RebootPending {
+        booted: Some(427),
+        current: Some(437),
+        kernel_changed: false,
+        initrd_changed: true,
+    };
     let rendered = block(&reboot_lines(&node, &theme));
     assert!(rendered.contains("initrd changed"), "{rendered:?}");
     assert!(!rendered.contains("can wait"), "{rendered:?}");
@@ -1522,12 +2588,24 @@ fn a_changed_initrd_is_not_the_activation_only_case() {
 #[test]
 fn the_reboot_block_fits_an_eighty_column_terminal() {
     let theme = Theme::default();
-    for (kernel_changed, initrd_changed) in [(true, true), (true, false), (false, true), (false, false)] {
-        let node = Node::RebootPending { booted: Some(427), current: Some(437), kernel_changed, initrd_changed };
+    for (kernel_changed, initrd_changed) in
+        [(true, true), (true, false), (false, true), (false, false)]
+    {
+        let node = Node::RebootPending {
+            booted: Some(427),
+            current: Some(437),
+            kernel_changed,
+            initrd_changed,
+        };
         for line in reboot_lines(&node, &theme) {
             // Two columns for the frame's own margins, which `render`
             // adds around every row.
-            assert!(trimmed(&line).width() <= 78, "{:?} is {} columns", trimmed(&line), trimmed(&line).width());
+            assert!(
+                trimmed(&line).width() <= 78,
+                "{:?} is {} columns",
+                trimmed(&line),
+                trimmed(&line).width()
+            );
         }
     }
 }
@@ -1539,12 +2617,21 @@ fn the_reboot_block_fits_an_eighty_column_terminal() {
 fn the_reboot_notice_is_toned_by_what_actually_changed() {
     let theme = Theme::default();
     let tone = |kernel_changed, initrd_changed| {
-        let node = Node::RebootPending { booted: Some(427), current: Some(437), kernel_changed, initrd_changed };
+        let node = Node::RebootPending {
+            booted: Some(427),
+            current: Some(437),
+            kernel_changed,
+            initrd_changed,
+        };
         reboot_lines(&node, &theme)[0].spans[0].style.fg
     };
     assert_eq!(tone(true, false), Some(theme.severity_urgent));
     assert_eq!(tone(false, true), Some(theme.severity_urgent));
-    assert_eq!(tone(false, false), Some(theme.severity_warning), "activation-only can wait, and does not shout");
+    assert_eq!(
+        tone(false, false),
+        Some(theme.severity_warning),
+        "activation-only can wait, and does not shout"
+    );
 }
 
 /// A booted store path that matches no generation on the profile - it can
@@ -1553,10 +2640,18 @@ fn the_reboot_notice_is_toned_by_what_actually_changed() {
 #[test]
 fn a_reboot_whose_generation_is_unknown_prints_no_number_for_it() {
     let theme = Theme::default();
-    let node = Node::RebootPending { booted: None, current: Some(437), kernel_changed: true, initrd_changed: false };
+    let node = Node::RebootPending {
+        booted: None,
+        current: Some(437),
+        kernel_changed: true,
+        initrd_changed: false,
+    };
     let rendered = block(&reboot_lines(&node, &theme));
     assert!(rendered.contains("booted ?"), "{rendered:?}");
-    assert!(!rendered.contains("booted 0"), "a zero would name generation 0: {rendered:?}");
+    assert!(
+        !rendered.contains("booted 0"),
+        "a zero would name generation 0: {rendered:?}"
+    );
 }
 
 #[test]
@@ -1569,7 +2664,10 @@ fn a_measured_store_prints_its_percentage_and_what_is_retained() {
         home_generations: Some(5),
         gc_roots: Some(156),
     };
-    assert_eq!(block(&nix_store_lines(&node, &theme)), "/nix 83%  .  160G free\n36 system generations  .  5 home  .  156 gc roots");
+    assert_eq!(
+        block(&nix_store_lines(&node, &theme)),
+        "/nix 83%  .  160G free\n36 system generations  .  5 home  .  156 gc roots"
+    );
 }
 
 /// Absent is not empty. Before `/nix` has been matched among the sampled
@@ -1587,10 +2685,21 @@ fn an_unmeasured_store_reads_as_unknown_rather_than_as_zero() {
     };
     let lines = nix_store_lines(&node, &theme);
     assert_eq!(trimmed(&lines[0]), "/nix -  .  - free");
-    assert!(!trimmed(&lines[0]).contains("0%"), "{:?}", trimmed(&lines[0]));
-    assert!(!trimmed(&lines[0]).contains("0B"), "{:?}", trimmed(&lines[0]));
+    assert!(
+        !trimmed(&lines[0]).contains("0%"),
+        "{:?}",
+        trimmed(&lines[0])
+    );
+    assert!(
+        !trimmed(&lines[0]).contains("0B"),
+        "{:?}",
+        trimmed(&lines[0])
+    );
     // The counts beside them are real readings and still print as numbers.
-    assert_eq!(trimmed(&lines[1]), "36 system generations  .  5 home  .  156 gc roots");
+    assert_eq!(
+        trimmed(&lines[1]),
+        "36 system generations  .  5 home  .  156 gc roots"
+    );
 }
 
 /// The same rule for the three counts, against the sharper version of the
@@ -1604,9 +2713,17 @@ fn an_unmeasured_store_reads_as_unknown_rather_than_as_zero() {
 #[test]
 fn counts_that_were_never_read_print_as_unknown_rather_than_as_zero() {
     let theme = Theme::default();
-    let unread =
-        Node::NixStore { used_percent: Some(83.0), free_bytes: None, system_generations: None, home_generations: None, gc_roots: None };
-    assert_eq!(trimmed(&nix_store_lines(&unread, &theme)[1]), "- system generations  .  - home  .  - gc roots");
+    let unread = Node::NixStore {
+        used_percent: Some(83.0),
+        free_bytes: None,
+        system_generations: None,
+        home_generations: None,
+        gc_roots: None,
+    };
+    assert_eq!(
+        trimmed(&nix_store_lines(&unread, &theme)[1]),
+        "- system generations  .  - home  .  - gc roots"
+    );
 
     let measured = Node::NixStore {
         used_percent: Some(83.0),
@@ -1615,7 +2732,10 @@ fn counts_that_were_never_read_print_as_unknown_rather_than_as_zero() {
         home_generations: Some(0),
         gc_roots: Some(0),
     };
-    assert_eq!(trimmed(&nix_store_lines(&measured, &theme)[1]), "0 system generations  .  0 home  .  0 gc roots");
+    assert_eq!(
+        trimmed(&nix_store_lines(&measured, &theme)[1]),
+        "0 system generations  .  0 home  .  0 gc roots"
+    );
 }
 
 /// `^` is the warning tier's glyph everywhere in masys, and an input most
@@ -1624,14 +2744,35 @@ fn counts_that_were_never_read_print_as_unknown_rather_than_as_zero() {
 fn a_stale_input_is_marked_and_a_transitive_one_recedes() {
     let theme = Theme::default();
     let rows = [
-        (an_input("nixpkgs", Some("NixOS/nixpkgs"), Some(1_754_265_600), true), Some(17)),
-        (an_input("flake-compat", Some("edolstra/flake-compat"), Some(1_735_430_400), false), Some(235)),
+        (
+            an_input("nixpkgs", Some("NixOS/nixpkgs"), Some(1_754_265_600), true),
+            Some(17),
+        ),
+        (
+            an_input(
+                "flake-compat",
+                Some("edolstra/flake-compat"),
+                Some(1_735_430_400),
+                false,
+            ),
+            Some(235),
+        ),
     ];
     let lines = input_lines(&rows, &theme);
 
-    assert_eq!(tier(&lines[0]), ("  ".to_string(), Some(theme.info)), "a fresh input is not marked");
-    assert_eq!(tier(&lines[1]), ("^ ".to_string(), Some(theme.severity_warning)));
-    assert_eq!(lines[0].spans[1].style.fg, None, "an input this configuration names itself reads as ordinary text");
+    assert_eq!(
+        tier(&lines[0]),
+        ("  ".to_string(), Some(theme.info)),
+        "a fresh input is not marked"
+    );
+    assert_eq!(
+        tier(&lines[1]),
+        ("^ ".to_string(), Some(theme.severity_warning))
+    );
+    assert_eq!(
+        lines[0].spans[1].style.fg, None,
+        "an input this configuration names itself reads as ordinary text"
+    );
     assert_eq!(
         lines[1].spans[1].style.fg,
         Some(theme.info),
@@ -1650,8 +2791,15 @@ fn an_input_with_no_upstream_timestamp_shows_dashes_rather_than_1970() {
     let rendered = trimmed(line);
     assert!(!rendered.contains("1970"), "{rendered:?}");
     assert!(!rendered.contains("0d"), "{rendered:?}");
-    assert_eq!(rendered, "  nixos      -  -           -", "age, date and origin all shrug");
-    assert_eq!(tier(line), ("  ".to_string(), Some(theme.info)), "and a missing reading is never marked stale");
+    assert_eq!(
+        rendered, "  nixos      -  -           -",
+        "age, date and origin all shrug"
+    );
+    assert_eq!(
+        tier(line),
+        ("  ".to_string(), Some(theme.info)),
+        "and a missing reading is never marked stale"
+    );
 }
 
 /// The name column is measured, so a section of short names does not wear
@@ -1659,23 +2807,44 @@ fn an_input_with_no_upstream_timestamp_shows_dashes_rather_than_1970() {
 #[test]
 fn input_names_are_padded_to_the_widest_in_the_section() {
     let theme = Theme::default();
-    let short = [(an_input("nixpkgs", Some("NixOS/nixpkgs"), Some(1_754_265_600), true), Some(17))];
+    let short = [(
+        an_input("nixpkgs", Some("NixOS/nixpkgs"), Some(1_754_265_600), true),
+        Some(17),
+    )];
     let mixed = [
-        (an_input("nixpkgs", Some("NixOS/nixpkgs"), Some(1_754_265_600), true), Some(17)),
-        (an_input("nixos-hardware", Some("NixOS/nixos-hardware"), Some(1_754_265_600), true), Some(17)),
+        (
+            an_input("nixpkgs", Some("NixOS/nixpkgs"), Some(1_754_265_600), true),
+            Some(17),
+        ),
+        (
+            an_input(
+                "nixos-hardware",
+                Some("NixOS/nixos-hardware"),
+                Some(1_754_265_600),
+                true,
+            ),
+            Some(17),
+        ),
     ];
     let column = |lines: &[Line]| text(&lines[0]).find("17d").expect("an age column");
 
     let narrow = column(&input_lines(&short, &theme));
     let wide = column(&input_lines(&mixed, &theme));
-    assert!(wide > narrow, "the long name pushes the section's columns right: {wide} vs {narrow}");
+    assert!(
+        wide > narrow,
+        "the long name pushes the section's columns right: {wide} vs {narrow}"
+    );
     let lines = input_lines(&mixed, &theme);
-    assert_eq!(text(&lines[0]).find("17d"), text(&lines[1]).find("17d"), "and within a section both rows put the age in the same column");
+    assert_eq!(
+        text(&lines[0]).find("17d"),
+        text(&lines[1]).find("17d"),
+        "and within a section both rows put the age in the same column"
+    );
 }
 
 /// `keep 14d` comes from the configuration and the schedule from the
 /// timer unit, which is the whole reason this section exists rather than
-/// pointing at the Timers view.
+/// pointing at the Timers section.
 #[test]
 fn a_maintenance_job_shows_its_retention_and_its_schedule() {
     let theme = Theme::default();
@@ -1692,8 +2861,14 @@ fn a_job_with_no_retention_claims_none_rather_than_reporting_one_missing() {
     let theme = Theme::default();
     let line = trimmed(&nix_policy_lines(&[a_policy("optimise", None, true)], &theme)[0]);
     assert!(!line.contains("keep"), "{line:?}");
-    assert!(!line.contains('-'), "an absent policy is not an unread one: {line:?}");
-    assert!(line.contains("last 4d ago") && line.contains("next in 2d 4h"), "{line:?}");
+    assert!(
+        !line.contains('-'),
+        "an absent policy is not an unread one: {line:?}"
+    );
+    assert!(
+        line.contains("last 4d ago") && line.contains("next in 2d 4h"),
+        "{line:?}"
+    );
 }
 
 /// And the state the blank column was standing in for until now: a
@@ -1705,11 +2880,20 @@ fn a_job_with_no_retention_claims_none_rather_than_reporting_one_missing() {
 #[test]
 fn a_retention_that_was_never_read_prints_as_unknown() {
     let theme = Theme::default();
-    let unread = NixPolicyRow { retention: None, ..a_policy("gc", Some("14d"), true) };
+    let unread = NixPolicyRow {
+        retention: None,
+        ..a_policy("gc", Some("14d"), true)
+    };
     let line = trimmed(&nix_policy_lines(&[unread], &theme)[0]);
-    assert!(line.contains('-'), "an unread policy is not an absent one: {line:?}");
+    assert!(
+        line.contains('-'),
+        "an unread policy is not an absent one: {line:?}"
+    );
     assert!(!line.contains("keep"), "{line:?}");
-    assert!(line.contains("last 4d ago") && line.contains("next in 2d 4h"), "the schedule is a different reading: {line:?}");
+    assert!(
+        line.contains("last 4d ago") && line.contains("next in 2d 4h"),
+        "the schedule is a different reading: {line:?}"
+    );
 }
 
 /// A gc timer that is switched off is what this row is for: nothing else
@@ -1719,19 +2903,39 @@ fn a_disabled_maintenance_job_is_marked() {
     let theme = Theme::default();
     let line = &nix_policy_lines(&[a_policy("gc", Some("14d"), false)], &theme)[0];
     assert_eq!(tier(line), ("~ ".to_string(), Some(theme.severity_warning)));
-    assert_eq!(line.spans[1].style.fg, Some(theme.severity_warning), "the row carries it, not only the glyph");
+    assert_eq!(
+        line.spans[1].style.fg,
+        Some(theme.severity_warning),
+        "the row carries it, not only the glyph"
+    );
     assert!(trimmed(line).contains("disabled"), "{:?}", trimmed(line));
 }
 
 /// The job and retention columns are measured across the section, the
-/// same way the units view measures its name column.
+/// same way the systemd buffer measures its name column.
 #[test]
 fn the_policy_columns_are_measured_across_the_section() {
     let theme = Theme::default();
-    let both = nix_policy_lines(&[a_policy("gc", Some("14d"), true), a_policy("optimise", None, true)], &theme);
-    assert_eq!(trimmed(&both[0]), ". gc        keep 14d  last 4d ago       next in 2d 4h");
-    assert_eq!(trimmed(&both[1]), ". optimise            last 4d ago       next in 2d 4h");
-    assert_eq!(text(&both[0]).find("last"), text(&both[1]).find("last"), "both rows put the schedule in the same column");
+    let both = nix_policy_lines(
+        &[
+            a_policy("gc", Some("14d"), true),
+            a_policy("optimise", None, true),
+        ],
+        &theme,
+    );
+    assert_eq!(
+        trimmed(&both[0]),
+        ". gc        keep 14d  last 4d ago       next in 2d 4h"
+    );
+    assert_eq!(
+        trimmed(&both[1]),
+        ". optimise            last 4d ago       next in 2d 4h"
+    );
+    assert_eq!(
+        text(&both[0]).find("last"),
+        text(&both[1]).find("last"),
+        "both rows put the schedule in the same column"
+    );
 
     let alone = nix_policy_lines(&[a_policy("gc", Some("14d"), true)], &theme);
     assert_eq!(
@@ -1739,4 +2943,827 @@ fn the_policy_columns_are_measured_across_the_section() {
         ". gc  keep 14d  last 4d ago       next in 2d 4h",
         "a section of one is not padded to a job it does not have"
     );
+}
+
+/// A Debian `/boot`: kernels to reclaim, and no generations to count.
+///
+/// The line the second platform adapter exists to have produced correctly.
+/// `generations: None` prints nothing rather than `0 generations`, which
+/// is what a `u32` on the port would have forced - and `reclaimable_bytes`
+/// carries the half that host actually has, which had no reader anywhere
+/// until it had a producer.
+#[test]
+fn a_boot_with_kernels_and_no_generations_says_only_what_is_true() {
+    let theme = Theme::default();
+    let debian = Finding::new(FindingKind::DiskCapacity {
+        mount_point: "/boot".to_string(),
+        used_percent: 91.0,
+        free_bytes: 40 * (1u64 << 20),
+        generations: None,
+        reclaimable_bytes: Some(175 * (1u64 << 20)),
+    });
+    assert_eq!(
+        text(&finding_line(&finding_row(debian.clone()), &theme)),
+        "^ /boot  91%   40M free   .  175M reclaimable"
+    );
+}
+
+/// And a NixOS `/boot`, which has both.
+#[test]
+fn a_boot_with_generations_shows_the_count_and_the_saving() {
+    let theme = Theme::default();
+    let nixos = Finding::new(FindingKind::DiskCapacity {
+        mount_point: "/boot".to_string(),
+        used_percent: 88.0,
+        free_bytes: 61 * (1u64 << 20),
+        generations: Some(9),
+        reclaimable_bytes: Some(500 * (1u64 << 20)),
+    });
+    assert_eq!(
+        text(&finding_line(&finding_row(nixos.clone()), &theme)),
+        "^ /boot  88%   61M free   .  9 generations   .  500M reclaimable"
+    );
+}
+
+/// Nothing to reclaim says nothing: `0 B reclaimable` is a sentence about
+/// nothing, and the clause's absence already carries it.
+#[test]
+fn nothing_to_reclaim_adds_no_clause() {
+    let theme = Theme::default();
+    let clean = Finding::new(FindingKind::DiskCapacity {
+        mount_point: "/boot".to_string(),
+        used_percent: 88.0,
+        free_bytes: 61 * (1u64 << 20),
+        generations: Some(1),
+        reclaimable_bytes: Some(0),
+    });
+    assert_eq!(
+        text(&finding_line(&finding_row(clean.clone()), &theme)),
+        "^ /boot  88%   61M free   .  1 generations"
+    );
+}
+
+/// The name column is sized to the widest name, and the version follows it.
+///
+/// The Packages buffer had no render test at all until 2026-08-30: the
+/// two functions were built, wired into `render.rs` and never asserted
+/// on, so the column could have been any width and nothing would have
+/// said so.
+#[test]
+fn a_package_column_is_sized_to_the_widest_name() {
+    let theme = Theme::default();
+    let packages = [
+        Package {
+            name: "git".to_string(),
+            version: "2.55.0".to_string(),
+        },
+        Package {
+            name: "linux-firmware".to_string(),
+            version: "20250ave".to_string(),
+        },
+    ];
+    let lines = package_lines(&packages, &theme);
+
+    assert_eq!(lines.len(), 2);
+    let versions: Vec<usize> = lines
+        .iter()
+        .map(|line| {
+            text(line)
+                .find("2025")
+                .or_else(|| text(line).find("2.55"))
+                .unwrap()
+        })
+        .collect();
+    assert_eq!(
+        versions[0],
+        versions[1],
+        "both versions start in the same column: {:?}",
+        lines.iter().map(text).collect::<Vec<_>>()
+    );
+    assert!(
+        text(&lines[0]).starts_with("git "),
+        "the short name is padded out: {:?}",
+        text(&lines[0])
+    );
+}
+
+/// The column is padded by display *width*, not by `char` count.
+///
+/// `{:<n}` counts `char`s. A name carrying a wide character is fewer
+/// `char`s than it is columns, so the old padding overshot and the
+/// version column stepped right on exactly the rows a CJK package name
+/// appears in. `package_lines` measures with `.width()`, so the padding
+/// has to as well or the two disagree.
+#[test]
+fn a_wide_name_is_padded_by_width_rather_than_char_count() {
+    let theme = Theme::default();
+    // Four `char`s, eight columns wide.
+    let packages = [
+        Package {
+            name: "日本語入力".to_string(),
+            version: "1.0".to_string(),
+        },
+        Package {
+            name: "aaaaaaaaaa".to_string(),
+            version: "2.0".to_string(),
+        },
+    ];
+    let lines = package_lines(&packages, &theme);
+    let widths: Vec<usize> = lines
+        .iter()
+        .map(|line| {
+            let whole = text(line);
+            whole[..whole.rfind(char::is_numeric).unwrap()]
+                .trim_end()
+                .width()
+        })
+        .collect();
+
+    let starts: Vec<usize> = lines
+        .iter()
+        .map(|line| {
+            let whole = text(line);
+            let idx = whole.find(['1', '2']).unwrap();
+            whole[..idx].width()
+        })
+        .collect();
+    assert_eq!(
+        starts[0],
+        starts[1],
+        "the version column lines up across a wide name and an ascii one: {:?} widths {:?}",
+        lines.iter().map(text).collect::<Vec<_>>(),
+        widths
+    );
+}
+
+/// Three readings, three verdicts, three colours - and no leakage
+/// between them. A host stalling on CPU says so on the CPU segments and
+/// leaves memory alone.
+#[test]
+fn each_overview_segment_takes_the_colour_of_its_own_resource() {
+    let theme = Theme::default();
+    let overview = Overview {
+        cpu_percent: Some(Reading {
+            value: 94.0,
+            severity: Severity::Urgent,
+        }),
+        cpu_pressure: Some(Reading {
+            value: 61.0,
+            severity: Severity::Urgent,
+        }),
+        io_pressure: Some(Reading {
+            value: 4.0,
+            severity: Severity::Normal,
+        }),
+        memory_pressure: Some(Reading {
+            value: 1.0,
+            severity: Severity::Normal,
+        }),
+        ..memory_overview(Severity::Normal)
+    };
+    let lines = overview_lines(&overview, &theme);
+
+    assert_eq!(
+        segment_style(&lines, "cpu ").fg,
+        Some(theme.severity_urgent),
+        "the cpu utilisation segment"
+    );
+    assert_eq!(
+        segment_style(&lines, "cpu psi ").fg,
+        Some(theme.severity_urgent),
+        "and the figure it was judged on"
+    );
+    assert_ne!(
+        segment_style(&lines, "mem 27G").fg,
+        Some(theme.severity_urgent),
+        "cpu pressure is not memory's problem"
+    );
+    assert_ne!(
+        segment_style(&lines, "io ").fg,
+        Some(theme.severity_urgent),
+        "nor io's"
+    );
+}
+
+/// The PSI figures are there so a colour can be checked rather than
+/// trusted.
+#[test]
+fn the_pressure_figures_appear_beside_the_readings_they_judge() {
+    let theme = Theme::default();
+    let overview = Overview {
+        cpu_percent: Some(Reading {
+            value: 94.0,
+            severity: Severity::Warning,
+        }),
+        cpu_pressure: Some(Reading {
+            value: 61.0,
+            severity: Severity::Warning,
+        }),
+        io_pressure: Some(Reading {
+            value: 4.0,
+            severity: Severity::Normal,
+        }),
+        memory_pressure: Some(Reading {
+            value: 41.0,
+            severity: Severity::Warning,
+        }),
+        ..memory_overview(Severity::Warning)
+    };
+    let rendered: Vec<String> = overview_lines(&overview, &theme).iter().map(text).collect();
+    assert!(
+        rendered
+            .iter()
+            .any(|l| l == ". cpu psi 61%  .  io psi 4%  .  mem psi 41%"),
+        "{rendered:#?}"
+    );
+    assert!(
+        rendered.iter().any(|l| l.contains("cpu 94%")),
+        "{rendered:#?}"
+    );
+}
+
+/// A kernel with no PSI has no pressure line at all. Three zeroes would
+/// be the most confident wrong answer the header could give.
+#[test]
+fn a_host_without_psi_shows_no_pressure_line() {
+    let theme = Theme::default();
+    let rendered: Vec<String> = overview_lines(&memory_overview(Severity::Unknown), &theme)
+        .iter()
+        .map(text)
+        .collect();
+    assert!(!rendered.iter().any(|l| l.contains("psi")), "{rendered:#?}");
+}
+
+/// Utilisation is a derivative: one sample, no figure. Not `cpu 0%`,
+/// which is a claim about an idle machine.
+#[test]
+fn a_host_sampled_once_shows_no_cpu_figure() {
+    let theme = Theme::default();
+    let rendered: Vec<String> = overview_lines(&memory_overview(Severity::Normal), &theme)
+        .iter()
+        .map(text)
+        .collect();
+    assert!(
+        !rendered.iter().any(|l| l.contains("cpu ")),
+        "{rendered:#?}"
+    );
+}
+
+/// A failing disk is the least visible thing on this screen no longer.
+#[test]
+fn the_standing_warnings_are_drawn_as_warnings() {
+    let theme = Theme::default();
+    let overview = Overview {
+        clock_synced: Reading {
+            value: false,
+            severity: Severity::Urgent,
+        },
+        smart_ok: Some(Reading {
+            value: false,
+            severity: Severity::Urgent,
+        }),
+        pending_reboot: Some(Reading {
+            value: PendingReboot {
+                reason: "generation 412 not yet booted".to_string(),
+            },
+            severity: Severity::Warning,
+        }),
+        ..healthy_overview()
+    };
+    let lines = overview_lines(&overview, &theme);
+    assert_eq!(
+        segment_style(&lines, "clock not synced").fg,
+        Some(theme.severity_urgent)
+    );
+    assert_eq!(
+        segment_style(&lines, "smart failing").fg,
+        Some(theme.severity_urgent)
+    );
+    assert_eq!(
+        segment_style(&lines, "reboot pending").fg,
+        Some(theme.severity_warning)
+    );
+}
+
+/// And a healthy host's flags are not coloured, so the colour still
+/// means something when one of them is.
+#[test]
+fn a_healthy_flag_is_not_drawn_as_a_warning() {
+    let theme = Theme::default();
+    let overview = Overview {
+        smart_ok: Some(Reading {
+            value: true,
+            severity: Severity::Normal,
+        }),
+        ..healthy_overview()
+    };
+    let lines = overview_lines(&overview, &theme);
+    for segment in ["clock synced", "smart ok"] {
+        let style = segment_style(&lines, segment);
+        assert_ne!(style.fg, Some(theme.severity_urgent), "{segment}");
+        assert_ne!(style.fg, Some(theme.severity_warning), "{segment}");
+    }
+}
+
+/// Three states, three renderings. An unread disk is the one masys knows
+/// least about, and it must not borrow the appearance of either answer.
+#[test]
+fn an_unread_smart_status_looks_like_neither_answer() {
+    let theme = Theme::default();
+    let smart = |smart_ok| {
+        overview_lines(
+            &Overview {
+                smart_ok,
+                ..healthy_overview()
+            },
+            &theme,
+        )
+        .iter()
+        .map(text)
+        .collect::<Vec<_>>()
+        .join("\n")
+    };
+    let unread = smart(None);
+    assert!(!unread.contains("smart"), "{unread}");
+    assert!(
+        smart(Some(Reading {
+            value: true,
+            severity: Severity::Normal
+        }))
+        .contains("smart ok")
+    );
+    assert!(
+        smart(Some(Reading {
+            value: false,
+            severity: Severity::Urgent
+        }))
+        .contains("smart failing")
+    );
+}
+
+/// A header full of everything, at the width the design targets.
+fn crowded_overview() -> Overview {
+    Overview {
+        machine: Some(masys_domain::sample::Machine {
+            distro: "NixOS 26.11 (Xantusia)".to_string(),
+            kernel: "6.18.42".to_string(),
+            arch: "x86_64".to_string(),
+            cpu_model: "AMD Ryzen 9 5950X 16-Core Processor".to_string(),
+            cpu_cores: 32,
+        }),
+        load_1: Some(112.82),
+        load_5: Some(104.44),
+        load_15: Some(98.20),
+        uptime_secs: Some(1024 * 86_400 + 12 * 3600),
+        // A saturated 100-gigabit link and an array to match: the widest
+        // these figures get before the units roll over to terabytes.
+        net_throughput: Some(Throughput {
+            in_bytes_per_sec: 12_500_000_000.0,
+            out_bytes_per_sec: 12_500_000_000.0,
+        }),
+        disk_throughput: Some(Throughput {
+            in_bytes_per_sec: 999_000_000_000.0,
+            out_bytes_per_sec: 999_000_000_000.0,
+        }),
+        cpu_percent: Some(Reading {
+            value: 100.0,
+            severity: Severity::Urgent,
+        }),
+        cpu_pressure: Some(Reading {
+            value: 100.0,
+            severity: Severity::Urgent,
+        }),
+        io_pressure: Some(Reading {
+            value: 100.0,
+            severity: Severity::Urgent,
+        }),
+        memory_pressure: Some(Reading {
+            value: 100.0,
+            severity: Severity::Urgent,
+        }),
+        // A terabyte host: the widest the memory segment gets.
+        mem_used_bytes: Some(Reading {
+            value: 1_098_000_000_000,
+            severity: Severity::Urgent,
+        }),
+        mem_total_bytes: Some(1_099_511_627_776),
+        zram_percent: Some(100.0),
+        swap_free_bytes: Some(0),
+        // The longest spelling of both flags, and a reason at exactly
+        // `masys_platform_nixos::REASON_BUDGET` - which is the budget
+        // that adapter clips to, derived from this very line.
+        clock_synced: Reading {
+            value: false,
+            severity: Severity::Urgent,
+        },
+        smart_ok: Some(Reading {
+            value: false,
+            severity: Severity::Urgent,
+        }),
+        pending_reboot: Some(Reading {
+            value: PendingReboot {
+                reason: "generation 412 boot".to_string(),
+            },
+            severity: Severity::Warning,
+        }),
+        ..healthy_overview()
+    }
+}
+
+/// The three readings that are genuinely percentages get a bar; the
+/// quantities and the durations beside them do not.
+#[test]
+fn only_the_percentages_are_gauged() {
+    let theme = Theme::default();
+    let lines = overview_lines(&crowded_overview(), &theme);
+    for gauged in ["cpu ", "mem 1", "zram "] {
+        let segment = segment_text(&lines, gauged);
+        assert!(segment.contains('['), "{gauged:?} has no bar: {segment:?}");
+    }
+    // Load is a queue length with no ceiling, swap free is a quantity,
+    // and uptime is a duration. A bar on any of them would be drawn
+    // against a maximum nobody measured.
+    for bare in ["load ", "swap ", "up "] {
+        let segment = segment_text(&lines, bare);
+        assert!(
+            !segment.contains('['),
+            "{bare:?} was given a bar: {segment:?}"
+        );
+    }
+}
+
+/// The bar is part of its segment, so it cannot drift out of step with
+/// the colour of the figure it sits beside.
+#[test]
+fn a_bar_carries_the_severity_of_the_reading_it_draws() {
+    let theme = Theme::default();
+    let lines = overview_lines(&crowded_overview(), &theme);
+    let cpu = segment_text(&lines, "cpu ");
+    assert!(cpu.contains('['), "{cpu:?}");
+    assert_eq!(
+        segment_style(&lines, "cpu ").fg,
+        Some(theme.severity_urgent),
+        "the figure and its bar are one span"
+    );
+}
+
+/// An empty bar says "measured, and zero". A reading nobody took has no
+/// bar at all, because it has no segment at all.
+#[test]
+fn an_absent_reading_has_no_bar_and_a_zero_one_has_an_empty_bar() {
+    let theme = Theme::default();
+    let idle = Overview {
+        cpu_percent: Some(Reading {
+            value: 0.0,
+            severity: Severity::Normal,
+        }),
+        ..healthy_overview()
+    };
+    assert_eq!(
+        segment_text(&overview_lines(&idle, &theme), "cpu "),
+        "cpu 0% [--------]"
+    );
+
+    let unmeasured = overview_lines(&healthy_overview(), &theme);
+    assert!(
+        !unmeasured
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .any(|span| span.content.starts_with("cpu ")),
+        "an unmeasured cpu has nothing to draw: {unmeasured:#?}"
+    );
+}
+
+/// The design targets eighty columns, and this is the row most at risk of
+/// outgrowing them: every segment present, on a terabyte host that has
+/// been up for years.
+#[test]
+fn the_overview_fits_eighty_columns_with_everything_present() {
+    let theme = Theme::default();
+    for line in overview_lines(&crowded_overview(), &theme) {
+        let rendered = text(&line);
+        assert!(
+            UnicodeWidthStr::width(rendered.as_str()) <= 80 - 2 - 2,
+            "{} columns: {rendered:?}",
+            UnicodeWidthStr::width(rendered.as_str())
+        );
+    }
+}
+
+/// Swap shares the pressure line and has no PSI of its own, so every
+/// segment on that line names its own reading. The line was headed `psi`
+/// once, which made the swap quantity beside it read as a fourth
+/// pressure resource.
+#[test]
+fn the_swap_quantity_does_not_read_as_a_pressure_resource() {
+    let theme = Theme::default();
+    let rendered: Vec<String> = overview_lines(&crowded_overview(), &theme)
+        .iter()
+        .map(text)
+        .collect();
+    let pressure_line = rendered
+        .iter()
+        .find(|line| line.contains("psi"))
+        .expect("a pressure line");
+    assert_eq!(
+        pressure_line,
+        ". cpu psi 100%  .  io psi 100%  .  mem psi 100%  .  swap 0B free"
+    );
+    assert!(
+        !pressure_line.contains("psi cpu"),
+        "the line is not headed `psi`: {pressure_line}"
+    );
+}
+
+/// What the machine is moving, in both directions and both kinds of
+/// pipe.
+#[test]
+fn throughput_reaches_the_header_in_both_directions() {
+    let theme = Theme::default();
+    let overview = Overview {
+        net_throughput: Some(Throughput {
+            in_bytes_per_sec: 1_258_291.0,
+            out_bytes_per_sec: 348_160.0,
+        }),
+        disk_throughput: Some(Throughput {
+            in_bytes_per_sec: 12_582_912.0,
+            out_bytes_per_sec: 4_194_304.0,
+        }),
+        ..healthy_overview()
+    };
+    let lines: Vec<String> = overview_lines(&overview, &theme).iter().map(text).collect();
+    assert!(
+        lines
+            .iter()
+            .any(|l| l == ". net 1.2M/s in  340K/s out  .  disk 12M/s in  4.0M/s out"),
+        "{lines:#?}"
+    );
+}
+
+/// Neither segment carries a severity, and the type is what says so:
+/// there is no threshold for "too much traffic", and a host saturating
+/// its NIC during a backup is working rather than failing.
+#[test]
+fn throughput_carries_no_severity() {
+    let theme = Theme::default();
+    let overview = Overview {
+        net_throughput: Some(Throughput {
+            in_bytes_per_sec: 1_258_291_200.0,
+            out_bytes_per_sec: 1_258_291_200.0,
+        }),
+        disk_throughput: Some(Throughput {
+            in_bytes_per_sec: 1_258_291_200.0,
+            out_bytes_per_sec: 1_258_291_200.0,
+        }),
+        ..healthy_overview()
+    };
+    let lines = overview_lines(&overview, &theme);
+    for segment in ["net ", "disk "] {
+        assert_eq!(
+            segment_style(&lines, segment).fg,
+            Some(theme.info),
+            "{segment} at a gigabyte a second is still just a reading"
+        );
+    }
+}
+
+/// A host sampled once has no throughput, and shows none. `0B/s` there
+/// would say the machine is moving nothing, which is a different claim
+/// from nobody having measured - and the one that is never true at
+/// startup.
+#[test]
+fn a_host_sampled_once_shows_no_throughput_rather_than_zero() {
+    let theme = Theme::default();
+    let unmeasured: Vec<String> = overview_lines(&healthy_overview(), &theme)
+        .iter()
+        .map(text)
+        .collect();
+    assert!(
+        !unmeasured
+            .iter()
+            .any(|l| l.contains("net ") || l.contains("disk ")),
+        "{unmeasured:#?}"
+    );
+
+    // And a measured idle machine says so, rather than going blank the
+    // way the device rows do.
+    let idle = Overview {
+        net_throughput: Some(Throughput::default()),
+        disk_throughput: Some(Throughput::default()),
+        ..healthy_overview()
+    };
+    let lines: Vec<String> = overview_lines(&idle, &theme).iter().map(text).collect();
+    assert!(
+        lines
+            .iter()
+            .any(|l| l == ". net 0B/s in  0B/s out  .  disk 0B/s in  0B/s out"),
+        "{lines:#?}"
+    );
+}
+
+/// A section holding both kinds of recent error lines them up.
+///
+/// The unit column is what an operator scans, so a row with no unit has
+/// to leave the column empty rather than skip it - otherwise its message
+/// sits a whole column to the left of every labelled one, and the eye
+/// reads two lists.
+#[test]
+fn a_recent_error_with_no_unit_still_lines_up_with_the_ones_that_have_one() {
+    let theme = Theme::default();
+    let findings = [
+        Finding::new(FindingKind::RecentError {
+            unit: Some("sshd.service".to_string()),
+            message: "too many authentication failures".to_string(),
+            count: 12,
+            age_ms: 780_000,
+        }),
+        Finding::new(FindingKind::RecentError {
+            unit: None,
+            message: "session opened for user root".to_string(),
+            count: 1,
+            age_ms: 60_000,
+        }),
+    ];
+    let lines: Vec<String> = finding_lines(
+        &findings
+            .iter()
+            .cloned()
+            .map(finding_row)
+            .collect::<Vec<_>>(),
+        &theme,
+    )
+    .iter()
+    .map(text)
+    .collect();
+    let at = |line: &str, needle: &str| {
+        UnicodeWidthStr::width(&line[..line.find(needle).expect("the message")])
+    };
+    assert_eq!(
+        at(&lines[0], "too many"),
+        at(&lines[1], "session opened"),
+        "{lines:#?}"
+    );
+}
+
+/// A repeat count appears only when something repeated. `x1` on every
+/// row would make the rows that did repeat harder to find, not easier.
+#[test]
+fn a_repeat_count_is_shown_only_when_a_line_repeated() {
+    let theme = Theme::default();
+    let once = Finding::new(FindingKind::KernelError {
+        message: "EXT4-fs error".to_string(),
+        count: 1,
+        age_ms: 1_000,
+    });
+    let many = Finding::new(FindingKind::KernelError {
+        message: "EXT4-fs error".to_string(),
+        count: 12,
+        age_ms: 1_000,
+    });
+    assert!(!text(&finding_lines(&[finding_row(once)], &theme)[0]).contains('x'));
+    assert!(text(&finding_lines(&[finding_row(many)], &theme)[0]).contains("x12"));
+}
+
+/// masys's own blind spot reads as a warning, not as a fault of the
+/// host - and says what went wrong and for how long.
+#[test]
+fn an_unreadable_journal_reads_as_a_warning_about_the_instrument() {
+    let theme = Theme::default();
+    let line = &finding_lines(
+        &[finding_row(Finding::new(FindingKind::Unreadable {
+            source: masys_domain::finding::UnreadableSource::Journal,
+            reason: "journalctl: not found".to_string(),
+            since_ms: 240_000,
+        }))],
+        &theme,
+    )[0];
+    let rendered = text(line);
+    assert!(rendered.starts_with("~ "), "{rendered:?}");
+    assert_eq!(line.spans[0].style.fg, Some(theme.severity_warning));
+    assert!(rendered.contains("journal"), "{rendered:?}");
+    assert!(
+        rendered.contains("journalctl: not found"),
+        "there is something to act on: {rendered:?}"
+    );
+    assert!(rendered.contains("4m"), "and how long: {rendered:?}");
+}
+
+/// An uncounted host says so, in the same `-` every other unmeasured
+/// reading here uses.
+#[test]
+fn an_uncounted_unit_list_renders_as_a_dash_rather_than_zero() {
+    let theme = Theme::default();
+    let uncounted = Overview {
+        unit_count: None,
+        ..healthy_overview()
+    };
+    let lines: Vec<String> = overview_lines(&uncounted, &theme)
+        .iter()
+        .map(text)
+        .collect();
+    assert!(lines.iter().any(|l| l.contains("- units")), "{lines:#?}");
+    assert!(!lines.iter().any(|l| l.contains("0 units")), "{lines:#?}");
+}
+
+/// **The IO heading says which way it is sorted, like the other three.**
+///
+/// #23 asked that "the header names the column the way it names cpu and
+/// memory". It was the one column built without `mark`, so pressing `i`
+/// twice reordered the rows and nothing on screen said so - and on a
+/// machine where reversing the order barely moves anything, the marker is
+/// the only feedback there is.
+///
+/// Split into `READ/s` and `WRITE/s`, both carry it, for the reason
+/// `proc_columns_header` gives.
+#[test]
+fn the_io_heading_says_which_way_it_is_sorted() {
+    let narrow = ProcColumns::fit(65);
+    assert!(!narrow.split_io, "65 columns is the single IO/s layout");
+    assert!(
+        proc_columns_header(masys_view::ProcSort::Io, true, &narrow).contains("IO/sv"),
+        "descending"
+    );
+    assert!(
+        proc_columns_header(masys_view::ProcSort::Io, false, &narrow).contains("IO/s^"),
+        "and ascending, so pressing the key again shows"
+    );
+    // Both glyphs, because the sort here is descending and only `v` can
+    // appear: checking for `^` alone would pass against an implementation
+    // that marked IO under every sort.
+    let cpu_sorted = proc_columns_header(masys_view::ProcSort::Cpu, true, &narrow);
+    assert!(
+        cpu_sorted.contains("IO/s")
+            && !cpu_sorted.contains("IO/sv")
+            && !cpu_sorted.contains("IO/s^"),
+        "unmarked when something else is the sort: {cpu_sorted}"
+    );
+
+    let wide = ProcColumns::fit(100);
+    assert!(wide.split_io, "100 columns splits read from write");
+    let split = proc_columns_header(masys_view::ProcSort::Io, true, &wide);
+    assert!(
+        split.contains("READ/sv") && split.contains("WRITE/sv"),
+        "the sort is over the pair's total, so both headings carry it: {split}"
+    );
+
+    assert_eq!(
+        split.width(),
+        proc_columns_header(masys_view::ProcSort::Cpu, true, &wide).width(),
+        "and turning the marker on shifts nothing, the rule the other three follow"
+    );
+    // Pinned, because it is a decision rather than an accident: the two
+    // marked headings meet with no gap, and the alternative - widening
+    // the pair - would shift every column after it on every host.
+    assert!(
+        split.contains(" READ/svWRITE/sv"),
+        "the marked pair abuts, which is what fitting inside the existing \
+         width costs: {split}"
+    );
+}
+
+/// `Overview::parts` decides how many rows the System section has, and
+/// this file renders them. They are two crates apart, so the agreement
+/// between them is the thing to hold: a part named but drawing nothing
+/// is a blank row the cursor can land on, and a part drawing something
+/// but never named is a reading the operator never sees.
+///
+/// Both directions, over hosts that answered different amounts - which
+/// is the axis that decides presence.
+#[test]
+fn every_part_that_is_named_draws_something_and_every_part_that_draws_is_named() {
+    let theme = Theme::default();
+    let empty = Overview {
+        machine: None,
+        ..healthy_overview()
+    };
+    let hosts = [
+        ("healthy", healthy_overview()),
+        ("nothing answered", empty),
+        (
+            "no machine, but figures",
+            Overview {
+                machine: None,
+                ..healthy_overview()
+            },
+        ),
+    ];
+    for (label, overview) in hosts {
+        let named = overview.parts();
+        for part in OverviewPart::ALL.iter().copied() {
+            let drawn = !overview_part_line(&overview, part, &theme)
+                .spans
+                .iter()
+                // Every line opens with the `. ` lead-in, so a part that
+                // built no segments still has one span. What says it drew
+                // nothing is that no span carries text of its own.
+                .any(|span| !span.content.trim().is_empty() && span.content.trim() != ".");
+            assert_eq!(
+                named.contains(&part),
+                !drawn,
+                "{label}: `{part:?}` is named={} but draws={}",
+                named.contains(&part),
+                !drawn
+            );
+        }
+    }
 }

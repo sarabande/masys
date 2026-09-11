@@ -33,7 +33,10 @@ fn a_changed_active_state_invalidates_it() {
 
 #[test]
 fn a_unit_never_seen_has_nothing() {
-    assert_eq!(StateStamps::default().get("nope.service", "active", "running"), None);
+    assert_eq!(
+        StateStamps::default().get("nope.service", "active", "running"),
+        None
+    );
 }
 
 /// A host that churns transient units must not grow this map without

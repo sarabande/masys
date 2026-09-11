@@ -28,7 +28,8 @@ pub fn parse_cgroup(text: &str) -> Option<String> {
         // `hierarchy-ID:controller-list:path`, and the path may itself
         // contain colons, so split only twice from the left.
         let mut parts = line.splitn(3, ':');
-        let (Some(_id), Some(controllers), Some(path)) = (parts.next(), parts.next(), parts.next()) else {
+        let (Some(_id), Some(controllers), Some(path)) = (parts.next(), parts.next(), parts.next())
+        else {
             continue;
         };
         if path.is_empty() {

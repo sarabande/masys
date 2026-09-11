@@ -88,14 +88,29 @@ fn renicing_our_own_process_succeeds() {
 
 /// The EPERM path, which reads very differently to an operator than
 /// ESRCH: the process is still there, masys is just not allowed to touch
-/// it. Skipped when running as root, where it would genuinely signal pid
-/// 1 - and the point of this test is not to send a signal that lands.
+/// it. The point of this test is a signal that does *not* land, so it
+/// runs only where pid 1 genuinely belongs to somebody else.
+///
+/// That precondition is read rather than inferred. `getuid() != 0` was
+/// the proxy here until a Nix build sandbox failed on it: inside a PID
+/// namespace pid 1 is the build process, owned by the same unprivileged
+/// user, so the signal lands and the `expect_err` panics. Asking who owns
+/// `/proc/1` is the same question the test actually depends on, and it is
+/// answerable - which is the rule the rest of this tree is held to.
 #[test]
 fn signalling_another_users_process_says_it_is_not_permitted() {
+    use std::os::unix::fs::MetadataExt;
+
     // SAFETY: getuid takes no arguments and cannot fail.
-    if unsafe { libc::getuid() } == 0 {
+    let us = unsafe { libc::getuid() };
+    let init_owner = std::fs::metadata("/proc/1").map(|meta| meta.uid());
+    // An unreadable `/proc/1` is not a failure to report: it is a host
+    // this test cannot ask its question on.
+    let Ok(owner) = init_owner else { return };
+    if owner == us {
         return;
     }
-    let err = kill(1, Signal::Hup).expect_err("pid 1 belongs to root");
+
+    let err = kill(1, Signal::Hup).expect_err("pid 1 belongs to another user");
     assert!(format!("{err}").contains("not permitted"), "{err}");
 }

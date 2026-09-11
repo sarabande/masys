@@ -76,7 +76,12 @@ impl TransientDef {
                     rows: group
                         .rows
                         .iter()
-                        .map(|row| ActionRow { chord: row.chord, label: row.label, note: row.note.clone(), dimmed: row.dimmed })
+                        .map(|row| ActionRow {
+                            chord: row.chord,
+                            label: row.label,
+                            note: row.note.clone(),
+                            dimmed: row.dimmed,
+                        })
                         .collect(),
                 })
                 .collect(),
@@ -91,7 +96,11 @@ impl TransientDef {
     /// confirmation", and a lookup that skipped it would quietly make the
     /// mark mean something else.
     pub fn action(&self, chord: char) -> Option<Action> {
-        self.groups.iter().flat_map(|group| &group.rows).find(|row| row.chord == chord).map(|row| row.action)
+        self.groups
+            .iter()
+            .flat_map(|group| &group.rows)
+            .find(|row| row.chord == chord)
+            .map(|row| row.action)
     }
 
     /// Flips the switch this chord names, and says whether it found one.
@@ -102,7 +111,11 @@ impl TransientDef {
     /// defines switches yet, and the transient that first does owes its
     /// switches letters its actions do not use.
     pub fn toggle(&mut self, chord: char) -> bool {
-        match self.switches.iter_mut().find(|switch| switch.chord.ends_with(chord) && switch.supported) {
+        match self
+            .switches
+            .iter_mut()
+            .find(|switch| switch.chord.ends_with(chord) && switch.supported)
+        {
             Some(switch) => {
                 switch.on = !switch.on;
                 true

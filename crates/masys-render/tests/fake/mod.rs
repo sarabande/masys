@@ -12,8 +12,8 @@
 //! `unimplemented!()`, same convention as the domain crate's fake.
 
 use masys_domain::error::MasysError;
-use masys_domain::journal::Entry;
-use masys_domain::platform::{BootPressure, Ownership, Package, PendingReboot, PlatformId, UpdateStatus};
+use masys_domain::journal::{Entry, Priority};
+use masys_domain::platform::{BootPressure, Ownership, PendingReboot, PlatformId};
 use masys_domain::sample::Snapshot;
 use masys_domain::service::{IoNiceClass, PlatformService, Signal, SystemService};
 use masys_domain::unit::Unit;
@@ -32,7 +32,11 @@ impl FakeSystemService {
     /// queue runs dry.
     pub fn returning(snapshots: Vec<Snapshot>) -> Self {
         let first = snapshots.first().expect("at least one snapshot").clone();
-        Self { snapshot: first, units: Vec::new(), queued: std::cell::RefCell::new(snapshots) }
+        Self {
+            snapshot: first,
+            units: Vec::new(),
+            queued: std::cell::RefCell::new(snapshots),
+        }
     }
 }
 
@@ -77,13 +81,27 @@ impl SystemService for FakeSystemService {
         Ok(Vec::new())
     }
 
+    /// Nothing logged, for the same reason `unit_journal` answers
+    /// nothing here: these tests are about how rows are drawn, and a
+    /// host with no journal draws exactly as one did before the Status
+    /// buffer read it.
+    fn journal(&self, _since_ms: u64, _min_priority: Priority) -> Result<Vec<Entry>, MasysError> {
+        Ok(Vec::new())
+    }
+
     /// Whatever the test configured, or nothing. A unit's detail is
     /// read on demand, so most tests never look at it.
     fn unit_detail(&self, unit: &str) -> Result<masys_domain::unit::UnitDetail, MasysError> {
-        Ok(masys_domain::unit::UnitDetail { description: Some(format!("{unit} description")), ..Default::default() })
+        Ok(masys_domain::unit::UnitDetail {
+            description: Some(format!("{unit} description")),
+            ..Default::default()
+        })
     }
     fn proc_detail(&self, pid: u32) -> Result<masys_domain::proc_detail::ProcDetail, MasysError> {
-        Ok(masys_domain::proc_detail::ProcDetail { cmdline: Some(format!("/usr/bin/fake --pid {pid}")), ..Default::default() })
+        Ok(masys_domain::proc_detail::ProcDetail {
+            cmdline: Some(format!("/usr/bin/fake --pid {pid}")),
+            ..Default::default()
+        })
     }
     fn start(&self, _unit: &str) -> Result<(), MasysError> {
         unimplemented!("no App method dispatches unit actions yet")
@@ -143,12 +161,6 @@ pub struct FakePlatformService {
 impl PlatformService for FakePlatformService {
     fn id(&self) -> PlatformId {
         PlatformId::Unsupported
-    }
-    fn packages(&self) -> Result<Vec<Package>, MasysError> {
-        unimplemented!("no App method reads packages yet")
-    }
-    fn updates(&self) -> Result<UpdateStatus, MasysError> {
-        unimplemented!("no App method reads updates yet")
     }
     fn pending_reboot(&self) -> Result<Option<PendingReboot>, MasysError> {
         Ok(self.pending_reboot.clone())

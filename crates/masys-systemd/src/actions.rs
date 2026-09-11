@@ -54,7 +54,9 @@ fn last_error(what: &str, pid: u32) -> MasysError {
     // masys is not allowed to touch it.
     MasysError::Command(match e.raw_os_error() {
         Some(libc::ESRCH) => format!("{what}: process {pid} no longer exists"),
-        Some(libc::EPERM) => format!("{what}: not permitted for process {pid} - it belongs to another user"),
+        Some(libc::EPERM) => {
+            format!("{what}: not permitted for process {pid} - it belongs to another user")
+        }
         _ => format!("{what}: process {pid}: {e}"),
     })
 }
@@ -68,7 +70,9 @@ pub fn kill(pid: u32, signal: Signal) -> Result<(), MasysError> {
     // whole process group, so a zero pid is refused here rather than
     // passed through.
     if pid == 0 {
-        return Err(MasysError::Command("kill: refusing to signal the entire process group".to_string()));
+        return Err(MasysError::Command(
+            "kill: refusing to signal the entire process group".to_string(),
+        ));
     }
     if unsafe { libc::kill(pid as libc::pid_t, signal_number(signal)) } != 0 {
         return Err(last_error("kill", pid));
@@ -93,7 +97,14 @@ pub fn ionice(pid: u32, class: IoNiceClass, level: i32) -> Result<(), MasysError
     const IOPRIO_WHO_PROCESS: libc::c_int = 1;
     // SAFETY: `ioprio_set` has no libc wrapper, so it goes through
     // `syscall` directly. Three integer arguments, no memory touched.
-    let result = unsafe { libc::syscall(libc::SYS_ioprio_set, IOPRIO_WHO_PROCESS, pid as libc::c_int, ioprio_value(class, level)) };
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_ioprio_set,
+            IOPRIO_WHO_PROCESS,
+            pid as libc::c_int,
+            ioprio_value(class, level),
+        )
+    };
     if result != 0 {
         return Err(last_error("ionice", pid));
     }
@@ -123,7 +134,11 @@ pub fn systemctl(verb: &str, unit: &str) -> Result<(), MasysError> {
         return Ok(());
     }
     let message = String::from_utf8_lossy(&output.stderr).trim().to_string();
-    Err(MasysError::Command(if message.is_empty() { format!("systemctl {verb} {unit} failed") } else { message }))
+    Err(MasysError::Command(if message.is_empty() {
+        format!("systemctl {verb} {unit} failed")
+    } else {
+        message
+    }))
 }
 
 /// Runs a `systemctl` verb that takes over the terminal.
@@ -150,5 +165,8 @@ pub fn systemctl_interactive(verb: &str, unit: &str) -> Result<(), MasysError> {
     if status.success() {
         return Ok(());
     }
-    Err(MasysError::Command(format!("systemctl {verb} {unit} exited {}", status.code().unwrap_or(-1))))
+    Err(MasysError::Command(format!(
+        "systemctl {verb} {unit} exited {}",
+        status.code().unwrap_or(-1)
+    )))
 }

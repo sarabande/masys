@@ -19,8 +19,12 @@ fn generation_id_rejects_the_profile_link_and_foreign_names() {
 
 #[test]
 fn version_label_reads_what_follows_the_host_name() {
-    let path = "/nix/store/iqmqj06r37ma91cvp1xhw281vjv0kqln-nixos-system-devbox-26.11.20260804.e72e4f2";
-    assert_eq!(version_label(path).as_deref(), Some("26.11.20260804.e72e4f2"));
+    let path =
+        "/nix/store/iqmqj06r37ma91cvp1xhw281vjv0kqln-nixos-system-devbox-26.11.20260804.e72e4f2";
+    assert_eq!(
+        version_label(path).as_deref(),
+        Some("26.11.20260804.e72e4f2")
+    );
 }
 
 /// The home profile's store paths are a bare `-profile` with no version in
@@ -28,7 +32,10 @@ fn version_label_reads_what_follows_the_host_name() {
 /// the row that no part of the system agrees with.
 #[test]
 fn version_label_is_absent_where_the_path_carries_none() {
-    assert_eq!(version_label("/nix/store/ym3jcfahrwr7nr8pkikcwmfnniwbnws7-profile"), None);
+    assert_eq!(
+        version_label("/nix/store/ym3jcfahrwr7nr8pkikcwmfnniwbnws7-profile"),
+        None
+    );
     assert_eq!(version_label(""), None);
 }
 
@@ -38,7 +45,10 @@ fn version_label_is_absent_where_the_path_carries_none() {
 #[test]
 fn version_label_survives_a_hyphenated_host_name() {
     let path = "/nix/store/iqmqj06r37ma91cvp1xhw281vjv0kqln-nixos-system-web-server-26.11.20260804.e72e4f2";
-    assert_eq!(version_label(path).as_deref(), Some("26.11.20260804.e72e4f2"));
+    assert_eq!(
+        version_label(path).as_deref(),
+        Some("26.11.20260804.e72e4f2")
+    );
 }
 
 /// A host name ending in digits, on a path that carries no real version

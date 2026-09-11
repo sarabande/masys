@@ -11,10 +11,13 @@ pub mod links;
 pub mod ops;
 pub mod profiles;
 
-use masys_domain::declarative::{DeclarativeService, HomeMode, Input, InputSource, Inputs, NixOp, Profile, ProfileKind, RebootState};
+use masys_domain::declarative::{
+    DeclarativeService, HomeMode, Input, InputSource, Inputs, NixOp, Profile, ProfileKind,
+    RebootState,
+};
 use masys_domain::error::MasysError;
-use masys_domain::platform::{BootPressure, Ownership, Package, PendingReboot, PlatformId, UpdateStatus};
-use masys_domain::service::PlatformService;
+use masys_domain::platform::{BootPressure, Ownership, Package, PendingReboot, PlatformId};
+use masys_domain::service::{PackageService, PlatformService};
 
 /// Where NixOS keeps everything it manages. A unit whose definition
 /// resolves in here is generated from configuration.
@@ -36,7 +39,11 @@ const CHANNELS: &str = "/nix/var/nix/profiles/per-user/root";
 /// enable succeed and then quietly undo it on the next rebuild - which
 /// needs a different warning from one that refuses immediately.
 fn wants_writable() -> bool {
-    std::path::Path::new(UNIT_DIR).join("multi-user.target.wants").metadata().map(|meta| !meta.permissions().readonly()).unwrap_or(false)
+    std::path::Path::new(UNIT_DIR)
+        .join("multi-user.target.wants")
+        .metadata()
+        .map(|meta| !meta.permissions().readonly())
+        .unwrap_or(false)
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -47,7 +54,11 @@ pub struct NixosPlatform;
 /// The ID field rather than PRETTY_NAME: it is the stable machine-readable
 /// one, and PRETTY_NAME carries a version and a codename that change.
 pub fn is_nixos(os_release: &str) -> bool {
-    os_release.lines().find_map(|line| line.strip_prefix("ID=")).map(|value| value.trim().trim_matches('"') == "nixos").unwrap_or(false)
+    os_release
+        .lines()
+        .find_map(|line| line.strip_prefix("ID="))
+        .map(|value| value.trim().trim_matches('"') == "nixos")
+        .unwrap_or(false)
 }
 
 /// Whether a unit's definition lives in the nix store, given the path
@@ -62,22 +73,205 @@ pub fn is_store_managed(fragment_path: &str) -> bool {
     if fragment_path.is_empty() {
         return false;
     }
-    std::fs::canonicalize(fragment_path).map(|resolved| resolved.starts_with(STORE)).unwrap_or_else(|_| fragment_path.starts_with(STORE))
+    std::fs::canonicalize(fragment_path)
+        .map(|resolved| resolved.starts_with(STORE))
+        .unwrap_or_else(|_| fragment_path.starts_with(STORE))
+}
+
+/// What this host's generations say about `/boot`, given the profiles
+/// already read.
+///
+/// **Half of `BootPressure`, deliberately.** `generations` is answered and
+/// `reclaimable_bytes` is `None`, which is the opposite of what the Debian
+/// adapter fills in - and the reason is the same one in both directions:
+/// each adapter answers only the half it can measure.
+///
+/// NixOS can count generations, because `/nix/var/nix/profiles` is
+/// world-readable. It cannot measure what they occupy in `/boot`, because
+/// a default NixOS install mounts the ESP `umask=0077` and an unprivileged
+/// masys cannot read the directory at all.
+///
+/// **And the store sizes it *can* read answer a different question.** A
+/// generation's kernel and initrd are store paths, and generations share
+/// them: on the development host, thirty-five generations reference three
+/// distinct kernel/initrd pairs. Summing per generation gives 2.03 GB
+/// against a deduplicated 102 MB - a twenty-fold overcount - and `/boot`
+/// itself holds 59 MB, because the bootloader keeps far fewer entries than
+/// the profile keeps generations. Three numbers, none of them the one
+/// being asked for. `None` is the only honest answer until masys can read
+/// the ESP.
+///
+/// `None` overall for a single generation: one is a freshly installed host
+/// or one collected an hour ago, not a finding.
+pub fn boot_pressure_from(profiles: &[Profile]) -> Option<BootPressure> {
+    let count = profiles
+        .iter()
+        .find(|profile| profile.kind == ProfileKind::System)?
+        .generations
+        .len();
+    match count {
+        0 | 1 => None,
+        count => Some(BootPressure {
+            generations: Some(count as u32),
+            reclaimable_bytes: None,
+        }),
+    }
+}
+
+/// Where the system's binaries are collected, each a symlink into the
+/// store path of whatever provides it.
+const SYSTEM_PATH_BIN: &str = "/run/current-system/sw/bin";
+
+/// A store directory name, exactly as `/nix/store` spells it, split into
+/// package and version.
+///
+/// The boundary is the first `-` that is **not followed by a letter**,
+/// which is `builtins.parseDrvName`'s rule as nix actually implements it.
+/// Both simpler readings lose a real name on this host: the *first* `-`
+/// outright cuts `python3.13-setuptools-80.9.0` after `python3.13`, and
+/// the last `-` a digit follows cuts `rust-analyzer-2026-06-15` after
+/// `2026-06` and `sox-14.4.2-unstable-2021-05-09` after `…-05`. Nix's
+/// rule keeps `python3.13-setuptools` whole *and* gives those two their
+/// dates, because "followed by a letter" is what distinguishes a hyphen
+/// inside a name from the one before a version.
+///
+/// Takes the hash prefix and the output suffix off first, so a caller
+/// hands over the directory name and nothing else.
+///
+/// `None` where no such boundary exists. `system-path` and `man-pages` are
+/// real entries in a system closure and neither carries a version - better
+/// absent from the list than listed with one invented.
+pub fn parse_store_name(dir: &str) -> Option<Package> {
+    let dir = strip_output(strip_hash(dir));
+    let bytes = dir.as_bytes();
+    let split = dir
+        .char_indices()
+        .find(|(i, c)| *c == '-' && bytes.get(i + 1).is_some_and(|b| !b.is_ascii_alphabetic()))?;
+    Some(Package {
+        name: dir[..split.0].to_string(),
+        version: dir[split.0 + 1..].to_string(),
+    })
+}
+
+/// Every package named by a list of store directory names, deduplicated
+/// and sorted.
+///
+/// Deduplicated because the input is one entry per *binary*: the system
+/// path on the development host holds 1408 of them resolving to 268 store
+/// paths, 267 distinct directory names, and 254 packages once the eleven
+/// versionless entries are dropped and the outputs folded together.
+/// `util-linux` supplies 119 of those binaries on its own and
+/// `uutils-coreutils` 108, so a list built without this reports them once
+/// per binary they provide.
+///
+/// Re-measured 2026-08-30. This comment previously said `106` store paths
+/// with `coreutils` as the top contributor, and neither was the reading.
+pub fn packages_from(store_dirs: &[String]) -> Vec<Package> {
+    let mut packages: Vec<Package> = store_dirs
+        .iter()
+        .filter_map(|dir| parse_store_name(dir))
+        .collect();
+    packages.sort();
+    packages.dedup();
+    packages
+}
+
+/// A store directory name without its output suffix.
+///
+/// nix names a multi-output derivation's directories `acl-2.4.0-bin`,
+/// `acl-2.4.0-lib` and so on, and the system path links binaries from the
+/// `bin` output of eighteen packages on the development host. Left alone
+/// they parse as a *version* of `2.4.0-bin`, which is not a version, and
+/// the package appears once per output it happens to contribute.
+///
+/// Only the names nix itself uses for outputs. A suffix this does not know
+/// is left on, because the alternative - trimming anything after the last
+/// `-` - would cut real versions like `13.3.0-rc1`.
+fn strip_output(dir: &str) -> &str {
+    ["-bin", "-lib", "-dev", "-man", "-doc", "-info", "-out"]
+        .iter()
+        .find_map(|suffix| dir.strip_suffix(suffix))
+        .unwrap_or(dir)
+}
+
+/// A store directory name without its hash: `<32 chars>-` prefix removed.
+///
+/// The 32 characters have to *be* a hash, not merely be 32 characters
+/// followed by a `-`. Nix writes them in its own base32 alphabet - the
+/// digits and the lowercase letters less `e`, `o`, `u` and `t` - so a
+/// long package name that happens to carry a hyphen in position 33 keeps
+/// its head. Checking the length alone would have silently beheaded it.
+///
+/// Left alone where the prefix is not there, so this is safe to apply to a
+/// name that has already been stripped.
+fn strip_hash(dir: &str) -> &str {
+    /// Nix's base32: the digits and the lowercase letters, less `e`, `o`,
+    /// `u` and `t`.
+    const NIX_BASE32: &[u8] = b"0123456789abcdfghijklmnpqrsvwxyz";
+    let bytes = dir.as_bytes();
+    let hashed =
+        bytes.len() > 33 && bytes[32] == b'-' && bytes[..32].iter().all(|b| NIX_BASE32.contains(b));
+    match hashed {
+        true => &dir[33..],
+        false => dir,
+    }
+}
+
+impl PackageService for NixosPlatform {
+    /// What the system closure provides, read from the symlinks in
+    /// `/run/current-system/sw/bin`.
+    ///
+    /// **The system path, not `nix-env -q`.** That command reads
+    /// `~/.nix-profile`, which on a declaratively managed host is usually
+    /// empty and never describes the system - and it is a subprocess,
+    /// where this is a directory read masys can do on its ordinary tick.
+    ///
+    /// This answers "what does this system provide", which is the question
+    /// a Packages buffer is for. It is not the whole closure: a library
+    /// with no binaries is in the system and not in `sw/bin`, and saying
+    /// so here is better than a list that silently means something
+    /// narrower than its title.
+    fn packages(&self) -> Result<Vec<Package>, MasysError> {
+        let entries = std::fs::read_dir(SYSTEM_PATH_BIN).map_err(MasysError::Io)?;
+        let mut targets: Vec<String> = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(MasysError::Io)?;
+            // A dangling link is the one failure here that is not a
+            // failure to *read*: the link is there and its target is
+            // not, so it genuinely provides nothing and the list is
+            // still complete without it. Every other error - a
+            // permission denied on a directory component, an I/O error
+            // on the walk - is the read failing, and swallowing it
+            // would shrink the list with no signal, which is the shape
+            // `.ok()` has here and the reason this is not a
+            // `filter_map`.
+            let path = match std::fs::canonicalize(entry.path()) {
+                Ok(path) => path,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(MasysError::Io(e)),
+            };
+            // `/nix/store/<hash>-<name>-<version>/bin/foo` - the store
+            // directory is the component after `/nix/store/`. A binary
+            // that resolves outside the store is not a package this can
+            // name, and there is nothing to report about it.
+            let Ok(relative) = path.strip_prefix("/nix/store") else {
+                continue;
+            };
+            if let Some(dir) = relative
+                .components()
+                .next()
+                .and_then(|c| c.as_os_str().to_str())
+            {
+                targets.push(dir.to_string());
+            }
+        }
+        Ok(packages_from(&targets))
+    }
 }
 
 impl PlatformService for NixosPlatform {
     fn id(&self) -> PlatformId {
         PlatformId::NixOs
-    }
-
-    fn packages(&self) -> Result<Vec<Package>, MasysError> {
-        // The Packages buffer is out of v1 scope; answering with an empty
-        // list would claim this host has no packages.
-        Err(MasysError::Platform("listing packages is not implemented for NixOS yet".to_string()))
-    }
-
-    fn updates(&self) -> Result<UpdateStatus, MasysError> {
-        Err(MasysError::Platform("update checking is not implemented for NixOS yet".to_string()))
     }
 
     /// Now that `DeclarativeService::reboot` performs the comparison, the
@@ -86,7 +280,9 @@ impl PlatformService for NixosPlatform {
     /// number. The two ports must never disagree about whether a reboot is
     /// pending, so this delegates rather than repeating the comparison.
     fn pending_reboot(&self) -> Result<Option<PendingReboot>, MasysError> {
-        Ok(self.reboot()?.map(|state| PendingReboot { reason: reboot_reason(state.kernel_changed, state.initrd_changed).to_string() }))
+        Ok(self.reboot()?.map(|state| PendingReboot {
+            reason: reboot_reason(state.kernel_changed, state.initrd_changed).to_string(),
+        }))
     }
 
     /// The guard.
@@ -128,10 +324,12 @@ impl PlatformService for NixosPlatform {
         })
     }
 
+    /// Delegates to `profiles` for the same reason `pending_reboot`
+    /// delegates to `reboot`: the two ports must not disagree about how
+    /// many generations this host has, and re-reading the directory here
+    /// is how they would come to.
     fn boot_pressure(&self) -> Result<Option<BootPressure>, MasysError> {
-        // Counting generations with boot entries needs the bootloader's
-        // layout, which is not implemented yet.
-        Ok(None)
+        Ok(boot_pressure_from(&self.profiles()?))
     }
 }
 
@@ -151,7 +349,7 @@ impl PlatformService for NixosPlatform {
 /// that line carries. At the eighty columns masys is drawn to fit, that
 /// leaves [`REASON_BUDGET`] columns, and a longer reason does not wrap -
 /// it is clipped, taking the verdict with it and leaving a sentence that
-/// trails off mid-word. The detail belongs to the Nix view's reboot block,
+/// trails off mid-word. The detail belongs to the Nix buffer's reboot block,
 /// which has whole lines to spend on it and builds them from the flags
 /// rather than from this text.
 ///
@@ -177,7 +375,8 @@ pub fn reboot_reason(kernel_changed: bool, initrd_changed: bool) -> &'static str
 /// host and fail on somebody else's. Bytes stand in for columns because
 /// the prefix is ASCII; the reasons are measured in columns, which is the
 /// measure that actually decides where the clip falls.
-pub const REASON_BUDGET: usize = 80 - 2 - 2 - ". clock not synced  .  smart failing  .  reboot pending: ".len();
+pub const REASON_BUDGET: usize =
+    80 - 2 - 2 - ". clock not synced  .  smart failing  .  reboot pending: ".len();
 
 /// Whether a reboot is pending, and what actually differs.
 ///
@@ -237,25 +436,40 @@ impl DeclarativeService for NixosPlatform {
         // is merely left unflagged. And `Err` would cost the whole
         // generations list - every row, read from a different directory
         // entirely - to avoid losing one annotation on it.
-        let booted = std::fs::canonicalize("/run/booted-system").ok().map(|path| path.to_string_lossy().to_string());
+        let booted = std::fs::canonicalize("/run/booted-system")
+            .ok()
+            .map(|path| path.to_string_lossy().to_string());
         // `None` rather than a relative path when `HOME` is unset:
         // `PathBuf::default().join(..)` yields `.local/state/nix/profiles`,
         // which would read whatever happens to sit under the working
         // directory and report it as this user's generations.
-        let home = std::env::var_os("HOME").map(|home| std::path::PathBuf::from(home).join(".local/state/nix/profiles"));
+        let home = std::env::var_os("HOME")
+            .map(|home| std::path::PathBuf::from(home).join(".local/state/nix/profiles"));
 
         let sources = [
-            (ProfileKind::System, Some(std::path::PathBuf::from(PROFILES)), "system"),
+            (
+                ProfileKind::System,
+                Some(std::path::PathBuf::from(PROFILES)),
+                "system",
+            ),
             (ProfileKind::Home, home, "profile"),
-            (ProfileKind::Channels, Some(std::path::PathBuf::from(CHANNELS)), "channels"),
+            (
+                ProfileKind::Channels,
+                Some(std::path::PathBuf::from(CHANNELS)),
+                "channels",
+            ),
         ];
 
         let mut profiles = Vec::new();
         for (kind, dir, prefix) in sources {
             let Some(dir) = dir else { continue };
             // Only the system profile can hold the booted generation.
-            let booted = matches!(kind, ProfileKind::System).then_some(booted.as_deref()).flatten();
-            let Some(profile) = crate::profiles::read_profile(kind, &dir, prefix, booted)? else { continue };
+            let booted = matches!(kind, ProfileKind::System)
+                .then_some(booted.as_deref())
+                .flatten();
+            let Some(profile) = crate::profiles::read_profile(kind, &dir, prefix, booted)? else {
+                continue;
+            };
             // A directory that exists with no generations in it is a
             // second kind of absence, distinct from the missing directory
             // `read_profile` already reports as `None`, and it needs the
@@ -291,9 +505,15 @@ impl DeclarativeService for NixosPlatform {
         // *changed*, so a failed read errs toward "reboot now" rather than
         // toward "this can wait". Propagating instead would replace a
         // conservative answer with no answer at all.
-        let link =
-            |base: &str, name: &str| std::fs::read_link(format!("{base}/{name}")).ok().map(|path| path.to_string_lossy().to_string());
-        let (Some(booted), Some(current)) = (resolve("/run/booted-system")?, resolve("/run/current-system")?) else {
+        let link = |base: &str, name: &str| {
+            std::fs::read_link(format!("{base}/{name}"))
+                .ok()
+                .map(|path| path.to_string_lossy().to_string())
+        };
+        let (Some(booted), Some(current)) = (
+            resolve("/run/booted-system")?,
+            resolve("/run/current-system")?,
+        ) else {
             return Ok(None);
         };
         Ok(reboot_state(
@@ -316,7 +536,12 @@ impl DeclarativeService for NixosPlatform {
     /// store, and the generated units are its contents.
     fn home_mode(&self) -> Result<HomeMode, MasysError> {
         let module = match std::fs::read_dir(UNIT_DIR) {
-            Ok(entries) => entries.flatten().any(|entry| entry.file_name().to_string_lossy().starts_with("home-manager-")),
+            Ok(entries) => entries.flatten().any(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("home-manager-")
+            }),
             // No unit directory at all means no module install. Any other
             // failure is not an answer, and reporting `Absent` from one
             // would hide a standalone install behind a permission error.
@@ -337,10 +562,25 @@ impl DeclarativeService for NixosPlatform {
         // one as the working directory, but a `home-manager` binary that
         // happens to sit in the directory masys was launched from is not
         // evidence that this host has a standalone home-manager.
-        let standalone = std::env::var_os("PATH")
-            .map(|path| std::env::split_paths(&path).filter(|dir| !dir.as_os_str().is_empty()).any(|dir| dir.join("home-manager").exists()))
-            .unwrap_or(false);
-        Ok(if standalone { HomeMode::Standalone } else { HomeMode::Absent })
+        // No `PATH` is no way to look, and the comment above has always
+        // said so - but `unwrap_or(false)` then answered `Absent`, which
+        // the port reserves for a real finding. It rendered
+        // "home-manager not installed" and dimmed `h` on the strength of
+        // a look that never happened. An `Err` is what "could not find
+        // out" is spelled as here.
+        let Some(path) = std::env::var_os("PATH") else {
+            return Err(MasysError::Platform(
+                "PATH is unset, so there is nowhere to look for home-manager".to_string(),
+            ));
+        };
+        let standalone = std::env::split_paths(&path)
+            .filter(|dir| !dir.as_os_str().is_empty())
+            .any(|dir| dir.join("home-manager").exists());
+        Ok(if standalone {
+            HomeMode::Standalone
+        } else {
+            HomeMode::Absent
+        })
     }
 
     fn inputs(&self) -> Result<Option<Inputs>, MasysError> {
@@ -351,14 +591,23 @@ impl DeclarativeService for NixosPlatform {
             // the "this host has no lock" that `None` means below.
             let text = std::fs::read_to_string(&lock_path)?;
             return Ok(Some(Inputs {
-                source: InputSource::Flake { lock_path: lock_path.to_string_lossy().to_string() },
+                source: InputSource::Flake {
+                    lock_path: lock_path.to_string_lossy().to_string(),
+                },
                 inputs: crate::inputs::parse_lock(&text)?,
             }));
         }
         // No lock. Channels are the other paradigm, and a channel profile
         // with generations is what says this host uses them.
-        let channels = crate::profiles::read_profile(ProfileKind::Channels, std::path::Path::new(CHANNELS), "channels", None)?;
-        let Some(channels) = channels.filter(|profile| !profile.generations.is_empty()) else { return Ok(None) };
+        let channels = crate::profiles::read_profile(
+            ProfileKind::Channels,
+            std::path::Path::new(CHANNELS),
+            "channels",
+            None,
+        )?;
+        let Some(channels) = channels.filter(|profile| !profile.generations.is_empty()) else {
+            return Ok(None);
+        };
         Ok(Some(Inputs {
             source: InputSource::Channels,
             inputs: channels
@@ -397,21 +646,32 @@ impl DeclarativeService for NixosPlatform {
     /// `nix-gc-start`; spawning a shell to echo back a constant would cost
     /// a subprocess and buy no accuracy.
     fn running_nixpkgs_rev(&self) -> Result<Option<String>, MasysError> {
-        let Some(script) = read_if_present("/run/current-system/sw/bin/nixos-version")? else { return Ok(None) };
+        let Some(script) = read_if_present("/run/current-system/sw/bin/nixos-version")? else {
+            return Ok(None);
+        };
         // The `--json` branch emits `"nixpkgsRevision":"<rev>"`. Split on
         // the key and then on quotes rather than matching the pair
         // together, so a generator that spaces its JSON differently still
         // reads.
-        let Some((_, after_key)) = script.split_once("\"nixpkgsRevision\"") else { return Ok(None) };
-        let Some((_, after_quote)) = after_key.split_once('"') else { return Ok(None) };
-        let Some((rev, _)) = after_quote.split_once('"') else { return Ok(None) };
+        let Some((_, after_key)) = script.split_once("\"nixpkgsRevision\"") else {
+            return Ok(None);
+        };
+        let Some((_, after_quote)) = after_key.split_once('"') else {
+            return Ok(None);
+        };
+        let Some((rev, _)) = after_quote.split_once('"') else {
+            return Ok(None);
+        };
         // The script guards its own `--revision` output with `[[ <rev> =~
         // ^[0-9a-f]+$ ]]`, because the value is a build-time substitution
         // that stays an unexpanded `@revision@` on a system built outside
         // a git checkout. The same predicate here: a placeholder is this
         // system recording no revision, and handing it back as one would
         // make every comparison against it report drift.
-        let looks_like_a_rev = !rev.is_empty() && rev.chars().all(|character| matches!(character, '0'..='9' | 'a'..='f'));
+        let looks_like_a_rev = !rev.is_empty()
+            && rev
+                .chars()
+                .all(|character| matches!(character, '0'..='9' | 'a'..='f'));
         Ok(looks_like_a_rev.then(|| rev.to_string()))
     }
 
@@ -425,19 +685,46 @@ impl DeclarativeService for NixosPlatform {
         // finding worth reporting. A read that *fails* is not: a
         // permission error here would otherwise be indistinguishable from
         // "no policy", and the row would quietly claim the host has none.
-        let Some(unit) = read_if_present(&format!("{UNIT_DIR}/nix-gc.service"))? else { return Ok(None) };
-        let Some(exec) = unit.lines().find_map(|line| line.strip_prefix("ExecStart=")) else { return Ok(None) };
-        let Some(script_path) = exec.split_whitespace().next() else { return Ok(None) };
-        let Some(script) = read_if_present(script_path)? else { return Ok(None) };
-        Ok(script.split_whitespace().skip_while(|word| *word != "--delete-older-than").nth(1).map(str::to_string))
+        let Some(unit) = read_if_present(&format!("{UNIT_DIR}/nix-gc.service"))? else {
+            return Ok(None);
+        };
+        let Some(exec) = unit
+            .lines()
+            .find_map(|line| line.strip_prefix("ExecStart="))
+        else {
+            return Ok(None);
+        };
+        let Some(script_path) = exec.split_whitespace().next() else {
+            return Ok(None);
+        };
+        let Some(script) = read_if_present(script_path)? else {
+            return Ok(None);
+        };
+        Ok(script
+            .split_whitespace()
+            .skip_while(|word| *word != "--delete-older-than")
+            .nth(1)
+            .map(str::to_string))
     }
 
     /// A `0` here reads as an actionable claim - nothing is pinning the
     /// store - so an unreadable directory must not produce one. Missing is
     /// zero; unreadable is an error.
+    /// The guard was on the *open* only. `entries.flatten()` then dropped
+    /// every per-entry `Err`, so a directory that opened and failed
+    /// part-way through enumerating under-counted silently - and could
+    /// reach the very `0` the paragraph above forbids. Counting requires
+    /// every entry, so a failure to read one is a failure to count.
     fn gc_roots(&self) -> Result<u32, MasysError> {
         match std::fs::read_dir("/nix/var/nix/gcroots/auto") {
-            Ok(entries) => Ok(entries.flatten().count() as u32),
+            Ok(entries) => {
+                let mut count = 0u32;
+                for entry in entries {
+                    entry.map_err(MasysError::Io)?;
+                    count += 1;
+                }
+                Ok(count)
+            }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(0),
             Err(error) => Err(MasysError::Io(error)),
         }
@@ -458,5 +745,21 @@ impl DeclarativeService for NixosPlatform {
 
     fn run(&self, op: &NixOp) -> Result<(), MasysError> {
         crate::ops::run(op)
+    }
+
+    /// Whether this host has `run0` or `sudo` on `PATH`.
+    ///
+    /// Which mechanism exists is knowable by looking; whether the policy
+    /// will let this operator through is not, for either. So this answers
+    /// the first question only, and the operation still has to be
+    /// attempted to learn the second.
+    fn can_elevate(&self) -> bool {
+        crate::ops::offered_here() != crate::ops::Elevate::No
+    }
+
+    /// Answered the way `ops::run` answers it for itself: `geteuid`,
+    /// infallible by POSIX.
+    fn is_root(&self) -> bool {
+        crate::ops::euid() == 0
     }
 }

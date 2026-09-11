@@ -20,8 +20,11 @@ struct ProfileDir(PathBuf);
 
 impl ProfileDir {
     fn new(label: &str) -> ProfileDir {
-        let path =
-            std::env::temp_dir().join(format!("masys-profiles-{label}-{}-{}", std::process::id(), UNIQUE.fetch_add(1, Ordering::Relaxed)));
+        let path = std::env::temp_dir().join(format!(
+            "masys-profiles-{label}-{}-{}",
+            std::process::id(),
+            UNIQUE.fetch_add(1, Ordering::Relaxed)
+        ));
         ProfileDir(path)
     }
 
@@ -53,9 +56,14 @@ fn generations_ascend_by_id_and_the_profile_link_is_not_one_of_them() {
     let tmp = ProfileDir::new("asc");
     fixture(tmp.path());
 
-    let profile = read_profile(ProfileKind::System, tmp.path(), "system", None).unwrap().unwrap();
+    let profile = read_profile(ProfileKind::System, tmp.path(), "system", None)
+        .unwrap()
+        .unwrap();
 
-    assert_eq!(profile.generations.iter().map(|g| g.id).collect::<Vec<_>>(), vec![3, 4, 5]);
+    assert_eq!(
+        profile.generations.iter().map(|g| g.id).collect::<Vec<_>>(),
+        vec![3, 4, 5]
+    );
 }
 
 #[test]
@@ -63,9 +71,16 @@ fn the_generation_the_profile_points_at_is_current() {
     let tmp = ProfileDir::new("cur");
     fixture(tmp.path());
 
-    let profile = read_profile(ProfileKind::System, tmp.path(), "system", None).unwrap().unwrap();
+    let profile = read_profile(ProfileKind::System, tmp.path(), "system", None)
+        .unwrap()
+        .unwrap();
 
-    let current: Vec<u64> = profile.generations.iter().filter(|g| g.current).map(|g| g.id).collect();
+    let current: Vec<u64> = profile
+        .generations
+        .iter()
+        .filter(|g| g.current)
+        .map(|g| g.id)
+        .collect();
     assert_eq!(current, vec![5]);
 }
 
@@ -78,11 +93,25 @@ fn the_booted_store_path_marks_its_generation_when_one_matches() {
     fixture(tmp.path());
     let booted = tmp.path().join("store-3").to_string_lossy().to_string();
 
-    let profile = read_profile(ProfileKind::System, tmp.path(), "system", Some(&booted)).unwrap().unwrap();
-    let marked: Vec<u64> = profile.generations.iter().filter(|g| g.booted).map(|g| g.id).collect();
+    let profile = read_profile(ProfileKind::System, tmp.path(), "system", Some(&booted))
+        .unwrap()
+        .unwrap();
+    let marked: Vec<u64> = profile
+        .generations
+        .iter()
+        .filter(|g| g.booted)
+        .map(|g| g.id)
+        .collect();
     assert_eq!(marked, vec![3]);
 
-    let gone = read_profile(ProfileKind::System, tmp.path(), "system", Some("/nix/store/deleted")).unwrap().unwrap();
+    let gone = read_profile(
+        ProfileKind::System,
+        tmp.path(),
+        "system",
+        Some("/nix/store/deleted"),
+    )
+    .unwrap()
+    .unwrap();
     assert!(gone.generations.iter().all(|g| !g.booted));
 }
 
@@ -103,9 +132,14 @@ fn a_profiles_path_is_the_symlink_nix_env_takes_not_its_directory() {
     let tmp = ProfileDir::new("path");
     fixture(tmp.path());
 
-    let profile = read_profile(ProfileKind::System, tmp.path(), "system", None).unwrap().unwrap();
+    let profile = read_profile(ProfileKind::System, tmp.path(), "system", None)
+        .unwrap()
+        .unwrap();
 
-    assert_eq!(profile.path, tmp.path().join("system").to_string_lossy().to_string());
+    assert_eq!(
+        profile.path,
+        tmp.path().join("system").to_string_lossy().to_string()
+    );
 }
 
 /// Whether the profile directory can be written, which is what decides
@@ -124,17 +158,29 @@ fn a_profile_directory_reads_as_writable_only_where_it_can_be_written() {
     let tmp = ProfileDir::new("perm");
     fixture(tmp.path());
 
-    let profile = read_profile(ProfileKind::System, tmp.path(), "system", None).unwrap().unwrap();
-    assert_eq!(profile.writable, Some(true), "a directory this process just created");
+    let profile = read_profile(ProfileKind::System, tmp.path(), "system", None)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        profile.writable,
+        Some(true),
+        "a directory this process just created"
+    );
 
     let mut mode = fs::metadata(tmp.path()).unwrap().permissions();
     mode.set_mode(0o555);
     fs::set_permissions(tmp.path(), mode).unwrap();
-    let refused = read_profile(ProfileKind::System, tmp.path(), "system", None).unwrap().unwrap();
+    let refused = read_profile(ProfileKind::System, tmp.path(), "system", None)
+        .unwrap()
+        .unwrap();
     // SAFETY: `geteuid` reads process state and takes no arguments.
     let root = unsafe { libc::geteuid() } == 0;
     if !root {
-        assert_eq!(refused.writable, Some(false), "0o555 with the generations still readable");
+        assert_eq!(
+            refused.writable,
+            Some(false),
+            "0o555 with the generations still readable"
+        );
     }
 
     // Restored so `Drop`'s `remove_dir_all` can unlink what is inside.
@@ -148,7 +194,10 @@ fn a_profile_directory_reads_as_writable_only_where_it_can_be_written() {
 #[test]
 fn a_missing_profile_directory_reads_as_absent() {
     let missing = ProfileDir::new("nope");
-    assert_eq!(read_profile(ProfileKind::Home, missing.path(), "profile", None).unwrap(), None);
+    assert_eq!(
+        read_profile(ProfileKind::Home, missing.path(), "profile", None).unwrap(),
+        None
+    );
 }
 
 /// A generation whose link is dangling - its target removed by a GC run
@@ -160,7 +209,9 @@ fn a_dangling_generation_link_has_no_store_path_and_is_not_current() {
     fixture(tmp.path());
     fs::remove_dir_all(tmp.path().join("store-4")).unwrap();
 
-    let profile = read_profile(ProfileKind::System, tmp.path(), "system", None).unwrap().unwrap();
+    let profile = read_profile(ProfileKind::System, tmp.path(), "system", None)
+        .unwrap()
+        .unwrap();
 
     let four = profile.generations.iter().find(|g| g.id == 4).unwrap();
     assert_eq!(four.store_path, None);
@@ -188,7 +239,9 @@ fn a_dangling_current_generation_and_unresolvable_profile_pointer_mark_nothing_c
     // match from.
     fs::remove_dir_all(tmp.path().join("store-5")).unwrap();
 
-    let profile = read_profile(ProfileKind::System, tmp.path(), "system", None).unwrap().unwrap();
+    let profile = read_profile(ProfileKind::System, tmp.path(), "system", None)
+        .unwrap()
+        .unwrap();
 
     assert!(profile.generations.iter().all(|g| !g.current));
 }
@@ -205,7 +258,9 @@ fn dangling_generations_are_never_marked_booted_even_with_a_real_booted_path() {
     fs::remove_dir_all(tmp.path().join("store-4")).unwrap();
     let booted = tmp.path().join("store-5").to_string_lossy().to_string();
 
-    let profile = read_profile(ProfileKind::System, tmp.path(), "system", Some(&booted)).unwrap().unwrap();
+    let profile = read_profile(ProfileKind::System, tmp.path(), "system", Some(&booted))
+        .unwrap()
+        .unwrap();
 
     let three = profile.generations.iter().find(|g| g.id == 3).unwrap();
     let four = profile.generations.iter().find(|g| g.id == 4).unwrap();

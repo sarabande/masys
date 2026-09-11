@@ -44,7 +44,10 @@ fn origin_and_revision_come_from_the_locked_block() {
     let inputs = parse_lock(LOCK).unwrap();
     let nixpkgs = inputs.iter().find(|i| i.name == "nixpkgs").unwrap();
     assert_eq!(nixpkgs.origin.as_deref(), Some("NixOS/nixpkgs"));
-    assert_eq!(nixpkgs.rev.as_deref(), Some("e72e4f299401a3689d4b3d5fc6496b11db7064eb"));
+    assert_eq!(
+        nixpkgs.rev.as_deref(),
+        Some("e72e4f299401a3689d4b3d5fc6496b11db7064eb")
+    );
     assert_eq!(nixpkgs.last_modified_secs, Some(1785828668));
 }
 
@@ -78,7 +81,10 @@ const LOCK_WITH_ARRAY_FOLLOWS: &str = r#"{
 fn an_array_valued_root_input_is_still_direct() {
     let inputs = parse_lock(LOCK_WITH_ARRAY_FOLLOWS).unwrap();
     let nixpkgs = inputs.iter().find(|i| i.name == "nixpkgs").unwrap();
-    assert!(nixpkgs.direct, "a root input locked as a follows path is still one the configuration names directly");
+    assert!(
+        nixpkgs.direct,
+        "a root input locked as a follows path is still one the configuration names directly"
+    );
 }
 
 const LOCK_WITH_ALIAS_NODE: &str = r#"{

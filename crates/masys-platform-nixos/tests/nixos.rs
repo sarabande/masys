@@ -1,7 +1,10 @@
-use masys_domain::declarative::{DeclarativeService, HomeMode};
-use masys_domain::platform::{Ownership, PlatformId};
+use masys_domain::declarative::{DeclarativeService, Generation, HomeMode, Profile, ProfileKind};
+use masys_domain::platform::{Ownership, Package, PlatformId};
 use masys_domain::service::PlatformService;
-use masys_platform_nixos::{NixosPlatform, REASON_BUDGET, is_nixos, is_store_managed, reboot_reason};
+use masys_platform_nixos::{
+    NixosPlatform, REASON_BUDGET, boot_pressure_from, is_nixos, is_store_managed, packages_from,
+    parse_store_name, reboot_reason,
+};
 use unicode_width::UnicodeWidthStr;
 
 /// The `ID` field rather than `PRETTY_NAME`: it is the stable
@@ -10,8 +13,13 @@ use unicode_width::UnicodeWidthStr;
 #[test]
 fn nixos_is_recognised_by_its_id() {
     assert!(is_nixos("ID=nixos\nPRETTY_NAME=\"NixOS 26.11 (Zokor)\"\n"));
-    assert!(is_nixos("PRETTY_NAME=\"NixOS 26.11\"\nID=\"nixos\"\n"), "a quoted ID still counts");
-    assert!(!is_nixos("ID=debian\nPRETTY_NAME=\"Debian GNU/Linux 12\"\n"));
+    assert!(
+        is_nixos("PRETTY_NAME=\"NixOS 26.11\"\nID=\"nixos\"\n"),
+        "a quoted ID still counts"
+    );
+    assert!(!is_nixos(
+        "ID=debian\nPRETTY_NAME=\"Debian GNU/Linux 12\"\n"
+    ));
     assert!(!is_nixos(""), "a host with no os-release is not NixOS");
 }
 
@@ -32,7 +40,9 @@ fn a_path_outside_the_store_is_not_store_managed() {
 /// genuinely persists.
 #[test]
 fn a_unit_with_no_file_at_all_is_imperative() {
-    let ownership = NixosPlatform.unit_ownership("definitely-not-a-real-unit.service").expect("an answer");
+    let ownership = NixosPlatform
+        .unit_ownership("definitely-not-a-real-unit.service")
+        .expect("an answer");
     assert_eq!(ownership, Ownership::Imperative);
 }
 
@@ -41,29 +51,42 @@ fn the_platform_identifies_itself() {
     assert_eq!(NixosPlatform.id(), PlatformId::NixOs);
 }
 
-/// Answering "no packages" would claim this host has none. The design's
-/// point about the fallback adapter cuts both ways: an adapter that
-/// cannot answer should say so, not invent a reassuring answer.
+/// Against the real host, where the only claim that holds everywhere is
+/// the one about the half this adapter declines.
+///
+/// The generation count depends on the machine - thirty-five on the
+/// development host, none at all on a runner with no
+/// `/nix/var/nix/profiles` - so it is asserted in
+/// `boot_pressure_counts_the_system_generations` against a fixture
+/// instead. What is true on every host is that `reclaimable_bytes` is
+/// `None`: `/boot` is unreadable without root and the store sizes answer
+/// a different question.
+///
+/// This test asserted `boot_pressure` answered `None` outright until it
+/// was implemented on 2026-08-30, and before that that `packages` and
+/// `updates` refused rather than inventing an answer, until both were
+/// removed from the port (#16). `pending_reboot` was here too until it
+/// was implemented. The pattern is worth noticing: an assertion that a
+/// method answers nothing is an assertion with a shelf life.
 #[test]
-fn unimplemented_queries_refuse_rather_than_inventing_an_answer() {
-    assert!(NixosPlatform.packages().is_err());
-    assert!(NixosPlatform.updates().is_err());
-    // Genuinely "nothing to report" rather than unknown. `pending_reboot`
-    // was asserted here too until it was implemented; it now compares
-    // booted against current, and on a host between two generations the
-    // honest answer is `Some`.
-    assert_eq!(NixosPlatform.boot_pressure().expect("an answer"), None);
+fn boot_pressure_never_guesses_at_what_boot_holds() {
+    let answer = NixosPlatform.boot_pressure().expect("an answer");
+    assert_eq!(answer.and_then(|pressure| pressure.reclaimable_bytes), None);
 }
 
 /// The two ports must never disagree. `pending_reboot` is the neutral
 /// port's rendering of the comparison `reboot` performs, so a host where
-/// the Status buffer says nothing and the Nix view says "reboot pending"
+/// the Status buffer says nothing and the Nix buffer says "reboot pending"
 /// would be masys contradicting itself in two places at once.
 #[test]
 fn the_neutral_port_and_the_declarative_one_agree_about_a_reboot() {
     let state = NixosPlatform.reboot().expect("an answer");
     let pending = NixosPlatform.pending_reboot().expect("an answer");
-    assert_eq!(state.is_some(), pending.is_some(), "one port sees a pending reboot and the other does not");
+    assert_eq!(
+        state.is_some(),
+        pending.is_some(),
+        "one port sees a pending reboot and the other does not"
+    );
     if let (Some(state), Some(pending)) = (state, pending) {
         // The whole reason to answer in a sentence: "reboot now" and
         // "this can wait" are different findings, and the reason has to
@@ -72,13 +95,23 @@ fn the_neutral_port_and_the_declarative_one_agree_about_a_reboot() {
         // initrd is read at boot too, so an initrd-only change is a
         // reboot, not an activation.
         let can_wait = pending.reason.contains("activation-only");
-        assert_eq!(can_wait, !state.kernel_changed && !state.initrd_changed, "the reason contradicts the reading: {pending:?}");
+        assert_eq!(
+            can_wait,
+            !state.kernel_changed && !state.initrd_changed,
+            "the reason contradicts the reading: {pending:?}"
+        );
         // And it must name whichever actually moved, not merely report
         // that something did.
         if state.kernel_changed {
-            assert!(pending.reason.contains("kernel changed"), "a changed kernel goes unnamed: {pending:?}");
+            assert!(
+                pending.reason.contains("kernel changed"),
+                "a changed kernel goes unnamed: {pending:?}"
+            );
         } else if state.initrd_changed {
-            assert!(pending.reason.contains("initrd changed"), "a changed initrd goes unnamed: {pending:?}");
+            assert!(
+                pending.reason.contains("initrd changed"),
+                "a changed initrd goes unnamed: {pending:?}"
+            );
         }
     }
 }
@@ -87,7 +120,7 @@ fn the_neutral_port_and_the_declarative_one_agree_about_a_reboot() {
 /// the end of the line - which is where the verdict is.
 ///
 /// The same rule `masys-render`'s `the_reboot_block_fits_an_eighty_column_
-/// terminal` pins for the Nix view's reboot block, carried to the second
+/// terminal` pins for the Nix buffer's reboot block, carried to the second
 /// place the same fact lands. It was written there first because the block
 /// overflowed there first; the reason string then grew to a hundred and
 /// four characters and was cut off mid-word in the Status buffer, on this
@@ -100,7 +133,9 @@ fn the_neutral_port_and_the_declarative_one_agree_about_a_reboot() {
 /// from pairs to answers is the function's own business.
 #[test]
 fn every_reboot_reason_fits_an_eighty_column_status_line() {
-    for (kernel_changed, initrd_changed) in [(true, true), (true, false), (false, true), (false, false)] {
+    for (kernel_changed, initrd_changed) in
+        [(true, true), (true, false), (false, true), (false, false)]
+    {
         let reason = reboot_reason(kernel_changed, initrd_changed);
         assert!(
             reason.width() <= REASON_BUDGET,
@@ -117,11 +152,18 @@ fn every_reboot_reason_fits_an_eighty_column_status_line() {
 /// whichever pair this machine happens to be in.
 #[test]
 fn only_an_unchanged_kernel_and_initrd_may_say_the_reboot_can_wait() {
-    assert_eq!(reboot_reason(true, true), reboot_reason(true, false), "a changed kernel is the verdict either way");
+    assert_eq!(
+        reboot_reason(true, true),
+        reboot_reason(true, false),
+        "a changed kernel is the verdict either way"
+    );
     assert_eq!(reboot_reason(false, false), "activation-only");
     for (kernel_changed, initrd_changed) in [(true, true), (true, false), (false, true)] {
         let reason = reboot_reason(kernel_changed, initrd_changed);
-        assert!(!reason.contains("activation-only"), "{reason:?} says a reboot can wait when something read at boot moved");
+        assert!(
+            !reason.contains("activation-only"),
+            "{reason:?} says a reboot can wait when something read at boot moved"
+        );
     }
 }
 
@@ -134,9 +176,20 @@ fn only_an_unchanged_kernel_and_initrd_may_say_the_reboot_can_wait() {
 #[test]
 fn a_reported_profile_always_has_generations() {
     for profile in NixosPlatform.profiles().expect("an answer") {
-        assert!(!profile.generations.is_empty(), "{:?} was reported with no generations", profile.kind);
-        let ascending = profile.generations.windows(2).all(|pair| pair[0].id < pair[1].id);
-        assert!(ascending, "{:?} generations are not ascending by id", profile.kind);
+        assert!(
+            !profile.generations.is_empty(),
+            "{:?} was reported with no generations",
+            profile.kind
+        );
+        let ascending = profile
+            .generations
+            .windows(2)
+            .all(|pair| pair[0].id < pair[1].id);
+        assert!(
+            ascending,
+            "{:?} generations are not ascending by id",
+            profile.kind
+        );
     }
 }
 
@@ -147,8 +200,14 @@ fn a_reported_profile_always_has_generations() {
 /// drift that is not there.
 #[test]
 fn a_running_revision_is_a_whole_revision_or_nothing() {
-    let Some(rev) = NixosPlatform.running_nixpkgs_rev().expect("an answer") else { return };
-    assert!(rev.chars().all(|character| matches!(character, '0'..='9' | 'a'..='f')), "not a revision: {rev:?}");
+    let Some(rev) = NixosPlatform.running_nixpkgs_rev().expect("an answer") else {
+        return;
+    };
+    assert!(
+        rev.chars()
+            .all(|character| matches!(character, '0'..='9' | 'a'..='f')),
+        "not a revision: {rev:?}"
+    );
     // Length, because shape alone cannot tell the two revisions in this
     // file apart. The same script carries `nixosVersion`, whose last
     // segment is the *short* rev - seven hex characters, which passes
@@ -157,7 +216,10 @@ fn a_running_revision_is_a_whole_revision_or_nothing() {
     // happen to share a prefix. `>=` rather than `== 40` so a move to
     // sha-256 commit ids fails nothing here - what this pins is the
     // discrimination against the short rev, not any particular hash.
-    assert!(rev.len() >= 40, "a short revision where the whole one was wanted: {rev:?}");
+    assert!(
+        rev.len() >= 40,
+        "a short revision where the whole one was wanted: {rev:?}"
+    );
 }
 
 /// A generated `home-manager-*` unit decides `Module`, and it must decide
@@ -167,10 +229,20 @@ fn a_running_revision_is_a_whole_revision_or_nothing() {
 #[test]
 fn a_generated_home_manager_unit_means_the_module_mode() {
     let generated = std::fs::read_dir("/etc/systemd/system")
-        .map(|entries| entries.flatten().any(|entry| entry.file_name().to_string_lossy().starts_with("home-manager-")))
+        .map(|entries| {
+            entries.flatten().any(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("home-manager-")
+            })
+        })
         .unwrap_or(false);
     if generated {
-        assert_eq!(NixosPlatform.home_mode().expect("an answer"), HomeMode::Module);
+        assert_eq!(
+            NixosPlatform.home_mode().expect("an answer"),
+            HomeMode::Module
+        );
     }
 }
 
@@ -183,14 +255,242 @@ fn a_generated_home_manager_unit_means_the_module_mode() {
 fn a_store_managed_unit_says_how_the_change_fails() {
     // A real unit on this host, if it is NixOS; the test asserts the
     // shape of the answer rather than which branch this machine takes.
-    let ownership = NixosPlatform.unit_ownership("sshd.service").expect("an answer");
+    let ownership = NixosPlatform
+        .unit_ownership("sshd.service")
+        .expect("an answer");
     match ownership {
-        Ownership::Declarative { source, note, reverted_by } => {
+        Ownership::Declarative {
+            source,
+            note,
+            reverted_by,
+        } => {
             assert_eq!(source, "configuration.nix");
             assert_eq!(reverted_by, "nixos-rebuild switch");
-            assert!(note.contains("read-only") || note.contains("generated"), "the note must say how it fails, got {note:?}");
+            assert!(
+                note.contains("read-only") || note.contains("generated"),
+                "the note must say how it fails, got {note:?}"
+            );
         }
         // Not a NixOS host, or sshd is hand-placed here: both legitimate.
         Ownership::Imperative => {}
     }
+}
+
+fn generation(id: u64) -> Generation {
+    Generation {
+        id,
+        created_ms: None,
+        store_path: Some(format!("/nix/store/{id:032}-nixos-system")),
+        label: None,
+        kernel: None,
+        current: false,
+        booted: false,
+    }
+}
+
+fn system_profile(generations: Vec<Generation>) -> Profile {
+    Profile {
+        kind: ProfileKind::System,
+        path: "/nix/var/nix/profiles/system".to_string(),
+        writable: Some(false),
+        generations,
+    }
+}
+
+/// The half NixOS can answer: how many generations there are.
+///
+/// Counted from the system profile, which is world-readable, rather than
+/// from `/boot`, which on a default NixOS install is mounted `umask=0077`
+/// and cannot be read by an unprivileged masys at all.
+#[test]
+fn boot_pressure_counts_the_system_generations() {
+    let pressure = boot_pressure_from(&[system_profile((413..=447).map(generation).collect())])
+        .expect("thirty-five generations is pressure worth reporting");
+    assert_eq!(pressure.generations, Some(35));
+}
+
+/// **The half NixOS cannot answer, and why it says so rather than guessing.**
+///
+/// `/boot` is unreadable without root, so the bytes its entries occupy are
+/// not measurable. The store sizes that *are* readable answer a different
+/// question - what a generation holds - and on the development host they
+/// differ by 20x: thirty-five generations reference only three distinct
+/// kernel/initrd pairs, so summing per generation reports 2.03 GB where
+/// the deduplicated figure is 102 MB, and `/boot` itself holds 59 MB.
+///
+/// A number that can be wrong by twenty times is not a measurement.
+#[test]
+fn boot_pressure_declines_to_guess_at_reclaimable_bytes() {
+    let pressure = boot_pressure_from(&[system_profile((413..=447).map(generation).collect())])
+        .expect("pressure");
+    assert_eq!(pressure.reclaimable_bytes, None);
+}
+
+/// One generation is not pressure - it is a host that has just been
+/// installed, or one whose generations were collected an hour ago.
+#[test]
+fn a_single_generation_is_not_boot_pressure() {
+    assert_eq!(
+        boot_pressure_from(&[system_profile(vec![generation(447)])]),
+        None
+    );
+    assert_eq!(boot_pressure_from(&[]), None);
+}
+
+/// The *system* profile, not whichever came first. A home-manager profile
+/// has generations too and none of them puts a kernel in `/boot`.
+#[test]
+fn only_the_system_profile_counts_toward_boot_pressure() {
+    let home = Profile {
+        kind: ProfileKind::Home,
+        path: "/nix/var/nix/profiles/per-user/someone/home-manager".to_string(),
+        writable: Some(true),
+        generations: (1..=20).map(generation).collect(),
+    };
+    assert_eq!(boot_pressure_from(&[home]), None);
+}
+
+/// A store directory name splits into a package and a version at the first
+/// `-` that is not followed by a letter.
+///
+/// `builtins.parseDrvName`'s own rule. Not the first `-` outright, which
+/// would cut `python3.13-setuptools-80.9.0` after `python3.13`; and not
+/// the last `-` a digit follows, which this suite asserted until
+/// 2026-08-30 and which cuts `rust-analyzer-2026-06-15` after `2026-06`.
+/// "Followed by a letter" is what tells a hyphen inside a name from the
+/// one before a version.
+#[test]
+fn a_store_name_splits_into_package_and_version() {
+    for (dir, name, version) in [
+        ("git-2.55.0", "git", "2.55.0"),
+        (
+            "python3.13-setuptools-80.9.0",
+            "python3.13-setuptools",
+            "80.9.0",
+        ),
+        // The output suffix is nix's, not part of the version.
+        ("gcc-13.3.0-lib", "gcc", "13.3.0"),
+        ("acl-2.4.0-bin", "acl", "2.4.0"),
+        // And a real version that merely looks like one is kept.
+        ("openssl-3.0.15-rc1", "openssl", "3.0.15-rc1"),
+        ("openssl-3.0.15", "openssl", "3.0.15"),
+    ] {
+        assert_eq!(
+            parse_store_name(dir),
+            Some(Package {
+                name: name.to_string(),
+                version: version.to_string()
+            }),
+            "{dir}"
+        );
+    }
+}
+
+/// The five names on the development host that the previous rule got
+/// wrong, which is what found it.
+///
+/// Every one of them has a hyphen *inside* the version, so the
+/// last-`-`-a-digit-follows reading cut in the middle of a date or after
+/// a patch number and handed the buffer a package called
+/// `rust-analyzer-2026-06`. Measured 2026-08-30 across the 267 distinct
+/// store directory names in this host's system path: exactly these five
+/// parsed differently under the two rules, and nix's gets all five right.
+#[test]
+fn the_names_the_previous_rule_split_in_the_wrong_place() {
+    for (dir, name, version) in [
+        ("glibc-2.42-67", "glibc", "2.42-67"),
+        // The output suffix comes off first, so this is the one above.
+        ("glibc-2.42-67-bin", "glibc", "2.42-67"),
+        ("glibc-2.42-67-getent", "glibc", "2.42-67-getent"),
+        ("rust-analyzer-2026-06-15", "rust-analyzer", "2026-06-15"),
+        (
+            "sox-14.4.2-unstable-2021-05-09",
+            "sox",
+            "14.4.2-unstable-2021-05-09",
+        ),
+    ] {
+        assert_eq!(
+            parse_store_name(dir),
+            Some(Package {
+                name: name.to_string(),
+                version: version.to_string()
+            }),
+            "{dir}"
+        );
+    }
+}
+
+/// The hash goes, and only a real hash goes.
+///
+/// `parse_store_name` takes the directory name as `/nix/store` spells it,
+/// so it strips the prefix itself rather than leaving that to whichever
+/// caller remembers. The second case is why the check is the base32
+/// alphabet and not the length: a 32-character name followed by a hyphen
+/// is not a hashed path, and trimming it would behead a real package.
+#[test]
+fn a_hash_prefix_is_stripped_and_a_lookalike_is_not() {
+    assert_eq!(
+        parse_store_name("6f0qqak4qbcrbw4f750phr88c9yhpf5s-git-2.55.0"),
+        Some(Package {
+            name: "git".to_string(),
+            version: "2.55.0".to_string()
+        }),
+        "a real hash"
+    );
+    // Exactly 32 characters then a `-`, so a length check would strip it -
+    // but `e`, `o`, `u` and `t` are not in nix's base32, so this is a name.
+    let lookalike = "theoretical-quantum-tunnelingxyz-1.0";
+    assert_eq!(
+        lookalike.as_bytes()[32],
+        b'-',
+        "the fixture only tests what it claims if the hyphen is at 32"
+    );
+    assert_eq!(
+        parse_store_name(lookalike),
+        Some(Package {
+            name: "theoretical-quantum-tunnelingxyz".to_string(),
+            version: "1.0".to_string()
+        }),
+        "a 32-character head that is not a hash keeps its name"
+    );
+}
+
+/// A directory with no version is not a package this can describe. Better
+/// absent than listed with an invented version.
+#[test]
+fn a_store_name_with_no_version_is_not_a_package() {
+    for dir in ["system-path", "man-pages", ""] {
+        assert_eq!(parse_store_name(dir), None, "{dir}");
+    }
+}
+
+/// One entry per package, however many binaries it provides.
+///
+/// The system path on the development host holds 1408 binaries resolving
+/// to 268 store paths and 254 packages - `util-linux` alone supplies 119
+/// of the binaries and `uutils-coreutils` 108 - so a list built from
+/// binaries rather than from their targets reports those packages once
+/// per binary. Re-measured 2026-08-30; this said `106` and `coreutils`.
+#[test]
+fn packages_are_deduplicated_and_sorted() {
+    let packages = packages_from(&[
+        "6f0qqak4qbcrbw4f750phr88c9yhpf5s-git-2.55.0".to_string(),
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-coreutils-9.5".to_string(),
+        "6f0qqak4qbcrbw4f750phr88c9yhpf5s-git-2.55.0".to_string(),
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-system-path".to_string(),
+    ]);
+    assert_eq!(
+        packages,
+        vec![
+            Package {
+                name: "coreutils".to_string(),
+                version: "9.5".to_string()
+            },
+            Package {
+                name: "git".to_string(),
+                version: "2.55.0".to_string()
+            },
+        ],
+        "deduplicated, sorted, and the versionless entry dropped"
+    );
 }

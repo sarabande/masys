@@ -41,7 +41,12 @@ struct Lib {
     flush_matches: unsafe extern "C" fn(*mut SdJournal),
     seek_tail: unsafe extern "C" fn(*mut SdJournal) -> c_int,
     previous_skip: unsafe extern "C" fn(*mut SdJournal, u64) -> c_int,
-    get_data: unsafe extern "C" fn(*mut SdJournal, *const c_char, *mut *const c_void, *mut usize) -> c_int,
+    get_data: unsafe extern "C" fn(
+        *mut SdJournal,
+        *const c_char,
+        *mut *const c_void,
+        *mut usize,
+    ) -> c_int,
     get_realtime_usec: unsafe extern "C" fn(*mut SdJournal, *mut u64) -> c_int,
     wait: unsafe extern "C" fn(*mut SdJournal, u64) -> c_int,
 }
@@ -130,6 +135,11 @@ fn load() -> Option<Lib> {
 ///
 /// `None` means the subprocess path is what masys will use, on this host,
 /// for the rest of the run.
+///
+/// Nothing in the binary calls this - `Reader::open` reaches `lib()`
+/// directly and branches on its own `None`. Exists for tests, which have
+/// no other way to ask whether this host's library actually loaded before
+/// asserting behaviour that depends on it.
 pub fn available() -> bool {
     lib().is_some()
 }
@@ -164,12 +174,22 @@ impl Reader {
         if unsafe { (lib.open)(&mut journal, SD_JOURNAL_LOCAL_ONLY) } < 0 || journal.is_null() {
             return None;
         }
-        let reader = Reader { lib, journal, unit: unit.to_string() };
+        let reader = Reader {
+            lib,
+            journal,
+            unit: unit.to_string(),
+        };
         let match_text = format!("_SYSTEMD_UNIT={unit}");
         // SAFETY: the handle is open, and `match_text` outlives the call.
         // A zero length asks libsystemd to measure the NUL-terminated
         // string itself, which is why the bytes must not contain one.
-        let added = unsafe { (lib.add_match)(reader.journal, match_text.as_ptr() as *const c_void, match_text.len()) };
+        let added = unsafe {
+            (lib.add_match)(
+                reader.journal,
+                match_text.as_ptr() as *const c_void,
+                match_text.len(),
+            )
+        };
         if added < 0 {
             return None;
         }
@@ -191,7 +211,9 @@ impl Reader {
         let mut len: usize = 0;
         // SAFETY: the handle is open and positioned on an entry; `data`
         // and `len` are valid out-pointers.
-        if unsafe { (self.lib.get_data)(self.journal, cname.as_ptr(), &mut data, &mut len) } < 0 || data.is_null() {
+        if unsafe { (self.lib.get_data)(self.journal, cname.as_ptr(), &mut data, &mut len) } < 0
+            || data.is_null()
+        {
             return None;
         }
         // SAFETY: libsystemd guarantees `data` points at `len` readable
@@ -213,6 +235,15 @@ impl Reader {
             unit: self.field("_SYSTEMD_UNIT"),
             priority: priority_of(self.field("PRIORITY").as_deref()),
             message: self.field("MESSAGE").unwrap_or_default(),
+            // Read here rather than hardcoded `false`, though this
+            // reader only ever matches `_SYSTEMD_UNIT=` and a kernel
+            // record carries no such field, so it provably cannot see
+            // one. That argument is invisible from the assignment: the
+            // next reader would find a constant where the other path
+            // has a reading, and could not tell a deduction from an
+            // oversight. One field read costs nothing and leaves both
+            // paths answering the same question the same way.
+            origin: crate::journal::origin_of(self.field("_TRANSPORT").as_deref()),
         })
     }
 

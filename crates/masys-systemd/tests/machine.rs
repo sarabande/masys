@@ -11,14 +11,20 @@ fn pretty_name_is_taken_whole_and_unquoted() {
 
 #[test]
 fn a_single_quoted_value_is_unquoted_too() {
-    assert_eq!(parse_os_release("PRETTY_NAME='Debian GNU/Linux 12 (bookworm)'\n"), "Debian GNU/Linux 12 (bookworm)");
+    assert_eq!(
+        parse_os_release("PRETTY_NAME='Debian GNU/Linux 12 (bookworm)'\n"),
+        "Debian GNU/Linux 12 (bookworm)"
+    );
 }
 
 /// A host with no PRETTY_NAME is unusual but not broken, and refusing to
 /// name it would cost the whole machine line.
 #[test]
 fn a_missing_pretty_name_falls_back_rather_than_failing() {
-    assert_eq!(parse_os_release("NAME=\"Alpine Linux\"\nID=alpine\n"), "Alpine Linux");
+    assert_eq!(
+        parse_os_release("NAME=\"Alpine Linux\"\nID=alpine\n"),
+        "Alpine Linux"
+    );
     assert_eq!(parse_os_release("ID=alpine\n"), "alpine");
     assert_eq!(parse_os_release(""), "unknown");
 }
@@ -42,7 +48,8 @@ fn cpuinfo_reports_the_model_and_counts_logical_cpus() {
 /// answer, not a parse failure, and the core count still matters.
 #[test]
 fn cpuinfo_without_a_model_name_still_counts_cpus() {
-    let (model, cores) = parse_cpuinfo("processor\t: 0\nBogoMIPS\t: 50.00\n\nprocessor\t: 1\nBogoMIPS\t: 50.00\n");
+    let (model, cores) =
+        parse_cpuinfo("processor\t: 0\nBogoMIPS\t: 50.00\n\nprocessor\t: 1\nBogoMIPS\t: 50.00\n");
     assert_eq!(model, "");
     assert_eq!(cores, 2);
 }

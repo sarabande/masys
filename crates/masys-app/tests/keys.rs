@@ -39,15 +39,27 @@ fn alt_is_a_prefix() {
 #[test]
 fn ctrl_is_a_prefix_too() {
     assert_eq!(Key::parse("ctrl+n"), Some(Key::ctrl(KeyCode::Char('n'))));
-    assert_eq!(Key::parse("c-n"), Some(Key::ctrl(KeyCode::Char('n'))), "emacs spelling, which magit users will try");
-    assert_eq!(Key::parse("ctrl+alt+delete".trim_end_matches("delete")), None, "an empty base is still not a key");
+    assert_eq!(
+        Key::parse("c-n"),
+        Some(Key::ctrl(KeyCode::Char('n'))),
+        "emacs spelling, which magit users will try"
+    );
+    assert_eq!(
+        Key::parse("ctrl+alt+delete".trim_end_matches("delete")),
+        None,
+        "an empty base is still not a key"
+    );
 }
 
 /// A typo in a config file should leave the default binding alone and say
 /// so, not silently bind something else.
 #[test]
 fn an_unrecognised_key_is_rejected_rather_than_guessed() {
-    assert_eq!(Key::parse("hyper+n"), None, "a modifier masys does not model is not a near-miss to guess at");
+    assert_eq!(
+        Key::parse("hyper+n"),
+        None,
+        "a modifier masys does not model is not a near-miss to guess at"
+    );
     assert_eq!(Key::parse("nope"), None);
     assert_eq!(Key::parse(""), None);
 }
@@ -73,7 +85,13 @@ fn every_spelling_parses_back_to_the_same_key() {
         Key::alt(KeyCode::Char('n')),
     ];
     for key in keys {
-        assert_eq!(Key::parse(&key.spelling()), Some(key), "{:?} spells {:?}", key, key.spelling());
+        assert_eq!(
+            Key::parse(&key.spelling()),
+            Some(key),
+            "{:?} spells {:?}",
+            key,
+            key.spelling()
+        );
     }
 }
 

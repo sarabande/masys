@@ -6,10 +6,14 @@ use masys_domain::sample::LoadAverage;
 /// `1.37 0.50 0.28 1/1340 1758249` - the trailing running/total and last
 /// pid are of no interest to any buffer.
 pub fn parse_loadavg(text: &str) -> Result<LoadAverage, MasysError> {
-    let mut fields = text.split_whitespace().filter_map(|f| f.parse::<f32>().ok());
+    let mut fields = text
+        .split_whitespace()
+        .filter_map(|f| f.parse::<f32>().ok());
     match (fields.next(), fields.next(), fields.next()) {
         (Some(one), Some(five), Some(fifteen)) => Ok(LoadAverage { one, five, fifteen }),
-        _ => Err(MasysError::System("loadavg: fewer than three averages".into())),
+        _ => Err(MasysError::System(
+            "loadavg: fewer than three averages".into(),
+        )),
     }
 }
 

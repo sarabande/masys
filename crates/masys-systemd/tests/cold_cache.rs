@@ -3,7 +3,12 @@ use masys_systemd::units::{ColdCache, ColdProperties};
 const TTL: u64 = 60_000;
 
 fn props(enabled: bool) -> ColdProperties {
-    ColdProperties { enabled, cgroup: None, slice: None, triggers: Vec::new() }
+    ColdProperties {
+        enabled,
+        cgroup: None,
+        slice: None,
+        triggers: Vec::new(),
+    }
 }
 
 #[test]
@@ -13,7 +18,11 @@ fn an_entry_is_reused_until_the_ttl_expires() {
     cache.insert("a.service".to_string(), props(true));
 
     cache.expire_if_stale(TTL - 1, TTL);
-    assert_eq!(cache.get("a.service"), Some(&props(true)), "still fresh one millisecond short of the ttl");
+    assert_eq!(
+        cache.get("a.service"),
+        Some(&props(true)),
+        "still fresh one millisecond short of the ttl"
+    );
 }
 
 /// The reason this exists: `App` takes ownership of the `SystemService`, so
@@ -25,8 +34,15 @@ fn the_whole_cache_is_dropped_once_the_ttl_passes() {
     cache.expire_if_stale(0, TTL);
     cache.insert("a.service".to_string(), props(true));
 
-    assert!(cache.expire_if_stale(TTL, TTL), "reaching the ttl expires the cache");
-    assert_eq!(cache.get("a.service"), None, "the entry is gone and will be re-read");
+    assert!(
+        cache.expire_if_stale(TTL, TTL),
+        "reaching the ttl expires the cache"
+    );
+    assert_eq!(
+        cache.get("a.service"),
+        None,
+        "the entry is gone and will be re-read"
+    );
 }
 
 #[test]
@@ -37,7 +53,10 @@ fn expiring_restarts_the_clock_rather_than_expiring_every_call() {
 
     assert!(cache.expire_if_stale(TTL, TTL));
     cache.insert("a.service".to_string(), props(false));
-    assert!(!cache.expire_if_stale(TTL + 1, TTL), "the ttl runs from the last expiry, not from zero");
+    assert!(
+        !cache.expire_if_stale(TTL + 1, TTL),
+        "the ttl runs from the last expiry, not from zero"
+    );
     assert_eq!(cache.get("a.service"), Some(&props(false)));
 }
 

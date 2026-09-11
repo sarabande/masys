@@ -36,6 +36,229 @@ fn words(parts: &[&str]) -> Vec<String> {
     parts.iter().map(|part| part.to_string()).collect()
 }
 
+/// How `nixos-rebuild` should raise privilege for the commands that
+/// activate.
+///
+/// masys runs unprivileged, and the three rebuild verbs that write
+/// (`switch`, `boot` and `test`) are where that used to cost the most:
+/// the build runs for minutes and is then refused at activation, which
+/// was the first thing the README's Status section named.
+///
+/// `sudo` where the host has it, `run0` where it does not.
+///
+/// **`sudo` prompts on the terminal. `run0` prompts wherever the session's
+/// polkit agent happens to be, which is not the terminal and may be
+/// nowhere at all.**
+///
+/// That decides it, and it decides it against the earlier preference.
+/// These operations are the ones that take the screen: masys hands the
+/// terminal over so a rebuild can stream its own output for as long as it
+/// runs, and the whole point of handing it over is that what happens next
+/// happens where the operator is looking. `sudo` asks there. `run0`
+/// delegates to whatever agent the *session* registered - on a GNOME
+/// desktop that is a `gnome-shell` dialog somewhere behind the terminal,
+/// and over SSH or on a bare TTY there is no agent to ask at all.
+/// Measured on the development host: `Authorization Manager Agent Helper
+/// (PID 2778/UID 1000)`, `gnome-shell`'s agent, put the password prompt
+/// in a window while masys had just given up the screen for the rebuild's
+/// output. `run0` offers no way to force a terminal agent - its options
+/// are `--no-ask-password`, `--pty` and `--pty-late`, none of which
+/// changes who asks.
+///
+/// Issue #13 rates `sudo` the weaker of the two because it depends on a
+/// sudoers policy masys cannot see. That is true, and polkit is equally a
+/// policy masys cannot see; the argument was never about knowability. It
+/// was that polkit is the mechanism masys already relies on for unit
+/// verbs - and that still holds *for unit verbs*, which are instant, go
+/// through `systemctl` and never take the terminal. A dialog is a fine
+/// place to authorise those. It is the wrong place to authorise something
+/// the operator is watching a terminal for.
+///
+/// So the preference is not "sudo is better" but "ask where the operator
+/// is looking", and the two mechanisms differ on exactly that.
+/// `NIX_SUDOOPTS` is the escape hatch `nixos-rebuild` documents for
+/// tuning sudo, and masys passes the environment through untouched.
+///
+/// No `--ask-elevate-password`. masys hands the terminal over for the
+/// whole rebuild - the design's `Flow::Suspend` - so `sudo` prompts on a
+/// real terminal the operator is looking at. Reading the password
+/// ourselves to feed it in would be masys handling a root password for no
+/// gain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Elevate {
+    /// Nothing to add: masys is already root, this `nixos-rebuild` has no
+    /// such flag, this host offers neither method, or the verb activates
+    /// nothing.
+    #[default]
+    No,
+    /// `--elevate run0`, systemd's polkit-based elevation.
+    Run0,
+    /// `--elevate sudo`, which prefixes the activation commands with
+    /// `sudo`.
+    Sudo,
+}
+
+impl Elevate {
+    /// The word for this method, or `None` where there is nothing to add.
+    ///
+    /// One word, two mechanisms. `nixos-rebuild` takes it as the value of
+    /// `--elevate` and raises privilege itself; everything else has no
+    /// such flag and is *run through* the program of the same name. Which
+    /// of the two applies is the operation's to know, so each arm of
+    /// [`argv`] uses this the way its own tool supports.
+    fn word(self) -> Option<&'static str> {
+        match self {
+            Elevate::No => None,
+            Elevate::Run0 => Some("run0"),
+            Elevate::Sudo => Some("sudo"),
+        }
+    }
+
+    /// The command, run through this method.
+    ///
+    /// A prefix rather than a flag, for the tools that have none.
+    /// `run0 nix-env …` raises `org.freedesktop.systemd1`'s polkit
+    /// action, which is the same one a unit verb raises through
+    /// `systemctl` - so an operator granted masys's unit verbs is granted
+    /// this by the rule they already hold.
+    fn wrapping(self, command: Vec<String>) -> Vec<String> {
+        match self.word() {
+            Some(method) => words(&[method]).into_iter().chain(command).collect(),
+            None => command,
+        }
+    }
+}
+
+/// The elevation this host can actually perform, preferring the one that
+/// asks on the terminal.
+///
+/// Both arguments are "is this program on `PATH`", which is as far as a
+/// look can get: whether the *policy* will let this operator through is
+/// not knowable without trying, for either method. What is knowable is
+/// which mechanism exists, and passing a method the host does not have
+/// would turn a refusal at activation into a "command not found" at
+/// activation - the same minutes gone, a stranger message.
+pub fn offered(has_run0: bool, has_sudo: bool) -> Elevate {
+    match (has_sudo, has_run0) {
+        (true, _) => Elevate::Sudo,
+        (false, true) => Elevate::Run0,
+        (false, false) => Elevate::No,
+    }
+}
+
+/// Whether a program is on `PATH`.
+///
+/// Takes the existence check as an argument, the shape
+/// [`crate::reboot_state`] already uses in this crate: the part with a
+/// decision in it is testable without a filesystem.
+pub fn on_path(program: &str, path: &str, exists: impl Fn(&std::path::Path) -> bool) -> bool {
+    path.split(':')
+        .filter(|entry| !entry.is_empty())
+        .any(|entry| exists(&std::path::Path::new(entry).join(program)))
+}
+
+/// Whether this host's `nixos-rebuild` accepts `--elevate`.
+///
+/// Measured off its own `--help`, because the flag is nixos-rebuild-ng's
+/// and the classic shell script has nothing like it. A host still running
+/// the old one would take the flag, print usage and exit - after the
+/// build, which is the failure this whole thing exists to remove.
+///
+/// A string predicate rather than a version test: `nixos-rebuild
+/// --version` prints a usage banner on this host rather than a version,
+/// and the question is what the binary in front of us accepts, not which
+/// implementation somebody believes it is.
+pub fn accepts_elevate(help: &str) -> bool {
+    help.contains("--elevate")
+}
+
+/// The elevation one operation wants, given what masys measured about
+/// the host and about itself.
+///
+/// `None` for `accepts` means the probe did not come back, and it is
+/// treated as "no": passing a flag masys did not confirm would trade a
+/// refusal at activation for a usage error at activation, which is the
+/// same minutes wasted and a stranger message.
+///
+/// Root needs nothing, and neither does `build`, which is the one verb
+/// that stops at a store path.
+///
+/// `dry-activate` *is* elevated, though it changes nothing, and the
+/// reason is measured rather than assumed. It reaches `systemd-run …
+/// switch-to-configuration dry-activate` like the three that write, and
+/// unprivileged it is refused there - after the build, which is minutes
+/// gone for an answer it never gives. An earlier version of this function
+/// left it out on the argument that prompting for a password to preview
+/// something teaches the operator to type one without reading. That
+/// argument is real and it loses to this one: the alternative is not
+/// "no prompt", it is "no answer, five minutes later".
+pub fn elevation(
+    op: &NixOp,
+    euid: u32,
+    accepts: Option<bool>,
+    offered: Elevate,
+    writable: impl Fn(&str) -> bool,
+) -> Elevate {
+    // Root needs nothing, whatever the operation.
+    if euid == 0 {
+        return Elevate::No;
+    }
+    match op {
+        // The three that write a profile, and have no elevation flag
+        // between them: `nix-env`'s synopsis carries none and
+        // `nix-collect-garbage`'s is `[--delete-old] [-d]
+        // [--delete-older-than period] [--max-freed bytes] [--dry-run]`.
+        // So they are run *through* the method rather than told about it.
+        //
+        // Asked of the profile rather than of the uid, because not every
+        // profile is root's. `~/.local/state/nix/profiles` belongs to the
+        // operator, so deleting a home-manager generation needs nothing -
+        // and prompting for root to remove your own generation would be
+        // masys asking for a privilege the act does not use.
+        NixOp::Activate { profile, .. } | NixOp::DeleteGenerations { profile, .. } => {
+            match writable(profile) {
+                true => Elevate::No,
+                false => offered,
+            }
+        }
+        // `nix-collect-garbage` "looks in a few locations, and acts on
+        // all profiles it finds there" - the system profile among them,
+        // which is never the operator's. There is no one path to ask
+        // about, so this is asked of the uid.
+        NixOp::Clean { .. } => offered,
+        _ => rebuild_elevation(op, accepts, offered),
+    }
+}
+
+/// The `--elevate` value `nixos-rebuild` should be given, or `No`.
+///
+/// Separate from the wrapper above because it is a different mechanism
+/// with a different precondition: this one asks whether *the binary in
+/// front of us* accepts the flag at all.
+fn rebuild_elevation(op: &NixOp, accepts: Option<bool>, offered: Elevate) -> Elevate {
+    // `--rollback` changes which configuration `nixos-rebuild` builds
+    // from, not whether it activates, so it wants what `switch` wants.
+    // Every other operation drives `nix`, `nix-env`, `nix-channel` or
+    // `nixos-option`, and none of those has an elevation flag at all -
+    // which is exactly why masys marks the rows that write a root-owned
+    // profile rather than offering to raise privilege for them.
+    let verb = match op {
+        NixOp::Rebuild(verb) => *verb,
+        NixOp::Rollback | NixOp::Upgrade => RebuildVerb::Switch,
+        // Everything else, `Repl` included, activates nothing and so has
+        // nothing to elevate for. `Repl` had an arm of its own here
+        // saying exactly that, immediately above this one and returning
+        // the same value - deleting it changed no behaviour and no test,
+        // which is what made it worth deleting.
+        _ => return Elevate::No,
+    };
+    let activates = !matches!(verb, RebuildVerb::Build);
+    match accepts == Some(true) && activates {
+        true => offered,
+        false => Elevate::No,
+    }
+}
+
 /// The `nixos-rebuild` sub-command a [`RebuildVerb`] names.
 ///
 /// A match rather than lowercasing the variant's `Debug`, because the
@@ -65,17 +288,37 @@ fn rebuild_verb(verb: RebuildVerb) -> &'static str {
 ///
 /// [`NixOp::Activate`] is the one operation this cannot fully express: it
 /// is two commands, and only the first is here. See [`activation_argv`].
-pub fn argv(op: &NixOp, flake: Option<&str>) -> Vec<String> {
+pub fn argv(op: &NixOp, flake: Option<&str>, elevate: Elevate) -> Vec<String> {
     match op {
         NixOp::Rebuild(verb) => {
             let mut command = words(&["nixos-rebuild", rebuild_verb(*verb)]);
-            command.extend(flake.map(|flake| words(&["--flake", flake])).unwrap_or_default());
+            command.extend(
+                flake
+                    .map(|flake| words(&["--flake", flake]))
+                    .unwrap_or_default(),
+            );
+            // Last, so the sub-command and its flake stay where every
+            // reading of this command line expects them, and so a host
+            // that elevates and one that does not differ by a suffix
+            // rather than by a rearrangement.
+            if let Some(method) = elevate.word() {
+                command.extend(words(&["--elevate", method]));
+            }
             command
         }
         // The first half only. The number is formatted rather than passed
         // as a word because `nix-env` takes the generation as a decimal
         // argument, which is what `u64` already is.
-        NixOp::Activate { profile, generation } => words(&["nix-env", "-p", profile, "--switch-generation", &generation.to_string()]),
+        NixOp::Activate {
+            profile,
+            generation,
+        } => elevate.wrapping(words(&[
+            "nix-env",
+            "-p",
+            profile,
+            "--switch-generation",
+            &generation.to_string(),
+        ])),
         // A flag on an action, not an action of its own. `nixos-rebuild
         // --help` on this host lists the actions as
         // `{switch,boot,test,build,edit,repl,dry-build,dry-run,dry-activate,
@@ -95,10 +338,92 @@ pub fn argv(op: &NixOp, flake: Option<&str>) -> Vec<String> {
         // one: `--rollback` builds nothing. It activates a generation that
         // already exists on disk, so the configuration it would be built
         // from is not consulted and naming it would be theatre.
-        NixOp::Rollback => words(&["nixos-rebuild", "switch", "--rollback"]),
+        // Elevated on the same terms as `switch`, which is what it is:
+        // `--rollback` changes which command `nixos-rebuild` builds from,
+        // not whether it activates. A rollback refused at activation
+        // wastes the same minutes.
+        NixOp::Rollback => {
+            let mut command = words(&["nixos-rebuild", "switch", "--rollback"]);
+            if let Some(method) = elevate.word() {
+                command.extend(words(&["--elevate", method]));
+            }
+            command
+        }
+        // Also a flag on `switch`, and also without `--flake` - but for
+        // the opposite reason to `--rollback`. That one builds nothing, so
+        // naming a configuration would be theatre. This one builds
+        // normally; what it cannot have is a flake *reference*, because
+        // `--upgrade` updates channels and a flake host has none. The row
+        // dims there rather than emitting this command at all, so the
+        // absence here is a second line of defence rather than the rule.
+        NixOp::Upgrade => {
+            let mut command = words(&["nixos-rebuild", "switch", "--upgrade"]);
+            if let Some(method) = elevate.word() {
+                command.extend(words(&["--elevate", method]));
+            }
+            command
+        }
+        // An action like the rebuild verbs, so it takes the flake
+        // reference; unlike them it never elevates. `repl` evaluates and
+        // opens a prompt - it builds no system and activates nothing, so
+        // there is no activation for polkit to refuse, and handing an
+        // operator root inside an interactive session is a privilege they
+        // did not ask for and would then be holding.
+        NixOp::Repl => {
+            let mut command = words(&["nixos-rebuild", "repl"]);
+            command.extend(
+                flake
+                    .map(|flake| words(&["--flake", flake]))
+                    .unwrap_or_default(),
+            );
+            command
+        }
+        // Both build-image forms and build-vm take `--flake` where one
+        // resolves, exactly as the rebuild verbs do: they build *this*
+        // configuration, and on a flake host that is what names it.
+        NixOp::BuildVm => {
+            let mut command = words(&["nixos-rebuild", "build-vm"]);
+            command.extend(
+                flake
+                    .map(|flake| words(&["--flake", flake]))
+                    .unwrap_or_default(),
+            );
+            command
+        }
+        // No `--image-variant`, which is what makes it print the list
+        // rather than build one. nixos-rebuild(8): "run without any
+        // options to get a list of available variants".
+        NixOp::ListImageVariants => {
+            let mut command = words(&["nixos-rebuild", "build-image"]);
+            command.extend(
+                flake
+                    .map(|flake| words(&["--flake", flake]))
+                    .unwrap_or_default(),
+            );
+            command
+        }
+        NixOp::BuildImage { variant } => {
+            let mut command = words(&["nixos-rebuild", "build-image", "--image-variant", variant]);
+            command.extend(
+                flake
+                    .map(|flake| words(&["--flake", flake]))
+                    .unwrap_or_default(),
+            );
+            command
+        }
         NixOp::Diff { from, to } => words(&["nix", "store", "diff-closures", from, to]),
-        NixOp::Clean { older_than } => words(&["nix-collect-garbage", "--delete-older-than", older_than]),
-        NixOp::DeleteGenerations { profile, spec } => words(&["nix-env", "-p", profile, "--delete-generations", spec]),
+        NixOp::Clean { older_than } => elevate.wrapping(words(&[
+            "nix-collect-garbage",
+            "--delete-older-than",
+            older_than,
+        ])),
+        NixOp::DeleteGenerations { profile, spec } => elevate.wrapping(words(&[
+            "nix-env",
+            "-p",
+            profile,
+            "--delete-generations",
+            spec,
+        ])),
         // `--flake`, not a positional, and the difference is load-bearing.
         // `nix flake update`'s synopsis is `nix flake update [option...]
         // inputs...` - measured against nix 2.34.8 on this host - so its
@@ -108,7 +433,11 @@ pub fn argv(op: &NixOp, flake: Option<&str>) -> Vec<String> {
         // which leaves nix's own default of the working directory.
         NixOp::FlakeUpdate { input } => {
             let mut command = words(&["nix", "flake", "update"]);
-            command.extend(flake.map(|flake| words(&["--flake", flake])).unwrap_or_default());
+            command.extend(
+                flake
+                    .map(|flake| words(&["--flake", flake]))
+                    .unwrap_or_default(),
+            );
             command.extend(input.iter().map(|input| input.to_string()));
             command
         }
@@ -118,7 +447,11 @@ pub fn argv(op: &NixOp, flake: Option<&str>) -> Vec<String> {
         // flake.
         NixOp::FlakeCheck => {
             let mut command = words(&["nix", "flake", "check"]);
-            command.extend(flake.map(|flake| vec![flake.to_string()]).unwrap_or_default());
+            command.extend(
+                flake
+                    .map(|flake| vec![flake.to_string()])
+                    .unwrap_or_default(),
+            );
             command
         }
         // The channel operations act on root's channel profile, so a
@@ -131,7 +464,11 @@ pub fn argv(op: &NixOp, flake: Option<&str>) -> Vec<String> {
         NixOp::OptionValue { name } => words(&["nixos-option", name]),
         NixOp::HomeSwitch => {
             let mut command = words(&["home-manager", "switch"]);
-            command.extend(flake.map(|flake| words(&["--flake", flake])).unwrap_or_default());
+            command.extend(
+                flake
+                    .map(|flake| words(&["--flake", flake]))
+                    .unwrap_or_default(),
+            );
             command
         }
     }
@@ -151,8 +488,11 @@ pub fn argv(op: &NixOp, flake: Option<&str>) -> Vec<String> {
 /// is the supported interface: `nixos-rebuild` offers `--rollback`, which
 /// goes to the previous generation only, and `--specialisation`. There is
 /// no `--to-generation`.
-pub fn activation_argv(profile: &str) -> Vec<String> {
-    words(&[&format!("{profile}/bin/switch-to-configuration"), "switch"])
+pub fn activation_argv(profile: &str, elevate: Elevate) -> Vec<String> {
+    elevate.wrapping(words(&[
+        &format!("{profile}/bin/switch-to-configuration"),
+        "switch",
+    ]))
 }
 
 /// The flake reference to build from, given the sources in the order the
@@ -182,9 +522,19 @@ pub fn activation_argv(profile: &str) -> Vec<String> {
 /// which fails on the empty string rather than falling through to the
 /// next source - and would stop a channels host that happens to export it
 /// from offering the bare `nixos-rebuild switch` that works there.
-pub fn flake_ref_from(nh_flake: Option<&str>, flake: Option<&str>, etc_nixos_has_flake: bool) -> Option<String> {
-    let named = [nh_flake, flake].into_iter().flatten().map(str::trim).find(|value| !value.is_empty());
-    named.map(str::to_string).or_else(|| etc_nixos_has_flake.then(|| ETC_NIXOS.to_string()))
+pub fn flake_ref_from(
+    nh_flake: Option<&str>,
+    flake: Option<&str>,
+    etc_nixos_has_flake: bool,
+) -> Option<String> {
+    let named = [nh_flake, flake]
+        .into_iter()
+        .flatten()
+        .map(str::trim)
+        .find(|value| !value.is_empty());
+    named
+        .map(str::to_string)
+        .or_else(|| etc_nixos_has_flake.then(|| ETC_NIXOS.to_string()))
 }
 
 /// This host's flake reference, performing the reads [`flake_ref_from`]
@@ -198,7 +548,11 @@ pub fn flake_ref_from(nh_flake: Option<&str>, flake: Option<&str>, etc_nixos_has
 pub fn flake_ref() -> Option<String> {
     let nh_flake = std::env::var("NH_FLAKE").ok();
     let flake = std::env::var("FLAKE").ok();
-    flake_ref_from(nh_flake.as_deref(), flake.as_deref(), std::path::Path::new(ETC_NIXOS).join("flake.nix").exists())
+    flake_ref_from(
+        nh_flake.as_deref(),
+        flake.as_deref(),
+        std::path::Path::new(ETC_NIXOS).join("flake.nix").exists(),
+    )
 }
 
 /// Where `<nixos-config>` resolves, taking its readings rather than
@@ -222,7 +576,9 @@ pub fn nixos_config_from(nix_path: Option<&str>, etc_nixos_config: Option<&str>)
         .filter_map(|entry| entry.strip_prefix("nixos-config="))
         .map(str::trim)
         .find(|value| !value.is_empty());
-    named.map(str::to_string).or_else(|| etc_nixos_config.map(str::to_string))
+    named
+        .map(str::to_string)
+        .or_else(|| etc_nixos_config.map(str::to_string))
 }
 
 /// This host's `<nixos-config>`, performing the reads
@@ -231,7 +587,10 @@ pub fn nixos_config() -> Option<String> {
     let configuration = std::path::Path::new(ETC_NIXOS).join("configuration.nix");
     nixos_config_from(
         std::env::var("NIX_PATH").ok().as_deref(),
-        configuration.is_file().then(|| configuration.to_string_lossy().into_owned()).as_deref(),
+        configuration
+            .is_file()
+            .then(|| configuration.to_string_lossy().into_owned())
+            .as_deref(),
     )
 }
 
@@ -239,7 +598,56 @@ pub fn nixos_config() -> Option<String> {
 ///
 /// The reads and the spawning; [`run_with`] holds every decision.
 pub fn run(op: &NixOp) -> Result<(), MasysError> {
-    run_with(op, flake_ref().as_deref(), spawn)
+    let elevate = elevation(
+        op,
+        euid(),
+        accepts_elevate_here(),
+        offered_here(),
+        crate::profiles::writable_dir,
+    );
+    run_with(op, flake_ref().as_deref(), elevate, spawn)
+}
+
+/// Which elevation this host offers, from `PATH`.
+pub fn offered_here() -> Elevate {
+    let path = std::env::var("PATH").unwrap_or_default();
+    offered(
+        on_path("run0", &path, |candidate| candidate.exists()),
+        on_path("sudo", &path, |candidate| candidate.exists()),
+    )
+}
+
+/// This process's effective uid.
+pub(crate) fn euid() -> u32 {
+    // Infallible by POSIX: `geteuid` has no error return.
+    unsafe { libc::geteuid() }
+}
+
+/// Asks this host's `nixos-rebuild` what it accepts, or `None` where the
+/// question could not be put.
+///
+/// Run here, at the moment an operation is about to start, rather than
+/// once at startup. It costs one exec - 182 ms on the development host -
+/// against a rebuild that runs for minutes, so there is nothing to save
+/// by caching it and nothing to keep honest afterwards: a cached answer
+/// would go on being reported across a `nixos-rebuild` that was replaced
+/// underneath the session.
+///
+/// Nothing else in masys spawns a process to answer a question, and this
+/// is the exception rather than a new habit: the flag is not recorded
+/// anywhere on the filesystem, and the alternative is passing it blind.
+fn accepts_elevate_here() -> Option<bool> {
+    let output = std::process::Command::new("nixos-rebuild")
+        .arg("--help")
+        .output()
+        .ok()?;
+    // `--help` is expected to exit zero; a non-zero exit means this is
+    // not a `nixos-rebuild` masys can reason about, and `None` says so
+    // rather than reading whatever it printed.
+    if !output.status.success() {
+        return None;
+    }
+    Some(accepts_elevate(&String::from_utf8_lossy(&output.stdout)))
 }
 
 /// The chain one operation runs, against a caller-supplied spawner.
@@ -260,10 +668,20 @@ pub fn run(op: &NixOp) -> Result<(), MasysError> {
 /// succeeded, because activating "generation 427" through a profile still
 /// pointing at 428 would re-activate 428 and report that it had done what
 /// was asked.
-pub fn run_with(op: &NixOp, flake: Option<&str>, mut spawn: impl FnMut(&[String]) -> Result<(), MasysError>) -> Result<(), MasysError> {
-    spawn(&argv(op, flake))?;
-    if let NixOp::Activate { profile, generation } = op {
-        spawn(&activation_argv(profile)).map_err(|error| switched_but_not_activated(*generation, &error))?;
+pub fn run_with(
+    op: &NixOp,
+    flake: Option<&str>,
+    elevate: Elevate,
+    mut spawn: impl FnMut(&[String]) -> Result<(), MasysError>,
+) -> Result<(), MasysError> {
+    spawn(&argv(op, flake, elevate))?;
+    if let NixOp::Activate {
+        profile,
+        generation,
+    } = op
+    {
+        spawn(&activation_argv(profile, elevate))
+            .map_err(|error| switched_but_not_activated(*generation, &error))?;
     }
     Ok(())
 }
@@ -332,7 +750,11 @@ fn spawn(argv: &[String]) -> Result<(), MasysError> {
     if status.success() {
         return Ok(());
     }
-    Err(MasysError::Command(format!("{} {}", argv.join(" "), outcome(status))))
+    Err(MasysError::Command(format!(
+        "{} {}",
+        argv.join(" "),
+        outcome(status)
+    )))
 }
 
 /// How a command ended, in the words of the thing that ended it.

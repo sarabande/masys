@@ -1,6 +1,7 @@
 //! The outline's row model: a flat, ordered list of what a buffer shows.
 //! Structure only - no styling; masys-render's own row type adds that.
 
+use crate::presentation::Presentation;
 use masys_domain::declarative::ProfileKind;
 use masys_domain::finding::Finding;
 use masys_domain::journal::Entry;
@@ -10,7 +11,7 @@ use masys_domain::rate::ProcRate;
 use masys_domain::sample::{Disk, Filesystem, Proc};
 use masys_domain::unit::{Unit, UnitDetail};
 
-use crate::Overview;
+use crate::{Overview, OverviewPart};
 
 /// Which section a run of rows belongs to - a machine-readable tag
 /// alongside the rendered title, so fold/toggle logic (masys-app) can
@@ -24,17 +25,31 @@ pub enum SectionKind {
     FailedUnits,
     Flapping,
     Pressure,
-    /// `Finding::DiskCapacity`, `Finding::InodeExhaustion`, and
-    /// `Finding::ReadOnlyFilesystem` all share this section - three
+    /// `FindingKind::DiskCapacity`, `FindingKind::InodeExhaustion`, and
+    /// `FindingKind::ReadOnlyFilesystem` all share this section - three
     /// distinct checks, but all filesystem capacity/health problems.
     Disk,
     Clock,
+    /// What masys could not read.
+    ///
+    /// Named for what it holds rather than for the journal, because what
+    /// belongs here is any reading masys was unable to take - and kept
+    /// apart from the sections about the host, since "journald will not
+    /// answer" and "this machine is in trouble" are different claims and
+    /// a reader must not take one for the other.
+    Unreadable,
+    /// What the kernel logged, on the Status buffer.
+    ///
+    /// This variant existed and was deleted on 2026-08-28, correctly:
+    /// nothing constructed it. It is back because something does now -
+    /// which is the other half of what that sweep found, since the
+    /// section was designed all along and only the code was missing.
+    Kernel,
+    /// Error-priority lines from userspace, on the Status buffer.
+    /// Deleted and restored for the same reason as `Kernel`.
+    RecentErrors,
     OomKills,
     Degraded,
-    /// Kernel-origin journal entries (no owning unit) - dmesg-class
-    /// events like a GPU hang.
-    Kernel,
-    RecentErrors,
     /// The Units buffer's per-state groups. One kind for all of them:
     /// `kind` is a semantic tag for dispatch, and "a group of units" is
     /// the same thing whichever state it holds.
@@ -64,6 +79,8 @@ pub enum SectionKind {
     NixStore,
     /// Nix's own units, filtered out of the units masys already polls.
     NixUnits,
+    /// Every package this host has installed.
+    Packages,
 }
 
 impl SectionKind {
@@ -75,26 +92,53 @@ impl SectionKind {
     /// step by hand. `NixStore` and `System` are the deliberate absences:
     /// both always render, as the "checks actually ran" indicator of
     /// their view, so neither has a fold to cycle into.
+    ///
+    /// **An exhaustive `match`, not a `matches!`.** The predicate form
+    /// answers `false` for a variant nobody thought about, which is a
+    /// decision made by omission: the section renders, `TAB` does
+    /// nothing on it, and no test knows to ask. Spelling both groups out
+    /// costs twelve names and makes a new variant a compiler error until
+    /// somebody says which group it joins - the same trade `build_items`
+    /// took when its `node =>` catch-all came out.
     pub fn folds(self) -> bool {
-        matches!(
-            self,
-            SectionKind::Units | SectionKind::Journal | SectionKind::Generations(_) | SectionKind::Inputs | SectionKind::NixUnits
-        )
+        match self {
+            SectionKind::Units
+            | SectionKind::Journal
+            | SectionKind::Generations(_)
+            | SectionKind::Inputs
+            | SectionKind::NixUnits
+            | SectionKind::Packages => true,
+            SectionKind::Network
+            | SectionKind::FailedUnits
+            | SectionKind::Flapping
+            | SectionKind::Pressure
+            | SectionKind::Disk
+            | SectionKind::Clock
+            | SectionKind::Unreadable
+            | SectionKind::Kernel
+            | SectionKind::RecentErrors
+            | SectionKind::OomKills
+            | SectionKind::Degraded
+            | SectionKind::Filesystems
+            | SectionKind::Devices
+            | SectionKind::NixStore
+            | SectionKind::System => false,
+        }
     }
 
     /// The key this section folds under, given its rendered title.
     ///
     /// **Not the title**, which is what it used to be everywhere. A title
-    /// is display text, and the Nix view's titles carry readings: the
+    /// is display text, and the Nix buffer's titles carry readings: the
     /// Inputs heading names both revisions and the drift verdict, and the
     /// Home-manager heading says whether `nixos-rebuild` activates it.
     /// Fold Inputs, rebuild in another terminal, and the heading turns
     /// from `drift - not rebuilt` into `in sync` - which silently reopens
     /// the section the operator folded and strands the old key in the set
-    /// for the rest of the session. That is the exact workflow the view
+    /// for the rest of the session. That is the exact workflow the buffer
     /// exists for.
     ///
-    /// `build_nix_rows` only ever argued that its titles are unique
+    /// The Nix buffer only ever argued that its titles are unique
     /// *within one call*. A fold set outlives the call, so what it
     /// actually needs is stability *across* calls, which is a different
     /// and stronger property.
@@ -109,7 +153,9 @@ impl SectionKind {
         match self {
             SectionKind::Generations(ProfileKind::System) => "nix:generations:system".to_string(),
             SectionKind::Generations(ProfileKind::Home) => "nix:generations:home".to_string(),
-            SectionKind::Generations(ProfileKind::Channels) => "nix:generations:channels".to_string(),
+            SectionKind::Generations(ProfileKind::Channels) => {
+                "nix:generations:channels".to_string()
+            }
             SectionKind::Inputs => "nix:inputs".to_string(),
             SectionKind::NixUnits => "nix:units".to_string(),
             _ => title.to_string(),
@@ -124,11 +170,23 @@ pub enum Node {
         kind: SectionKind,
         count: Option<u32>,
     },
-    /// A triage finding, straight from masys-domain. Wrapped rather than
-    /// re-declared field-by-field (unlike wagit's `Node::Commit`) because
-    /// `Finding` has nine variants - duplicating that enum's shape here
-    /// would be pure restatement with nothing for the view layer to add.
-    Finding(Finding),
+    /// A triage finding, and everything it says about itself.
+    ///
+    /// The finding is wrapped rather than re-declared field-by-field
+    /// (unlike wagit's `Node::Commit`) because `FindingKind` has fourteen
+    /// variants - duplicating that enum's shape here would be pure
+    /// restatement. The [`Presentation`] beside it is the opposite kind
+    /// of thing: not the datum but what the tree makes of it, computed
+    /// once by [`Node::finding`] rather than five times by five callers.
+    ///
+    /// **Both, not either.** The presentation alone would lose the fact -
+    /// `Debug` output, and the section assertions that match on
+    /// `FindingKind`, both need it - and the finding alone is what the
+    /// five parallel matches were for.
+    Finding {
+        finding: Finding,
+        presentation: Presentation,
+    },
     /// One systemd unit, in the Units buffer.
     Unit {
         unit: Unit,
@@ -162,7 +220,7 @@ pub enum Node {
     /// A separate row rather than extra lines on `Node::Unit`, for two
     /// reasons. The selection highlight covers a whole list item, so a
     /// unit and its detail sharing one item lit the entire block. And the
-    /// cursor belongs on the *unit*: every verb in the view acts on the
+    /// cursor belongs on the *unit*: every verb in the buffer acts on the
     /// row under it, and a cursor parked on a property line would have
     /// nothing to act on. This row is never selectable.
     UnitDetail {
@@ -314,10 +372,19 @@ pub enum Node {
         rate: Option<masys_domain::rate::NetRate>,
     },
     /// The System section's body - one row, rendered as several lines.
-    Overview(Overview),
+    /// One line of the System section, and the part of the overview it
+    /// draws.
+    ///
+    /// The whole `Overview` rides on every line because the renderer
+    /// formats the values and only the data knows them - seven small
+    /// clones a tick, against a two-second tick. Carrying only each
+    /// part's own fields would need seven row shapes for one section.
+    OverviewLine {
+        overview: Overview,
+        part: OverviewPart,
+    },
     /// A cgroup/unit's aggregate row in the Procs buffer - CPU/mem/io
-    /// summed over everything folded beneath it, plus its sparkline
-    /// history.
+    /// summed over everything folded beneath it.
     ProcGroup {
         name: String,
         depth: u32,
@@ -332,9 +399,6 @@ pub enum Node {
         read_bytes_per_sec: f64,
         write_bytes_per_sec: f64,
         proc_count: u32,
-        /// Recent history samples, oldest first - render draws these as a
-        /// sparkline. Empty until the sample ring has history.
-        sparkline: Vec<f32>,
     },
     /// One process. `expanded` asks the renderer to also draw the detail
     /// sub-lines (cgroup, started-at, threads, state, nice, oom_score) -
@@ -385,5 +449,110 @@ pub enum Node {
         proc: Proc,
         detail: Option<Box<ProcDetail>>,
     },
+    /// One installed package, in the Packages buffer.
+    Package(masys_domain::platform::Package),
     Spacer,
+}
+
+impl Node {
+    /// A finding row, with its presentation computed.
+    ///
+    /// The only way to build one. `Node::Finding { .. }` is writable by
+    /// hand, but `Presentation`'s fields are private and
+    /// `Presentation::of` is its only constructor, so the presentation in
+    /// that slot can only ever be the one this finding earns.
+    pub fn finding(finding: Finding) -> Node {
+        let presentation = Presentation::of(&finding.kind);
+        Node::Finding {
+            finding,
+            presentation,
+        }
+    }
+
+    /// Whether the cursor may rest on this row.
+    ///
+    /// Spacers are structure. A `UnitDetail` or `ProcDetail` is content,
+    /// but it belongs to the row above it: every verb acts on the row
+    /// under the cursor, and a cursor on a property line would have
+    /// nothing to act on.
+    ///
+    /// **Here rather than in `masys-app`, and exhaustive rather than a
+    /// `matches!`.** Two separate claims, and the second is the reason.
+    ///
+    /// This is not a presentational choice, which is the only kind this
+    /// crate refuses: it is a fact about what a row *is*, of a piece with
+    /// the rest of `Node`. The renderer still decides how a row looks.
+    ///
+    /// The predicate form answered `true` for a variant nobody thought
+    /// about, and "selectable" is the wrong default - a new row type
+    /// became a cursor stop silently, with whatever verb the buffer binds
+    /// aimed at a row that cannot answer for it. That is not
+    /// hypothetical: Change 1 added five variants, the compiler named the
+    /// two checked sites, and two row types were selectable that should
+    /// not have been. Review found them, which is later than a compiler
+    /// error and by a person rather than a machine.
+    /// Whether `n` and `p` stop here - the outline's structure, as opposed
+    /// to [`Node::selectable`]'s question about a single row.
+    ///
+    /// Here for the same reason `selectable` is: whether a row heads a
+    /// group is a fact about what the row *is*. A `ProcGroup` counts
+    /// alongside `SectionHeader` because it heads the processes folded
+    /// under it, which is what the operator is navigating between.
+    ///
+    /// Exhaustive rather than a `matches!`, though the argument is weaker
+    /// than `selectable`'s and worth stating honestly: a new variant that
+    /// silently was not a heading would be *inert* rather than wrong - `n`
+    /// would skip it, visible the first time anyone used the buffer, where
+    /// a wrongly-selectable row aims a verb at something that cannot
+    /// answer for it. The case for exhaustiveness here is only that the
+    /// answer costs two arms and a `matches!` in `masys-app` costs a
+    /// decision nobody is prompted to make.
+    pub fn heading(&self) -> bool {
+        match self {
+            Node::SectionHeader { .. } | Node::ProcGroup { .. } => true,
+            Node::Spacer
+            | Node::UnitDetail { .. }
+            | Node::ProcDetail { .. }
+            | Node::Finding { .. }
+            | Node::Unit { .. }
+            | Node::Filesystem { .. }
+            | Node::Disk { .. }
+            | Node::Timer { .. }
+            | Node::Generation { .. }
+            | Node::Input { .. }
+            | Node::RebootPending { .. }
+            | Node::NixStore { .. }
+            | Node::NixPolicy { .. }
+            | Node::JournalEntry(_)
+            | Node::DirEntry { .. }
+            | Node::Interface { .. }
+            | Node::OverviewLine { .. }
+            | Node::Package(_)
+            | Node::Proc { .. } => false,
+        }
+    }
+
+    pub fn selectable(&self) -> bool {
+        match self {
+            Node::Spacer | Node::UnitDetail { .. } | Node::ProcDetail { .. } => false,
+            Node::SectionHeader { .. }
+            | Node::Finding { .. }
+            | Node::Unit { .. }
+            | Node::Filesystem { .. }
+            | Node::Disk { .. }
+            | Node::Timer { .. }
+            | Node::Generation { .. }
+            | Node::Input { .. }
+            | Node::RebootPending { .. }
+            | Node::NixStore { .. }
+            | Node::NixPolicy { .. }
+            | Node::JournalEntry(_)
+            | Node::DirEntry { .. }
+            | Node::Interface { .. }
+            | Node::OverviewLine { .. }
+            | Node::Package(_)
+            | Node::ProcGroup { .. }
+            | Node::Proc { .. } => true,
+        }
+    }
 }
