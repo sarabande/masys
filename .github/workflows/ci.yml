@@ -10,6 +10,12 @@ env:
   # A warning in this codebase is a defect that has not been written down
   # yet. There are none today, and this is what keeps it that way.
   RUSTFLAGS: -D warnings
+  # The same rule for the docs, which needed saying separately: rustdoc
+  # has its own flags and its own warnings, and `RUSTFLAGS` reaches
+  # neither. Two dangling doc links lived here for weeks because of that
+  # gap - one to a private constant, one to a sibling adapter this crate
+  # must not depend on - and both were invisible to every job below.
+  RUSTDOCFLAGS: -D warnings
 
 jobs:
   test:
@@ -26,6 +32,13 @@ jobs:
 
       - name: Clippy
         run: cargo clippy --workspace --all-targets
+
+      # What a reader who installed the crate actually gets. `--no-deps`
+      # because a warning in somebody else's crate is not this tree's to
+      # fix, and `citations.rs` already guards the half of this rustdoc
+      # cannot see - a doc naming a working document that does not ship.
+      - name: Docs
+        run: cargo doc --workspace --no-deps
 
       # The suite includes tests that read this runner's own systemd,
       # /proc and journal. They assert invariants rather than values, and

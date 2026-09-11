@@ -22,12 +22,16 @@ pub fn parse_swaps_zram_percent(text: &str) -> Option<f32> {
     let (mut size, mut used) = (0u64, 0u64);
     for line in text.lines().skip(1) {
         let mut columns = line.split_whitespace();
-        let Some(filename) = columns.next() else { continue };
+        let Some(filename) = columns.next() else {
+            continue;
+        };
         if !filename.starts_with("/dev/zram") {
             continue;
         }
         let mut numbers = columns.skip(1).filter_map(|c| c.parse::<u64>().ok());
-        let (Some(s), Some(u)) = (numbers.next(), numbers.next()) else { continue };
+        let (Some(s), Some(u)) = (numbers.next(), numbers.next()) else {
+            continue;
+        };
         size += s;
         used += u;
     }
@@ -39,8 +43,10 @@ pub fn parse_swaps_zram_percent(text: &str) -> Option<f32> {
 /// idle machine; `MemAvailable` is the kernel's own estimate of what a new
 /// allocation could obtain, which is what an operator means by "used".
 pub fn parse_meminfo(meminfo: &str, swaps: &str) -> Result<Memory, MasysError> {
-    let total = kb_field(meminfo, "MemTotal").ok_or_else(|| MasysError::System("meminfo: no MemTotal".into()))?;
-    let available = kb_field(meminfo, "MemAvailable").ok_or_else(|| MasysError::System("meminfo: no MemAvailable".into()))?;
+    let total = kb_field(meminfo, "MemTotal")
+        .ok_or_else(|| MasysError::System("meminfo: no MemTotal".into()))?;
+    let available = kb_field(meminfo, "MemAvailable")
+        .ok_or_else(|| MasysError::System("meminfo: no MemAvailable".into()))?;
     Ok(Memory {
         used_bytes: total.saturating_sub(available),
         total_bytes: total,

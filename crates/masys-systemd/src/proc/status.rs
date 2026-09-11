@@ -16,7 +16,9 @@ pub fn parse_status(text: &str) -> Result<RawStatus, MasysError> {
     let mut threads = None;
     let mut rss_bytes = None;
     for line in text.lines() {
-        let Some((key, value)) = line.split_once(':') else { continue };
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
         match key {
             "Threads" => {
                 threads = value.trim().parse().ok();

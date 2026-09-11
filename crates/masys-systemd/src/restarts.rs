@@ -42,7 +42,10 @@ impl RestartHistory {
         if stamps.is_empty() {
             return;
         }
-        self.seeded.entry(unit.to_string()).or_default().extend(stamps);
+        self.seeded
+            .entry(unit.to_string())
+            .or_default()
+            .extend(stamps);
     }
 
     /// Whether `n_restarts` is higher than the last poll's reading.
@@ -51,7 +54,9 @@ impl RestartHistory {
     /// before has no previous reading and so has not risen - its first
     /// sighting is a baseline, the same rule `observe` follows.
     pub fn count_rose(&self, unit: &str, n_restarts: u32) -> bool {
-        self.units.get(unit).is_some_and(|history| n_restarts > history.last_seen)
+        self.units
+            .get(unit)
+            .is_some_and(|history| n_restarts > history.last_seen)
     }
 
     /// Records this poll's `NRestarts` for `unit` and returns every
@@ -66,7 +71,35 @@ impl RestartHistory {
     /// A count that *falls* means the unit was reloaded or the daemon
     /// restarted, so the counter reset; re-baseline rather than treating
     /// the drop as negative restarts.
-    pub fn observe(&mut self, unit: &str, n_restarts: u32, now_ms: u64, window_ms: u64) -> Vec<u64> {
+    ///
+    /// **`None` is a read that failed, and is not a count.** It was the
+    /// third way a count could fall and the only one that is not a fact
+    /// about the unit: `unwrap_or(0)` upstream turned a failed `Get` into
+    /// a reset, and the next good poll then replayed the whole counter as
+    /// restarts happening *now*. The history is left exactly as it was -
+    /// no re-baseline, no new stamps - and the stamps already held are
+    /// returned, which is the same keep-last-good rule the rest of masys
+    /// applies to a reading it could not take.
+    pub fn observe(
+        &mut self,
+        unit: &str,
+        n_restarts: Option<u32>,
+        now_ms: u64,
+        window_ms: u64,
+    ) -> Vec<u64> {
+        let Some(n_restarts) = n_restarts else {
+            let cutoff = now_ms.saturating_sub(window_ms);
+            return match self.units.get_mut(unit) {
+                Some(history) => {
+                    history.stamps.retain(|&t| t >= cutoff);
+                    history.stamps.clone()
+                }
+                // Never seen, and this poll could not see it either.
+                // Recording a baseline from a failed read would make the
+                // next good one look like a rise from nothing.
+                None => Vec::new(),
+            };
+        };
         let history = match self.units.get_mut(unit) {
             Some(existing) => existing,
             None => {
@@ -77,7 +110,13 @@ impl RestartHistory {
                 let cutoff = now_ms.saturating_sub(window_ms);
                 stamps.retain(|&t| t >= cutoff);
                 stamps.sort_unstable();
-                self.units.insert(unit.to_string(), History { last_seen: n_restarts, stamps: stamps.clone() });
+                self.units.insert(
+                    unit.to_string(),
+                    History {
+                        last_seen: n_restarts,
+                        stamps: stamps.clone(),
+                    },
+                );
                 return stamps;
             }
         };

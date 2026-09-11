@@ -1,5 +1,9 @@
-//! The session's half of the Nix view: holding the port, sampling it, and
+//! The session's half of the Nix buffer: holding the port, sampling it, and
 //! turning what it said into the buffer's rows.
+//!
+//! Named for the session rather than the buffer because `nix_buffer.rs`
+//! next door already holds that name, and holds the layout tests: what is
+//! under test here is the wiring between the port and the rows.
 //!
 //! `nix_buffer.rs`'s own tests cover the layout. What is under test here
 //! is the wiring - that a reading reaches a row at all, that a *failed*
@@ -9,7 +13,7 @@
 mod fake;
 
 use fake::{FakeDeclarative, FakePlatformService, FakeSystemService, NoScanner, bare_snapshot};
-use masys_app::buffer::Registry;
+use masys_app::buffer::{BufferGates, Registry};
 use masys_app::keymap::Keymap;
 use masys_app::{App, Buffer, Key, KeyCode};
 use masys_domain::declarative::{Generation, Input, InputSource, Inputs, Profile, ProfileKind};
@@ -29,13 +33,20 @@ fn nixos(snapshot: Snapshot, units: Vec<Unit>, declarative: FakeDeclarative) -> 
         Box::new(FakePlatformService::default()),
         Box::new(NoScanner),
         "nixbox".to_string(),
-        Keymap::for_registry(Registry::new(true)),
+        Keymap::for_registry(Registry::new(BufferGates {
+            declarative: true,
+            packages: false,
+        })),
         Some(Box::new(declarative)),
     )
 }
 
 fn press_five(app: &mut App) {
-    app.handle_key(Key { code: KeyCode::Char('5'), ctrl: false, alt: false });
+    app.handle_key(Key {
+        code: KeyCode::Char('5'),
+        ctrl: false,
+        alt: false,
+    });
 }
 
 fn generation(id: u64, store_path: &str) -> Generation {
@@ -55,7 +66,10 @@ fn system_profile(ids: &[u64]) -> Profile {
         kind: ProfileKind::System,
         path: "/nix/var/nix/profiles/system".to_string(),
         writable: Some(true),
-        generations: ids.iter().map(|id| generation(*id, &format!("/nix/store/{id}-nixos-system"))).collect(),
+        generations: ids
+            .iter()
+            .map(|id| generation(*id, &format!("/nix/store/{id}-nixos-system")))
+            .collect(),
     }
 }
 
@@ -72,7 +86,11 @@ fn timer(name: &str, next_ms: Option<u64>, last_ms: Option<u64>) -> Unit {
         cgroup: None,
         slice: None,
         triggers: Vec::new(),
-        timer: Some(Timer { next_ms, last_ms, activates: name.replace(".timer", ".service") }),
+        timer: Some(Timer {
+            next_ms,
+            last_ms,
+            activates: name.replace(".timer", ".service"),
+        }),
     }
 }
 
@@ -81,7 +99,12 @@ fn store_row(app: &App) -> (Option<f32>, Option<u64>, Option<u32>) {
         .rows
         .iter()
         .find_map(|row| match row {
-            Node::NixStore { used_percent, free_bytes, gc_roots, .. } => Some((*used_percent, *free_bytes, *gc_roots)),
+            Node::NixStore {
+                used_percent,
+                free_bytes,
+                gc_roots,
+                ..
+            } => Some((*used_percent, *free_bytes, *gc_roots)),
             _ => None,
         })
         .expect("the Store section always renders")
@@ -100,7 +123,7 @@ fn generation_ids(app: &App) -> Vec<u64> {
 
 /// The registry's whole purpose, asserted through the session rather than
 /// through the registry: pressing `5` on a Debian host must not switch
-/// views, because there is no view there to switch to.
+/// buffers, because there is no buffer there to switch to.
 #[test]
 fn digit_five_does_nothing_without_a_declarative_service() {
     let mut app = App::with_declarative(
@@ -111,7 +134,7 @@ fn digit_five_does_nothing_without_a_declarative_service() {
         Keymap::default(),
         None,
     );
-    app.tick(1_000, "t".to_string()).expect("tick");
+    app.tick(1_000, "t".to_string());
 
     press_five(&mut app);
 
@@ -119,9 +142,9 @@ fn digit_five_does_nothing_without_a_declarative_service() {
 }
 
 #[test]
-fn digit_five_opens_the_nix_view_when_the_service_is_present() {
+fn digit_five_opens_the_nix_buffer_when_the_service_is_present() {
     let mut app = nixos(bare_snapshot(), Vec::new(), FakeDeclarative::default());
-    app.tick(1_000, "t".to_string()).expect("tick");
+    app.tick(1_000, "t".to_string());
 
     press_five(&mut app);
 
@@ -139,11 +162,11 @@ fn what_the_port_reported_reaches_the_rows() {
         ..Default::default()
     };
     let mut app = nixos(bare_snapshot(), Vec::new(), declarative);
-    app.tick(1_000, "t".to_string()).expect("tick");
+    app.tick(1_000, "t".to_string());
 
     press_five(&mut app);
 
-    // Newest first, which is `build_nix_rows`' ordering - asserted here
+    // Newest first, which is `NixBuffer::rows`' ordering - asserted here
     // only to show the generations arrived rather than being invented.
     assert_eq!(generation_ids(&app), vec![42, 41]);
     let (_, _, gc_roots) = store_row(&app);
@@ -165,14 +188,22 @@ fn a_failed_read_keeps_the_last_good_reading() {
         ..Default::default()
     };
     let mut app = nixos(bare_snapshot(), Vec::new(), declarative);
-    app.tick(1_000, "t".to_string()).expect("tick");
+    app.tick(1_000, "t".to_string());
     press_five(&mut app);
-    assert_eq!(generation_ids(&app), vec![42, 41], "the first tick read them");
+    assert_eq!(
+        generation_ids(&app),
+        vec![42, 41],
+        "the first tick read them"
+    );
 
     failing.set(true);
-    app.tick(3_000, "t".to_string()).expect("a declarative failure does not fail the tick");
+    app.tick(3_000, "t".to_string());
 
-    assert_eq!(generation_ids(&app), vec![42, 41], "a read that failed must not empty the list");
+    assert_eq!(
+        generation_ids(&app),
+        vec![42, 41],
+        "a read that failed must not empty the list"
+    );
     let (_, _, gc_roots) = store_row(&app);
     assert_eq!(gc_roots, Some(7), "nor report nothing pinning the store");
 }
@@ -183,7 +214,7 @@ fn a_failed_read_keeps_the_last_good_reading() {
 #[test]
 fn an_unmeasured_store_reports_no_reading_rather_than_zero() {
     let mut app = nixos(bare_snapshot(), Vec::new(), FakeDeclarative::default());
-    app.tick(1_000, "t".to_string()).expect("tick");
+    app.tick(1_000, "t".to_string());
 
     press_five(&mut app);
 
@@ -210,17 +241,28 @@ fn a_store_whose_reads_have_never_succeeded_counts_nothing() {
         ..Default::default()
     };
     let mut app = nixos(bare_snapshot(), Vec::new(), declarative);
-    app.tick(1_000, "t".to_string()).expect("a declarative failure does not fail the tick");
+    app.tick(1_000, "t".to_string());
 
     press_five(&mut app);
 
     let (_, _, gc_roots) = store_row(&app);
-    assert_eq!(gc_roots, None, "a refused read must not report an unpinned store");
+    assert_eq!(
+        gc_roots, None,
+        "a refused read must not report an unpinned store"
+    );
     let counts = app.view().rows.iter().find_map(|row| match row {
-        Node::NixStore { system_generations, home_generations, .. } => Some((*system_generations, *home_generations)),
+        Node::NixStore {
+            system_generations,
+            home_generations,
+            ..
+        } => Some((*system_generations, *home_generations)),
         _ => None,
     });
-    assert_eq!(counts, Some((None, None)), "nor a host with no generations to roll back to");
+    assert_eq!(
+        counts,
+        Some((None, None)),
+        "nor a host with no generations to roll back to"
+    );
 }
 
 /// `/nix` where the store has a filesystem of its own, `/` only as the
@@ -230,11 +272,23 @@ fn a_store_whose_reads_have_never_succeeded_counts_nothing() {
 fn the_store_reading_prefers_the_nix_mount_to_the_root_one() {
     let mut snapshot = bare_snapshot();
     snapshot.filesystems = vec![
-        Filesystem { mount_point: "/".to_string(), used_percent: 12.0, free_bytes: 1_000, inode_used_percent: 1.0, read_only: false },
-        Filesystem { mount_point: "/nix".to_string(), used_percent: 87.0, free_bytes: 2_000, inode_used_percent: 2.0, read_only: false },
+        Filesystem {
+            mount_point: "/".to_string(),
+            used_percent: 12.0,
+            free_bytes: 1_000,
+            inode_used_percent: 1.0,
+            read_only: false,
+        },
+        Filesystem {
+            mount_point: "/nix".to_string(),
+            used_percent: 87.0,
+            free_bytes: 2_000,
+            inode_used_percent: 2.0,
+            read_only: false,
+        },
     ];
     let mut app = nixos(snapshot, Vec::new(), FakeDeclarative::default());
-    app.tick(1_000, "t".to_string()).expect("tick");
+    app.tick(1_000, "t".to_string());
 
     press_five(&mut app);
 
@@ -244,10 +298,15 @@ fn the_store_reading_prefers_the_nix_mount_to_the_root_one() {
 #[test]
 fn the_root_filesystem_answers_where_the_store_has_no_mount_of_its_own() {
     let mut snapshot = bare_snapshot();
-    snapshot.filesystems =
-        vec![Filesystem { mount_point: "/".to_string(), used_percent: 12.0, free_bytes: 1_000, inode_used_percent: 1.0, read_only: false }];
+    snapshot.filesystems = vec![Filesystem {
+        mount_point: "/".to_string(),
+        used_percent: 12.0,
+        free_bytes: 1_000,
+        inode_used_percent: 1.0,
+        read_only: false,
+    }];
     let mut app = nixos(snapshot, Vec::new(), FakeDeclarative::default());
-    app.tick(1_000, "t".to_string()).expect("tick");
+    app.tick(1_000, "t".to_string());
 
     press_five(&mut app);
 
@@ -259,10 +318,16 @@ fn the_root_filesystem_answers_where_the_store_has_no_mount_of_its_own() {
 /// Only the gc job has a retention - nothing is retained by optimising.
 #[test]
 fn policy_rows_join_the_ports_retention_to_the_timer_units() {
-    let units = vec![timer("nix-gc.timer", Some(61_000), Some(1_000)), timer("nix-optimise.timer", None, None)];
-    let declarative = FakeDeclarative { gc_retention: Some("14d".to_string()), ..Default::default() };
+    let units = vec![
+        timer("nix-gc.timer", Some(61_000), Some(1_000)),
+        timer("nix-optimise.timer", None, None),
+    ];
+    let declarative = FakeDeclarative {
+        gc_retention: Some("14d".to_string()),
+        ..Default::default()
+    };
     let mut app = nixos(bare_snapshot(), units, declarative);
-    app.tick(10_000, "t".to_string()).expect("tick");
+    app.tick(10_000, "t".to_string());
 
     press_five(&mut app);
 
@@ -271,9 +336,13 @@ fn policy_rows_join_the_ports_retention_to_the_timer_units() {
         .rows
         .iter()
         .filter_map(|row| match row {
-            Node::NixPolicy { job, retention, next_in_ms, last_ago_ms, .. } => {
-                Some((job.clone(), retention.clone(), *next_in_ms, *last_ago_ms))
-            }
+            Node::NixPolicy {
+                job,
+                retention,
+                next_in_ms,
+                last_ago_ms,
+                ..
+            } => Some((job.clone(), retention.clone(), *next_in_ms, *last_ago_ms)),
             _ => None,
         })
         .collect();
@@ -284,7 +353,12 @@ fn policy_rows_join_the_ports_retention_to_the_timer_units() {
     assert_eq!(
         policies,
         vec![
-            ("gc".to_string(), Some(Some("14d".to_string())), Some(51_000), Some(9_000)),
+            (
+                "gc".to_string(),
+                Some(Some("14d".to_string())),
+                Some(51_000),
+                Some(9_000)
+            ),
             ("optimise".to_string(), Some(None), None, None),
         ]
     );
@@ -307,7 +381,7 @@ fn a_retention_that_could_not_be_read_is_not_a_job_that_keeps_nothing() {
         ..Default::default()
     };
     let mut app = nixos(bare_snapshot(), units, declarative);
-    app.tick(10_000, "t".to_string()).expect("a declarative failure does not fail the tick");
+    app.tick(10_000, "t".to_string());
 
     press_five(&mut app);
 
@@ -316,7 +390,10 @@ fn a_retention_that_could_not_be_read_is_not_a_job_that_keeps_nothing() {
         _ => None,
     });
     let retention = retention.expect("the gc row is there - its timer unit is in the sample");
-    assert_eq!(retention, None, "a read that was refused must not read as a job that keeps nothing");
+    assert_eq!(
+        retention, None,
+        "a read that was refused must not read as a job that keeps nothing"
+    );
 }
 
 /// Absent is not empty, one level down: a job whose timer unit this host
@@ -327,7 +404,7 @@ fn a_retention_that_could_not_be_read_is_not_a_job_that_keeps_nothing() {
 fn a_job_with_no_timer_unit_contributes_no_row() {
     let units = vec![timer("nix-gc.timer", Some(61_000), None)];
     let mut app = nixos(bare_snapshot(), units, FakeDeclarative::default());
-    app.tick(10_000, "t".to_string()).expect("tick");
+    app.tick(10_000, "t".to_string());
 
     press_five(&mut app);
 
@@ -346,10 +423,18 @@ fn a_job_with_no_timer_unit_contributes_no_row() {
 
 fn flake_inputs(names: &[&str]) -> Inputs {
     Inputs {
-        source: InputSource::Flake { lock_path: "/etc/nixos/flake.lock".to_string() },
+        source: InputSource::Flake {
+            lock_path: "/etc/nixos/flake.lock".to_string(),
+        },
         inputs: names
             .iter()
-            .map(|name| Input { name: name.to_string(), origin: None, rev: None, last_modified_secs: None, direct: true })
+            .map(|name| Input {
+                name: name.to_string(),
+                origin: None,
+                rev: None,
+                last_modified_secs: None,
+                direct: true,
+            })
             .collect(),
     }
 }
@@ -373,7 +458,7 @@ fn service(name: &str, active_state: ActiveState) -> Unit {
 
 /// The section costs one predicate over the units masys already polls, so
 /// what this asserts is the join: units that arrived through
-/// `SystemService` for every other view show up under a Nix heading with
+/// `SystemService` for every other buffer show up under a Nix heading with
 /// no second read.
 ///
 /// Worst first, like every other list of units in masys - a failed
@@ -388,7 +473,7 @@ fn nix_units_come_from_the_poll_masys_already_runs() {
         timer("nix-gc.timer", Some(61_000), Some(1_000)),
     ];
     let mut app = nixos(bare_snapshot(), units, FakeDeclarative::default());
-    app.tick(1_000, "t".to_string()).expect("tick");
+    app.tick(1_000, "t".to_string());
 
     press_five(&mut app);
 
@@ -401,9 +486,23 @@ fn nix_units_come_from_the_poll_masys_already_runs() {
             _ => None,
         })
         .collect();
-    assert_eq!(named, vec!["nix-gc.service", "home-manager-operator.service", "nix-daemon.service"], "worst first, then by name");
-    assert!(!named.iter().any(|name| name == "nix-gc.timer"), "the Store section already reports that timer as policy");
-    assert!(!named.iter().any(|name| name == "sshd.service"), "and the systemd view owns the rest of the host");
+    assert_eq!(
+        named,
+        vec![
+            "nix-gc.service",
+            "home-manager-operator.service",
+            "nix-daemon.service"
+        ],
+        "worst first, then by name"
+    );
+    assert!(
+        !named.iter().any(|name| name == "nix-gc.timer"),
+        "the Store section already reports that timer as policy"
+    );
+    assert!(
+        !named.iter().any(|name| name == "sshd.service"),
+        "and the systemd buffer owns the rest of the host"
+    );
 }
 
 /// Puts the cursor on the first row of the given kind, so a fold test does
@@ -419,23 +518,30 @@ fn step_onto_section(app: &mut App, kind: SectionKind) {
     panic!("never landed on a {kind:?} header: {:#?}", app.view().rows);
 }
 
-/// magit's `TAB`, on this view: the Nix view added `Generations`,
+/// magit's `TAB`, on this buffer: the Nix buffer added `Generations`,
 /// `Inputs`, `NixStore` and `NixUnits` as section kinds, and
 /// `cycle_section` only knew `Units` and `Journal` - so `tab` on a
 /// "System generations" header fell through to `toggle_detail`, which
 /// has nothing for a section header either, and did nothing at all. No
 /// compiler error: both are `_ =>` arms.
 #[test]
-fn tab_folds_the_generations_section_in_the_nix_view() {
-    let declarative = FakeDeclarative { profiles: vec![system_profile(&[1, 2, 3])], ..Default::default() };
+fn tab_folds_the_generations_section_in_the_nix_buffer() {
+    let declarative = FakeDeclarative {
+        profiles: vec![system_profile(&[1, 2, 3])],
+        ..Default::default()
+    };
     let mut app = nixos(bare_snapshot(), Vec::new(), declarative);
-    app.tick(1_000, "t".to_string()).expect("tick");
+    app.tick(1_000, "t".to_string());
     press_five(&mut app);
     assert_eq!(generation_ids(&app).len(), 3, "rows start visible");
 
     step_onto_section(&mut app, SectionKind::Generations(ProfileKind::System));
     app.handle_key(Key::new(KeyCode::Tab));
-    assert_eq!(generation_ids(&app), Vec::<u64>::new(), "tab folds the section's rows away");
+    assert_eq!(
+        generation_ids(&app),
+        Vec::<u64>::new(),
+        "tab folds the section's rows away"
+    );
 
     app.handle_key(Key::new(KeyCode::Tab));
     assert_eq!(generation_ids(&app).len(), 3, "and tab brings them back");
@@ -446,11 +552,20 @@ fn tab_folds_the_generations_section_in_the_nix_view() {
 /// already in `cycle_section`'s match, waiting for a producer.
 #[test]
 fn tab_folds_the_nix_units_section() {
-    let units = vec![service("nix-daemon.service", ActiveState::Active), service("home-manager-operator.service", ActiveState::Active)];
+    let units = vec![
+        service("nix-daemon.service", ActiveState::Active),
+        service("home-manager-operator.service", ActiveState::Active),
+    ];
     let mut app = nixos(bare_snapshot(), units, FakeDeclarative::default());
-    app.tick(1_000, "t".to_string()).expect("tick");
+    app.tick(1_000, "t".to_string());
     press_five(&mut app);
-    let shown = |app: &App| app.view().rows.iter().filter(|row| matches!(row, Node::Unit { .. })).count();
+    let shown = |app: &App| {
+        app.view()
+            .rows
+            .iter()
+            .filter(|row| matches!(row, Node::Unit { .. }))
+            .count()
+    };
     assert_eq!(shown(&app), 2, "rows start visible");
 
     step_onto_section(&mut app, SectionKind::NixUnits);
@@ -461,29 +576,56 @@ fn tab_folds_the_nix_units_section() {
     assert_eq!(shown(&app), 2, "and tab brings them back");
 }
 
-/// magit's `S-TAB` on this view. `Generations` and `Inputs` fold like any
-/// other section; `NixStore` does not, because it is this view's
+/// magit's `S-TAB` on this buffer. `Generations` and `Inputs` fold like any
+/// other section; `NixStore` does not, because it is this buffer's
 /// equivalent of the Status buffer's `System` section - always rendered,
 /// never hidden, the "checks actually ran" indicator - and `System` is
 /// excluded from the Status buffer's own collapse-all for that reason.
 #[test]
 fn shift_tab_folds_every_foldable_section_but_leaves_the_store_alone() {
-    let declarative =
-        FakeDeclarative { profiles: vec![system_profile(&[1, 2])], inputs: Some(flake_inputs(&["nixpkgs"])), ..Default::default() };
+    let declarative = FakeDeclarative {
+        profiles: vec![system_profile(&[1, 2])],
+        inputs: Some(flake_inputs(&["nixpkgs"])),
+        ..Default::default()
+    };
     let mut app = nixos(bare_snapshot(), Vec::new(), declarative);
-    app.tick(1_000, "t".to_string()).expect("tick");
+    app.tick(1_000, "t".to_string());
     press_five(&mut app);
-    assert!(!generation_ids(&app).is_empty(), "generations start visible");
-    assert!(app.view().rows.iter().any(|row| matches!(row, Node::Input { .. })), "inputs start visible");
+    assert!(
+        !generation_ids(&app).is_empty(),
+        "generations start visible"
+    );
+    assert!(
+        app.view()
+            .rows
+            .iter()
+            .any(|row| matches!(row, Node::Input { .. })),
+        "inputs start visible"
+    );
 
     app.handle_key(Key::new(KeyCode::BackTab));
-    assert_eq!(generation_ids(&app), Vec::<u64>::new(), "every generation folded");
-    assert!(!app.view().rows.iter().any(|row| matches!(row, Node::Input { .. })), "every input folded");
+    assert_eq!(
+        generation_ids(&app),
+        Vec::<u64>::new(),
+        "every generation folded"
+    );
+    assert!(
+        !app.view()
+            .rows
+            .iter()
+            .any(|row| matches!(row, Node::Input { .. })),
+        "every input folded"
+    );
     let _ = store_row(&app); // still renders - `.expect` inside panics otherwise.
 
     app.handle_key(Key::new(KeyCode::BackTab));
     assert!(!generation_ids(&app).is_empty(), "and back to rows");
-    assert!(app.view().rows.iter().any(|row| matches!(row, Node::Input { .. })));
+    assert!(
+        app.view()
+            .rows
+            .iter()
+            .any(|row| matches!(row, Node::Input { .. }))
+    );
 }
 
 /// The pairing check in `with_declarative`, in both directions. It is a
@@ -495,9 +637,9 @@ mod pairing {
     use super::*;
 
     /// A service the keymap cannot reach: `5` is bound to nothing, and the
-    /// view exists with no way in.
+    /// buffer exists with no way in.
     #[test]
-    #[should_panic(expected = "disagree about whether this host has a Nix view")]
+    #[should_panic(expected = "disagree about whether this host has a Nix buffer")]
     fn a_service_with_a_default_keymap_is_caught() {
         let _ = App::with_declarative(
             Box::new(FakeSystemService::returning(vec![bare_snapshot()])),
@@ -511,16 +653,19 @@ mod pairing {
 
     /// The worse direction, and the one `Registry` was added to prevent:
     /// a keymap offering `5` on a host with no service, so the digit opens
-    /// a screen with nothing on it.
+    /// a buffer with nothing on it.
     #[test]
-    #[should_panic(expected = "disagree about whether this host has a Nix view")]
+    #[should_panic(expected = "disagree about whether this host has a Nix buffer")]
     fn a_nix_keymap_with_no_service_is_caught() {
         let _ = App::with_declarative(
             Box::new(FakeSystemService::returning(vec![bare_snapshot()])),
             Box::new(FakePlatformService::default()),
             Box::new(NoScanner),
             "debian-box".to_string(),
-            Keymap::for_registry(Registry::new(true)),
+            Keymap::for_registry(Registry::new(BufferGates {
+                declarative: true,
+                packages: false,
+            })),
             None,
         );
     }

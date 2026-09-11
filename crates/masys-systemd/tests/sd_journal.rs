@@ -5,6 +5,7 @@
 //! most worth asserting - the fallback is the normal path on a host
 //! without a global library path, and it must never panic.
 
+use masys_domain::journal::Origin;
 use masys_systemd::sd_journal;
 
 /// The whole safety argument for this feature: absent library, no crash,
@@ -37,18 +38,36 @@ fn the_library_path_reads_the_same_journal_as_journalctl() {
     }
     // Available means this must work: a half-loaded library is treated as
     // no library at all, so there is no third state to be lenient about.
-    let reader = sd_journal::Reader::open("systemd-journald.service").expect("the library loaded, so the journal opens");
+    let reader = sd_journal::Reader::open("systemd-journald.service")
+        .expect("the library loaded, so the journal opens");
     let entries = reader.tail(20);
     assert!(!entries.is_empty(), "journald has certainly said something");
     for entry in &entries {
-        assert_eq!(entry.unit.as_deref(), Some("systemd-journald.service"), "the match is the unit's own, not a text search");
+        assert_eq!(
+            entry.unit.as_deref(),
+            Some("systemd-journald.service"),
+            "the match is the unit's own, not a text search"
+        );
     }
-    // Oldest first, the order the log view and journalctl both use.
+    // Oldest first, the order the log buffer and journalctl both use.
     let timestamps: Vec<u64> = entries.iter().map(|e| e.timestamp_ms).collect();
     let mut sorted = timestamps.clone();
     sorted.sort();
     assert_eq!(timestamps, sorted, "oldest first");
-    assert!(entries.iter().all(|e| e.timestamp_ms > 0), "every entry is stamped");
+    assert!(
+        entries.iter().all(|e| e.timestamp_ms > 0),
+        "every entry is stamped"
+    );
+    // Origin too, which this path reads independently of the JSON one.
+    // A unit-scoped query matches `_SYSTEMD_UNIT=` and a kernel record
+    // carries no such field, so every entry here is userspace - and
+    // `Unknown` would mean this reader failed to get a field journald
+    // stamps on everything, which is the answer worth catching.
+    assert!(
+        entries.iter().all(|e| e.origin == Origin::Userspace),
+        "a unit's own log is userspace, and the transport was read: {:?}",
+        entries.iter().map(|e| e.origin).collect::<Vec<_>>()
+    );
 
     // A check that never blocks, whatever it answers.
     let _ = reader.changed();

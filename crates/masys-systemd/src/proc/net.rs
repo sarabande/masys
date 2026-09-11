@@ -65,7 +65,9 @@ fn parse_v6(field: &str) -> Option<String> {
         return None;
     }
     let port = u16::from_str_radix(port, 16).ok()?;
-    let words: Option<Vec<u32>> = (0..4).map(|i| u32::from_str_radix(&address[i * 8..i * 8 + 8], 16).ok()).collect();
+    let words: Option<Vec<u32>> = (0..4)
+        .map(|i| u32::from_str_radix(&address[i * 8..i * 8 + 8], 16).ok())
+        .collect();
     let mut octets = [0u8; 16];
     for (index, word) in words?.into_iter().enumerate() {
         octets[index * 4..index * 4 + 4].copy_from_slice(&word.swap_bytes().to_be_bytes());
@@ -86,7 +88,12 @@ fn parse_inet(text: &str, v6: bool, tcp: bool) -> SocketTable {
         .filter_map(|line| {
             let fields: Vec<&str> = line.split_whitespace().collect();
             // sl, local, rem, st, tx:rx, tr:when, retrnsmt, uid, timeout, inode
-            let (local, remote, state, inode) = (fields.first()?, fields.get(2)?, fields.get(3)?, fields.get(9)?);
+            let (local, remote, state, inode) = (
+                fields.first()?,
+                fields.get(2)?,
+                fields.get(3)?,
+                fields.get(9)?,
+            );
             let _ = local;
             let local = address(fields.get(1)?)?;
             let inode: u64 = inode.parse().ok()?;
@@ -96,7 +103,11 @@ fn parse_inet(text: &str, v6: bool, tcp: bool) -> SocketTable {
                 // is not a peer. Reporting it as one would make every
                 // server look like it had a connection to nowhere.
                 let peer = address(remote).filter(|_| state != "LISTEN");
-                FdTarget::Tcp { local, peer, state: state.to_string() }
+                FdTarget::Tcp {
+                    local,
+                    peer,
+                    state: state.to_string(),
+                }
             } else {
                 FdTarget::Udp { local }
             };
@@ -124,7 +135,8 @@ fn parse_unix(text: &str) -> SocketTable {
             let fields: Vec<&str> = line.split_whitespace().collect();
             // Num, RefCount, Protocol, Flags, Type, St, Inode, Path
             let inode: u64 = fields.get(6)?.parse().ok()?;
-            let listening = u32::from_str_radix(fields.get(3)?, 16).is_ok_and(|flags| flags & SO_ACCEPTCON != 0);
+            let listening = u32::from_str_radix(fields.get(3)?, 16)
+                .is_ok_and(|flags| flags & SO_ACCEPTCON != 0);
             // An abstract socket's name begins with `@` and is not a path
             // on disk; it is still a name worth showing, so it is kept.
             let path = fields.get(7).map(|p| p.to_string());
@@ -149,7 +161,11 @@ pub fn socket_table(read: impl Fn(&str) -> Option<String>) -> SocketTable {
         ("udp6", |text| parse_inet(text, true, false)),
         ("unix", parse_unix),
     ];
-    sources.into_iter().filter_map(|(name, parse)| read(name).map(|text| parse(&text))).flatten().collect()
+    sources
+        .into_iter()
+        .filter_map(|(name, parse)| read(name).map(|text| parse(&text)))
+        .flatten()
+        .collect()
 }
 
 /// Reads the tables from the real `/proc/net`.
@@ -171,7 +187,10 @@ mod tests {
 
     #[test]
     fn a_v6_address_swaps_within_each_word() {
-        assert_eq!(parse_v6("00000000000000000000000001000000:1538").as_deref(), Some("[::1]:5432"));
+        assert_eq!(
+            parse_v6("00000000000000000000000001000000:1538").as_deref(),
+            Some("[::1]:5432")
+        );
     }
 
     #[test]
@@ -181,7 +200,11 @@ mod tests {
         let table = parse_inet(text, false, true);
         assert_eq!(
             table.get(&38271),
-            Some(&FdTarget::Tcp { local: "0.0.0.0:5432".into(), peer: None, state: "LISTEN".into() }),
+            Some(&FdTarget::Tcp {
+                local: "0.0.0.0:5432".into(),
+                peer: None,
+                state: "LISTEN".into()
+            }),
             "a listening socket's `0.0.0.0:0` peer is not a peer: {table:?}"
         );
     }
@@ -193,7 +216,11 @@ mod tests {
         let table = parse_inet(text, false, true);
         assert_eq!(
             table.get(&44012),
-            Some(&FdTarget::Tcp { local: "127.0.0.1:8080".into(), peer: Some("127.0.0.1:40000".into()), state: "ESTABLISHED".into() })
+            Some(&FdTarget::Tcp {
+                local: "127.0.0.1:8080".into(),
+                peer: Some("127.0.0.1:40000".into()),
+                state: "ESTABLISHED".into()
+            })
         );
     }
 
@@ -208,15 +235,27 @@ mod tests {
                     ffff9c2: 00000003 00000000 00000000 0001 03 39001 /run/postgresql/.s.PGSQL.5432\n\
                     ffff9c1: 00000002 00000000 00000000 0001 03 39000\n";
         let table = parse_unix(text);
-        assert_eq!(table.get(&38999), Some(&FdTarget::Unix { path: Some("/run/postgresql/.s.PGSQL.5432".into()), listening: true }));
+        assert_eq!(
+            table.get(&38999),
+            Some(&FdTarget::Unix {
+                path: Some("/run/postgresql/.s.PGSQL.5432".into()),
+                listening: true
+            })
+        );
         assert_eq!(
             table.get(&39001),
-            Some(&FdTarget::Unix { path: Some("/run/postgresql/.s.PGSQL.5432".into()), listening: false }),
+            Some(&FdTarget::Unix {
+                path: Some("/run/postgresql/.s.PGSQL.5432".into()),
+                listening: false
+            }),
             "a client of that socket names the same path and is not a listener"
         );
         assert_eq!(
             table.get(&39000),
-            Some(&FdTarget::Unix { path: None, listening: false }),
+            Some(&FdTarget::Unix {
+                path: None,
+                listening: false
+            }),
             "an unnamed socket has no path, and that is not an error"
         );
     }
@@ -232,7 +271,9 @@ mod tests {
     #[test]
     fn a_missing_table_is_not_an_error() {
         // A kernel with no IPv6 has no tcp6 file at all.
-        let table = socket_table(|name| (name == "unix").then(|| "Num RefCount\nx: 1 0 10000 1 1 7 /run/x\n".to_string()));
+        let table = socket_table(|name| {
+            (name == "unix").then(|| "Num RefCount\nx: 1 0 10000 1 1 7 /run/x\n".to_string())
+        });
         assert_eq!(table.len(), 1);
     }
 }

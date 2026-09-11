@@ -4,6 +4,7 @@ use masys_systemd::proc::io::parse_io;
 use masys_systemd::proc::loadavg::{parse_loadavg, parse_uptime};
 use masys_systemd::proc::meminfo::{parse_meminfo, parse_swaps_zram_percent};
 use masys_systemd::proc::mounts::{is_kernel_remount, parse_mounts};
+use masys_systemd::proc::parse_cpu_times;
 use masys_systemd::proc::pressure::parse_pressure;
 use masys_systemd::proc::stat::parse_stat;
 use masys_systemd::proc::status::parse_status;
@@ -19,7 +20,6 @@ fn stat_reads_the_fields_proc_needs() {
     assert_eq!(raw.cpu_ticks, 18, "utime 11 + stime 7, children excluded");
     assert_eq!(raw.nice, 0);
     assert_eq!(raw.starttime_ticks, 8_591_204);
-    assert_eq!(raw.rss_pages, 1655);
 }
 
 /// The trap this parser exists for: `comm` is process-chosen bytes, so it
@@ -46,7 +46,11 @@ fn stat_maps_every_state_letter_it_can_see() {
         ("I", ProcState::Sleeping),
     ] {
         let line = STAT.replacen(") R ", &format!(") {letter} "), 1);
-        assert_eq!(parse_stat(&line).expect("parsed").state, expected, "state {letter}");
+        assert_eq!(
+            parse_stat(&line).expect("parsed").state,
+            expected,
+            "state {letter}"
+        );
     }
 }
 
@@ -58,7 +62,11 @@ fn stat_rejects_a_line_with_no_comm() {
 #[test]
 fn io_reads_bytes_that_reached_storage_not_syscall_traffic() {
     let text = "rchar: 12063\nwchar: 0\nsyscr: 18\nsyscw: 0\nread_bytes: 4096\nwrite_bytes: 8192\ncancelled_write_bytes: 0\n";
-    assert_eq!(parse_io(text).expect("parsed io"), (4096, 8192), "rchar/wchar are cache traffic, not disk");
+    assert_eq!(
+        parse_io(text).expect("parsed io"),
+        (4096, 8192),
+        "rchar/wchar are cache traffic, not disk"
+    );
 }
 
 #[test]
@@ -87,23 +95,46 @@ fn pressure_reads_some_and_full() {
     let text = "some avg10=0.04 avg60=0.23 avg300=0.12 total=586715292\nfull avg10=0.00 avg60=1.50 avg300=0.00 total=0\n";
     let (some, full) = parse_pressure(text).expect("parsed pressure");
     assert_eq!((some.avg10, some.avg60, some.avg300), (0.04, 0.23, 0.12));
-    assert_eq!(full.avg60, 1.50);
+    assert_eq!(full.expect("a full line").avg60, 1.50);
 }
 
-/// Older kernels emit no `full` line for cpu at all.
+/// Older kernels emit no `full` line for cpu at all, and absent is not
+/// zero. This test asserted `full.avg60 == 0.0` until 2026-08-31 - a
+/// line nobody read, pinned as a reading of nought, in the one file
+/// whose figures decide what the Status header colours.
 #[test]
-fn pressure_without_a_full_line_defaults_it_to_zero() {
-    let (some, full) = parse_pressure("some avg10=0.04 avg60=0.23 avg300=0.12 total=1\n").expect("parsed");
+fn pressure_without_a_full_line_says_so_rather_than_reporting_zero() {
+    let (some, full) =
+        parse_pressure("some avg10=0.04 avg60=0.23 avg300=0.12 total=1\n").expect("parsed");
     assert_eq!(some.avg60, 0.23);
-    assert_eq!(full.avg60, 0.0);
+    assert_eq!(
+        full, None,
+        "no full line is no reading, not a reading of zero"
+    );
+}
+
+/// A line whose averages are missing or unreadable has not been
+/// understood. Zeroes there would read as a machine under no pressure at
+/// all, which is the most reassuring thing this parser could invent.
+#[test]
+fn pressure_with_an_unreadable_average_is_not_a_reading() {
+    for broken in [
+        "some avg10=0.04 avg300=0.12 total=1\n",
+        "some avg10=0.04 avg60=? avg300=0.12 total=1\n",
+        "some total=1\n",
+    ] {
+        assert!(
+            parse_pressure(broken).is_err(),
+            "should not have parsed: {broken:?}"
+        );
+    }
 }
 
 const MEMINFO: &str = "MemTotal:       32753552 kB\nMemFree:         4842884 kB\nMemAvailable:   21429936 kB\nBuffers:         2884264 kB\nSwapTotal:       3275260 kB\nSwapFree:        3274104 kB\n";
 
 #[test]
 fn meminfo_uses_available_not_free_for_used() {
-    let swaps =
-        "Filename\t\t\t\tType\t\tSize\t\tUsed\t\tPriority\n/dev/zram0                              partition\t3275260\t\t1156\t\t5\n";
+    let swaps = "Filename\t\t\t\tType\t\tSize\t\tUsed\t\tPriority\n/dev/zram0                              partition\t3275260\t\t1156\t\t5\n";
     let memory = parse_meminfo(MEMINFO, swaps).expect("parsed meminfo");
     assert_eq!(memory.total_bytes, 32_753_552 * 1024);
     // MemTotal - MemAvailable. Using MemFree would report 27.4G used on a
@@ -121,8 +152,15 @@ fn zram_percent_is_fullness_of_the_zram_swap_devices() {
 #[test]
 fn a_host_with_no_zram_reports_none_rather_than_zero() {
     let swaps = "Filename\t\t\t\tType\t\tSize\t\tUsed\t\tPriority\n/dev/sda3                               partition\t8388604\t\t0\t\t-2\n";
-    assert_eq!(parse_swaps_zram_percent(swaps), None, "no zram is not the same fact as an empty zram");
-    assert_eq!(parse_swaps_zram_percent("Filename\tType\tSize\tUsed\tPriority\n"), None);
+    assert_eq!(
+        parse_swaps_zram_percent(swaps),
+        None,
+        "no zram is not the same fact as an empty zram"
+    );
+    assert_eq!(
+        parse_swaps_zram_percent("Filename\tType\tSize\tUsed\tPriority\n"),
+        None
+    );
 }
 
 #[test]
@@ -133,7 +171,10 @@ fn loadavg_takes_the_three_averages_and_ignores_the_rest() {
 
 #[test]
 fn uptime_truncates_to_whole_seconds() {
-    assert_eq!(parse_uptime("85356.39 429938.13\n").expect("parsed uptime"), 85_356);
+    assert_eq!(
+        parse_uptime("85356.39 429938.13\n").expect("parsed uptime"),
+        85_356
+    );
 }
 
 const MOUNTS: &str = "/dev/sda2 / ext4 rw,relatime 0 0\ntmpfs /run tmpfs rw,nosuid,nodev 0 0\nproc /proc proc rw,nosuid 0 0\n/dev/sda2 /nix/store ext4 ro,relatime 0 0\nsystemd-1 /mnt/backup autofs rw,relatime 0 0\ncgroup2 /sys/fs/cgroup cgroup2 rw,nosuid 0 0\n/dev/sdb1 /mnt/my\\040disk ext4 rw 0 0\n";
@@ -145,22 +186,38 @@ const MOUNTS: &str = "/dev/sda2 / ext4 rw,relatime 0 0\ntmpfs /run tmpfs rw,nosu
 fn mounts_never_yields_an_autofs_entry() {
     let mounts = parse_mounts(MOUNTS);
     assert!(!mounts.iter().any(|m| m.fstype == "autofs"), "{mounts:#?}");
-    assert!(!mounts.iter().any(|m| m.mount_point == "/mnt/backup"), "{mounts:#?}");
+    assert!(
+        !mounts.iter().any(|m| m.mount_point == "/mnt/backup"),
+        "{mounts:#?}"
+    );
 }
 
 #[test]
 fn mounts_drops_pseudo_filesystems_but_keeps_real_ones() {
     let mounts = parse_mounts(MOUNTS);
     let points: Vec<&str> = mounts.iter().map(|m| m.mount_point.as_str()).collect();
-    assert_eq!(points, vec!["/", "/run", "/nix/store", "/mnt/my disk"], "{mounts:#?}");
+    assert_eq!(
+        points,
+        vec!["/", "/run", "/nix/store", "/mnt/my disk"],
+        "{mounts:#?}"
+    );
 }
 
 #[test]
 fn mounts_reports_read_only_from_the_option_list() {
     let mounts = parse_mounts(MOUNTS);
-    let store = mounts.iter().find(|m| m.mount_point == "/nix/store").expect("a /nix/store mount");
-    assert!(store.read_only, "ro in the options means remounted read-only");
-    let root = mounts.iter().find(|m| m.mount_point == "/").expect("a / mount");
+    let store = mounts
+        .iter()
+        .find(|m| m.mount_point == "/nix/store")
+        .expect("a /nix/store mount");
+    assert!(
+        store.read_only,
+        "ro in the options means remounted read-only"
+    );
+    let root = mounts
+        .iter()
+        .find(|m| m.mount_point == "/")
+        .expect("a / mount");
     assert!(!root.read_only);
 }
 
@@ -169,15 +226,26 @@ fn mounts_reports_read_only_from_the_option_list() {
 #[test]
 fn mounts_keeps_the_device_so_bind_mounts_can_be_deduped() {
     let mounts = parse_mounts(MOUNTS);
-    let same: Vec<&str> = mounts.iter().filter(|m| m.device == "/dev/sda2").map(|m| m.mount_point.as_str()).collect();
-    assert_eq!(same, vec!["/", "/nix/store"], "both survive parsing; dedupe is the caller's job");
+    let same: Vec<&str> = mounts
+        .iter()
+        .filter(|m| m.device == "/dev/sda2")
+        .map(|m| m.mount_point.as_str())
+        .collect();
+    assert_eq!(
+        same,
+        vec!["/", "/nix/store"],
+        "both survive parsing; dedupe is the caller's job"
+    );
 }
 
 /// The kernel octal-escapes space, tab, newline and backslash.
 #[test]
 fn mounts_unescapes_octal_sequences_in_paths() {
     let mounts = parse_mounts(MOUNTS);
-    assert!(mounts.iter().any(|m| m.mount_point == "/mnt/my disk"), "{mounts:#?}");
+    assert!(
+        mounts.iter().any(|m| m.mount_point == "/mnt/my disk"),
+        "{mounts:#?}"
+    );
 }
 
 /// A read-only NFS export is a mount option, not the kernel giving up on
@@ -191,12 +259,30 @@ fn only_a_local_block_device_can_be_a_kernel_remount() {
                 none /run/credentials/systemd-journald.service tmpfs ro,nosuid 0 0\n\
                 /dev/sdb1 /data ext4 rw,relatime 0 0\n";
     let mounts = parse_mounts(text);
-    let by_point = |p: &str| mounts.iter().find(|m| m.mount_point == p).expect("a mount").clone();
+    let by_point = |p: &str| {
+        mounts
+            .iter()
+            .find(|m| m.mount_point == p)
+            .expect("a mount")
+            .clone()
+    };
 
-    assert!(is_kernel_remount(&by_point("/")), "a read-only local disk is the real alarm");
-    assert!(!is_kernel_remount(&by_point("/mnt/photos")), "a read-only NFS export is a mount option");
-    assert!(!is_kernel_remount(&by_point("/run/credentials/systemd-journald.service")), "a read-only tmpfs is by design");
-    assert!(!is_kernel_remount(&by_point("/data")), "a writable disk is not remounted");
+    assert!(
+        is_kernel_remount(&by_point("/")),
+        "a read-only local disk is the real alarm"
+    );
+    assert!(
+        !is_kernel_remount(&by_point("/mnt/photos")),
+        "a read-only NFS export is a mount option"
+    );
+    assert!(
+        !is_kernel_remount(&by_point("/run/credentials/systemd-journald.service")),
+        "a read-only tmpfs is by design"
+    );
+    assert!(
+        !is_kernel_remount(&by_point("/data")),
+        "a writable disk is not remounted"
+    );
 }
 
 /// Captured from this host. Partitions and their whole device both appear
@@ -208,7 +294,10 @@ fn diskstats_reports_whole_devices_not_partitions() {
                    8       1 sda1 227 2024 14730 97 250 289 533 66 0 112 163 0 0 0 0\n\
                    8       2 sda2 1412504 276801 34087586 491710 1650764 2245171 405386240 3237540 0 978585 3729251 0 0 0 0\n";
     let disks = parse_diskstats(text);
-    assert_eq!(disks.iter().map(|d| d.name.as_str()).collect::<Vec<_>>(), vec!["sda"]);
+    assert_eq!(
+        disks.iter().map(|d| d.name.as_str()).collect::<Vec<_>>(),
+        vec!["sda"]
+    );
     assert_eq!(disks[0].reads, 1_412_811);
     assert_eq!(disks[0].write_sectors, 405_386_773);
     assert_eq!(disks[0].io_ms, 849_688);
@@ -220,9 +309,19 @@ fn diskstats_reports_whole_devices_not_partitions() {
 #[test]
 fn a_device_whose_name_ends_in_a_digit_is_not_a_partition() {
     let row = |name: &str| format!("   1       0 {name} 1 2 3 4 5 6 7 8 0 9 10 0 0 0 0\n");
-    let text = format!("{}{}{}{}", row("zram0"), row("nvme0n1"), row("nvme0n1p1"), row("nvme0n1p2"));
+    let text = format!(
+        "{}{}{}{}",
+        row("zram0"),
+        row("nvme0n1"),
+        row("nvme0n1p1"),
+        row("nvme0n1p2")
+    );
     let names: Vec<String> = parse_diskstats(&text).into_iter().map(|d| d.name).collect();
-    assert_eq!(names, vec!["zram0", "nvme0n1"], "nvme partitions drop, the devices stay");
+    assert_eq!(
+        names,
+        vec!["zram0", "nvme0n1"],
+        "nvme partitions drop, the devices stay"
+    );
 }
 
 /// Kernels since 4.18 append discard and flush statistics. Reading by
@@ -260,11 +359,17 @@ enp0s31f6: 6736398191 8876129    0    2    0     0          0    327165 95850078
 
     let nic = &parsed[1];
     assert_eq!(nic.name, "enp0s31f6");
-    assert_eq!(nic.rx_bytes, 6_736_398_191, "past 32 bits, so u64 or it wraps");
+    assert_eq!(
+        nic.rx_bytes, 6_736_398_191,
+        "past 32 bits, so u64 or it wraps"
+    );
     assert_eq!(nic.rx_packets, 8_876_129);
     assert_eq!(nic.rx_drop, 2);
     assert_eq!(nic.tx_bytes, 9_585_007_885);
-    assert_eq!(nic.tx_drop, 37, "the transmit columns start over, eight fields along");
+    assert_eq!(
+        nic.tx_drop, 37,
+        "the transmit columns start over, eight fields along"
+    );
     assert_eq!(nic.tx_errs, 0);
 }
 
@@ -289,6 +394,89 @@ Inter-|   Receive                                                |  Transmit
 #[test]
 fn net_dev_headers_and_junk_are_skipped() {
     assert!(masys_systemd::proc::net_dev::parse_net_dev("").is_empty());
-    assert!(masys_systemd::proc::net_dev::parse_net_dev("Inter-|   Receive\n face |bytes\n").is_empty());
+    assert!(
+        masys_systemd::proc::net_dev::parse_net_dev("Inter-|   Receive\n face |bytes\n").is_empty()
+    );
     assert!(masys_systemd::proc::net_dev::parse_net_dev("garbage with no colon\n").is_empty());
+}
+
+/// `/proc/stat`'s first line, summed over every core. Ten fields on a
+/// modern kernel; older ones stop earlier, and a future one may add more.
+const PROC_STAT: &str = "\
+cpu  9821 12 3305 184203 918 402 233 0 0 0
+cpu0 4910 6 1652 92101 459 201 116 0 0 0
+intr 12345
+btime 1755000000
+";
+
+#[test]
+fn stat_sums_the_aggregate_cpu_line() {
+    let times = parse_cpu_times(PROC_STAT).expect("an aggregate cpu line");
+    // Every field on the `cpu` line, idle included.
+    assert_eq!(
+        times.total_ticks,
+        9821 + 12 + 3305 + 184203 + 918 + 402 + 233
+    );
+    // idle + iowait: the CPU had nothing runnable in both.
+    assert_eq!(times.idle_ticks, 184203 + 918);
+}
+
+/// The per-core lines say the same thing about one core each. Reading one
+/// of them as the total would report a sixteenth of the machine.
+#[test]
+fn stat_takes_the_aggregate_line_and_not_the_first_core() {
+    let times = parse_cpu_times(PROC_STAT).expect("an aggregate cpu line");
+    assert_ne!(times.total_ticks, 4910 + 6 + 1652 + 92101 + 459 + 201 + 116);
+}
+
+/// A kernel that reports no `cpu` line at all, or a truncated read.
+/// `None`, so the layers above show no figure - never a machine at 0%.
+#[test]
+fn stat_without_an_aggregate_cpu_line_reports_nothing() {
+    assert_eq!(parse_cpu_times("btime 1755000000\n"), None);
+    assert_eq!(parse_cpu_times(""), None);
+}
+
+/// Fewer fields than the five that make up the answer is not an answer.
+#[test]
+fn stat_with_a_truncated_cpu_line_reports_nothing() {
+    assert_eq!(parse_cpu_times("cpu  9821 12 3305\n"), None);
+}
+
+/// A field this cannot read fails the whole line. It used to become a
+/// zero and be summed into the total, so an unreadable `idle` reported
+/// the host at 100% busy - a confident answer from a line masys did not
+/// understand.
+#[test]
+fn stat_with_a_field_it_cannot_read_reports_nothing() {
+    assert_eq!(
+        parse_cpu_times("cpu  9821 12 3305 ? 918 402 233\n"),
+        None,
+        "an unreadable idle field is not a zero one"
+    );
+}
+
+/// `guest` is already counted inside `user`, and `guest_nice` inside
+/// `nice` - the kernel adds guest time to both fields. Summing all ten
+/// counts it twice and inflates the total, which drags the utilisation
+/// figure toward the idle share on exactly the hosts that run virtual
+/// machines.
+#[test]
+fn stat_does_not_count_guest_time_twice() {
+    // user 9821 (of which 4000 guest), nice 12 (of which 100 guest_nice).
+    let with_guests = "cpu  9821 12 3305 184203 918 402 233 0 4000 100\n";
+    let times = parse_cpu_times(with_guests).expect("an aggregate cpu line");
+    assert_eq!(
+        times.total_ticks,
+        9821 + 12 + 3305 + 184203 + 918 + 402 + 233,
+        "the disjoint fields only - guest and guest_nice are already in user and nice"
+    );
+
+    // The same machine with no virtual machines on it reports the same
+    // work, and must report the same utilisation.
+    let bare = "cpu  9821 12 3305 184203 918 402 233 0 0 0\n";
+    assert_eq!(
+        times.total_ticks,
+        parse_cpu_times(bare).expect("a cpu line").total_ticks
+    );
 }

@@ -1,7 +1,7 @@
 /// The unit types systemd defines, all eleven of them.
 ///
 /// The whole set rather than a useful subset: this is what the systemd
-/// view groups by, so a type missing here does not become an unlabelled
+/// buffer groups by, so a type missing here does not become an unlabelled
 /// section, it disappears into `Other` along with every other type that is
 /// missing - which is how 89 devices, 13 slices, 4 swaps, 4 automounts, 2
 /// scopes and 2 paths on one host all ended up in the same bucket.
@@ -43,7 +43,7 @@ impl UnitKind {
         }
     }
 
-    /// The order the systemd view lists them in: what an operator acts on
+    /// The order the systemd buffer lists them in: what an operator acts on
     /// most, first. Services lead because they are what starts, stops and
     /// fails; devices trail because there are more of them than anything
     /// else and almost nothing can be done to one.
@@ -118,7 +118,7 @@ pub struct Unit {
     pub since_ms: u64,
     pub cgroup: Option<String>,
     /// The slice this unit is in - systemd's own containment hierarchy,
-    /// and the one the systemd view nests by. `None` for a unit type that
+    /// and the one the systemd buffer nests by. `None` for a unit type that
     /// cannot be in one (`.target`, `.timer`, `.device`, `.path`) and for
     /// the root slice itself.
     pub slice: Option<String>,
@@ -129,7 +129,7 @@ pub struct Unit {
     /// service behind it. Empty for the units that start nothing, which is
     /// most of them.
     ///
-    /// This is the second hierarchy in the view, and unlike the slice tree
+    /// This is the second hierarchy in the buffer, and unlike the slice tree
     /// it is a *causal* one: it answers "what does pressing this do", not
     /// "what is inside this".
     pub triggers: Vec<String>,

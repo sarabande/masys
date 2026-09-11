@@ -19,15 +19,20 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, List, ListItem, ListState, Paragraph};
 use unicode_width::UnicodeWidthStr;
 
-use masys_domain::finding::Finding;
-use masys_view::{ActionGroup, ActionRow, Header, KeyBinding, Metrics, ModalView, Node, StatusLine, SwitchRow, View};
+use masys_view::{
+    ActionGroup, ActionRow, Header, KeyBinding, Metrics, ModalView, Node, StatusLine, SwitchRow,
+    View,
+};
 
 use crate::theme::Theme;
 use crate::view;
 
 fn header_lines(model: &View, width: u16, columns: &view::ProcColumns) -> Vec<Line<'static>> {
     match model.header {
-        Header::Status { hostname, timestamp } => {
+        Header::Status {
+            hostname,
+            timestamp,
+        } => {
             let left = format!("masys - {hostname}");
             // Terminal columns, not bytes - the same measure
             // `view::finding_lines` pads by, and for the same reason:
@@ -40,14 +45,21 @@ fn header_lines(model: &View, width: u16, columns: &view::ProcColumns) -> Vec<Li
         // Built from the same column constants the rows are, so the
         // headings cannot drift out of alignment with what is under them.
         Header::Procs { sort, descending } => {
-            vec![Line::from(format!("{ROW_INDENT}{}", view::proc_columns_header(sort, descending, columns)))]
+            vec![Line::from(format!(
+                "{ROW_INDENT}{}",
+                view::proc_columns_header(sort, descending, columns)
+            ))]
         }
         // The unit on the left, which way it reads on the right - the
         // same shape as the Status header's clock, and padded the same
         // way, in terminal columns rather than bytes.
         Header::Log { unit, newest_first } => {
             let left = format!("log - {unit}");
-            let right = if newest_first { "newest first" } else { "oldest first" };
+            let right = if newest_first {
+                "newest first"
+            } else {
+                "oldest first"
+            };
             let pad = (width as usize).saturating_sub(left.width() + right.width());
             vec![Line::from(format!("{left}{}{right}", " ".repeat(pad)))]
         }
@@ -67,50 +79,49 @@ fn indented(line: Line<'static>) -> Line<'static> {
     Line::from(spans)
 }
 
-/// One non-`Finding` `Node`, as a list row. `Node::Overview` and the Nix
-/// view's two blocks are the multi-line cases; `Finding` rows never come
-/// through here - they are batched per section by `build_items` so their
-/// labels can be aligned.
+/// One node, as one item.
 ///
-/// Exhaustive, with no `_` arm: the compiler pointing at this file is
-/// what makes the next row type impossible to forget, and a catch-all
-/// would trade that for a blank line nobody notices.
-fn row_item(node: &Node, theme: &Theme, columns: &view::ProcColumns) -> ListItem<'static> {
-    match node {
-        // The one row that is *not* indented: it is what the others are
-        // indented under.
-        Node::SectionHeader { title, count, .. } => ListItem::new(view::section_header_line(title, *count, theme)),
-        Node::Overview(overview) => ListItem::new(view::overview_lines(overview, theme).into_iter().map(indented).collect::<Vec<_>>()),
-        // Several lines in one item, and never highlighted: the cursor
-        // cannot rest here, so the selection style never reaches it.
-        // Handled by build_items, never reaches here.
-        Node::UnitDetail { .. } | Node::ProcDetail { .. } => ListItem::new(Line::default()),
-        Node::Spacer => ListItem::new(Line::default()),
-        // Handled by build_items, never reaches here.
-        Node::Finding(finding) => ListItem::new(indented(view::finding_line(finding, theme))),
-        // Handled by build_items, never reaches here.
-        Node::Proc { .. } => ListItem::new(Line::default()),
-        Node::ProcGroup { .. } => ListItem::new(view::proc_group_line(node, theme, columns)),
-        Node::JournalEntry(_)
-        | Node::Unit { .. }
-        | Node::Filesystem { .. }
-        | Node::DirEntry { .. }
-        | Node::Disk { .. }
-        | Node::Timer { .. }
-        | Node::Interface { .. }
-        // The three columnar Nix rows, batched per section by
-        // `build_items` for the same reason units and timers are.
-        | Node::Generation { .. }
-        | Node::Input { .. }
-        | Node::NixPolicy { .. } => ListItem::new(Line::default()),
-        // The Nix view's two blocks. Several lines in one item, like
-        // `Overview`, because each is one statement rather than a list.
-        // The reboot block is the only row in the buffer that is *not*
-        // indented: `build_nix_rows` gives it no section header, so it
-        // stands where a header would.
-        Node::RebootPending { .. } => ListItem::new(view::reboot_lines(node, theme)),
-        Node::NixStore { .. } => ListItem::new(view::nix_store_lines(node, theme).into_iter().map(indented).collect::<Vec<_>>()),
-    }
+/// The counterpart to [`batch`], and here for the same reason: it holds
+/// the bookkeeping - a node's first item index - so that the six arms
+/// that use it say only what they draw. Returns how many nodes it
+/// consumed, which is always one and is what advances the caller.
+fn single(
+    items: &mut Vec<ListItem<'static>>,
+    first_item: &mut Vec<usize>,
+    item: ListItem<'static>,
+) -> usize {
+    first_item.push(items.len());
+    items.push(item);
+    1
+}
+
+/// One maximal run of one row type, as items.
+///
+/// Holds the invariant that used to be restated at every batched arm:
+/// **a node index is not an item index**, because a detail block is one
+/// item per line. Every batched node contributes exactly one item, so the
+/// run occupies `items.len() .. items.len() + section.len()`, and that
+/// range is what `first_item` records.
+///
+/// Returns how many nodes it consumed, which is what advances the caller.
+/// It is never zero: the caller has already matched on the first node, so
+/// `extract` answers `Some` for it and the run is at least one long.
+///
+/// `extract` says which nodes belong to the run and carries each into the
+/// row type its builder wants; `lines` is handed the whole run at once,
+/// because the property being computed - a column width - belongs to the
+/// run rather than to the row.
+fn batch<R>(
+    nodes: &[Node],
+    items: &mut Vec<ListItem<'static>>,
+    first_item: &mut Vec<usize>,
+    extract: impl FnMut(&Node) -> Option<R>,
+    lines: impl FnOnce(&[R]) -> Vec<Line<'static>>,
+) -> usize {
+    let section: Vec<R> = nodes.iter().map_while(extract).collect();
+    first_item.extend(items.len()..items.len() + section.len());
+    items.extend(lines(&section).into_iter().map(indented).map(ListItem::new));
+    section.len()
 }
 
 /// One `ListItem` per `Node`, with consecutive `Finding`s gathered into
@@ -144,210 +155,328 @@ fn row_item(node: &Node, theme: &Theme, columns: &view::ProcColumns) -> ListItem
 /// is what the second return value exists to fix - the cursor is a node
 /// index, and handing it to the list untranslated would select the wrong
 /// row the moment anything was open above it.
-fn build_items(nodes: &[Node], theme: &Theme, columns: &view::ProcColumns, scope: Option<&str>) -> (Vec<ListItem<'static>>, Vec<usize>) {
+fn build_items(
+    nodes: &[Node],
+    theme: &Theme,
+    columns: &view::ProcColumns,
+    scope: Option<&str>,
+) -> (Vec<ListItem<'static>>, Vec<usize>) {
     let mut items = Vec::with_capacity(nodes.len());
     let mut first_item: Vec<usize> = Vec::with_capacity(nodes.len());
     let mut index = 0;
     while index < nodes.len() {
-        match &nodes[index] {
-            Node::Finding(_) => {
+        let run = &nodes[index..];
+        // Exhaustive, deliberately, and this is the point of the shape
+        // rather than the hundred lines it saves. The version with a
+        // `node =>` catch-all let a new variant fall through to the
+        // one-line arm in silence, so a columnar row type padded to
+        // guessed constants while every other list in masys measured -
+        // which is exactly what happened to the Nix buffer's three new row
+        // types, each needing an arm no compiler error asked for.
+        //
+        // A variant added below now stops the build here until somebody
+        // says which of the three kinds it is.
+        index += match &nodes[index] {
+            // Batched: each of these pads a column across a whole
+            // section, so the builder has to see the section rather than
+            // one row.
+            //
+            // A maximal run of consecutive nodes of one variant is
+            // exactly one section, because every buffer emits a
+            // `SectionHeader` ahead of each section's rows - so two
+            // sections' rows can never end up adjacent, and the home
+            // profile's generation ids are never padded to the system
+            // profile's.
+            Node::Finding { .. } => batch(
+                run,
+                &mut items,
+                &mut first_item,
                 // Cloned rather than borrowed because `finding_lines`
-                // takes a contiguous `&[Finding]`, which cannot be carved
-                // out of a `&[Node]`. A section holds a handful of
+                // takes a contiguous `&[FindingRow]`, which cannot be
+                // carved out of a `&[Node]`. A section holds a handful of
                 // findings, so the copy costs nothing per frame.
-                let mut section: Vec<Finding> = Vec::new();
-                while let Some(Node::Finding(finding)) = nodes.get(index) {
-                    section.push(finding.clone());
-                    index += 1;
-                }
-                // One item per finding, not one per section: `Node` and
-                // `ListItem` stay index-for-index, which is what a
-                // `selected` cursor will need.
-                // One item per row in the batch, so these nodes keep a
-                // one-to-one place among the items.
-                first_item.extend(items.len()..items.len() + section.len());
-                items.extend(view::finding_lines(&section, theme).into_iter().map(indented).map(ListItem::new));
-            }
-            // Batched for the same reason findings are: `view::proc_lines`
-            // pads every name in the slice it is handed to one width, so
-            // it has to see a whole ranking at once.
-            Node::Proc { .. } => {
-                let mut section: Vec<view::ProcRow> = Vec::new();
-                while let Some(Node::Proc { proc, rate, cpu_seconds, age_ms, .. }) = nodes.get(index) {
-                    section.push(view::ProcRow { proc: proc.clone(), rate: *rate, cpu_seconds: *cpu_seconds, age_ms: *age_ms });
-                    index += 1;
-                }
-                // One item per row in the batch, so these nodes keep a
-                // one-to-one place among the items.
-                first_item.extend(items.len()..items.len() + section.len());
-                items.extend(view::proc_lines(&section, theme, columns).into_iter().map(indented).map(ListItem::new));
-            }
-            // Batched for the same reason findings and processes are:
-            // each of these pads a column across a whole section, so the
-            // builder has to see the section rather than one row.
-            Node::Timer { .. } => {
-                let mut section: Vec<view::TimerRow> = Vec::new();
-                while let Some(Node::Timer { name, activates, next_in_ms, last_ago_ms, children, activated_failed }) = nodes.get(index) {
-                    section.push(view::TimerRow {
+                |node| match node {
+                    Node::Finding {
+                        finding,
+                        presentation,
+                    } => Some(view::FindingRow {
+                        severity: finding.severity(),
+                        presentation: presentation.clone(),
+                    }),
+                    _ => None,
+                },
+                |section| view::finding_lines(section, theme),
+            ),
+            Node::Proc { .. } => batch(
+                run,
+                &mut items,
+                &mut first_item,
+                |node| match node {
+                    Node::Proc {
+                        proc,
+                        rate,
+                        cpu_seconds,
+                        age_ms,
+                        ..
+                    } => Some(view::ProcRow {
+                        proc: proc.clone(),
+                        rate: *rate,
+                        cpu_seconds: *cpu_seconds,
+                        age_ms: *age_ms,
+                    }),
+                    _ => None,
+                },
+                |section| view::proc_lines(section, theme, columns),
+            ),
+            Node::Timer { .. } => batch(
+                run,
+                &mut items,
+                &mut first_item,
+                |node| match node {
+                    Node::Timer {
+                        name,
+                        activates,
+                        next_in_ms,
+                        last_ago_ms,
+                        children,
+                        activated_failed,
+                    } => Some(view::TimerRow {
                         name: name.clone(),
                         activates: activates.clone(),
                         next_in_ms: *next_in_ms,
                         last_ago_ms: *last_ago_ms,
                         children: *children,
                         activated_failed: *activated_failed,
-                    });
-                    index += 1;
-                }
-                // One item per row in the batch, so these nodes keep a
-                // one-to-one place among the items.
-                first_item.extend(items.len()..items.len() + section.len());
-                items.extend(view::timer_lines(&section, theme).into_iter().map(indented).map(ListItem::new));
-            }
-            Node::Unit { .. } => {
-                let mut section: Vec<view::UnitRow> = Vec::new();
-                while let Some(Node::Unit { unit, age_ms, expanded, depth, children }) = nodes.get(index) {
-                    section.push(view::UnitRow {
+                    }),
+                    _ => None,
+                },
+                |section| view::timer_lines(section, theme),
+            ),
+            Node::Unit { .. } => batch(
+                run,
+                &mut items,
+                &mut first_item,
+                |node| match node {
+                    Node::Unit {
+                        unit,
+                        age_ms,
+                        expanded,
+                        depth,
+                        children,
+                    } => Some(view::UnitRow {
                         unit: unit.clone(),
                         age_ms: *age_ms,
                         expanded: *expanded,
                         depth: *depth,
                         children: *children,
-                    });
-                    index += 1;
-                }
-                // One item per row in the batch, so these nodes keep a
-                // one-to-one place among the items.
-                first_item.extend(items.len()..items.len() + section.len());
-                items.extend(view::unit_lines(&section, theme).into_iter().map(indented).map(ListItem::new));
-            }
-            Node::Disk { .. } => {
-                let mut section: Vec<(masys_domain::sample::Disk, Option<masys_domain::rate::DiskRate>)> = Vec::new();
-                while let Some(Node::Disk { disk, rate }) = nodes.get(index) {
-                    section.push((disk.clone(), *rate));
-                    index += 1;
-                }
-                // One item per row in the batch, so these nodes keep a
-                // one-to-one place among the items.
-                first_item.extend(items.len()..items.len() + section.len());
-                items.extend(view::disk_lines(&section, theme).into_iter().map(indented).map(ListItem::new));
-            }
-            Node::Interface { .. } => {
-                let mut section: Vec<(masys_domain::sample::Interface, Option<masys_domain::rate::NetRate>)> = Vec::new();
-                while let Some(Node::Interface { interface, rate }) = nodes.get(index) {
-                    section.push((interface.clone(), *rate));
-                    index += 1;
-                }
-                // One item per row in the batch, so these nodes keep a
-                // one-to-one place among the items.
-                first_item.extend(items.len()..items.len() + section.len());
-                items.extend(view::interface_lines(&section, theme).into_iter().map(indented).map(ListItem::new));
-            }
-            Node::DirEntry { .. } => {
-                let mut section: Vec<view::DirRow> = Vec::new();
-                while let Some(Node::DirEntry { path, bytes, depth, share, expanded, has_children }) = nodes.get(index) {
-                    section.push(view::DirRow {
+                    }),
+                    _ => None,
+                },
+                |section| view::unit_lines(section, theme),
+            ),
+            Node::Disk { .. } => batch(
+                run,
+                &mut items,
+                &mut first_item,
+                |node| match node {
+                    Node::Disk { disk, rate } => Some((disk.clone(), *rate)),
+                    _ => None,
+                },
+                |section| view::disk_lines(section, theme),
+            ),
+            // Batched like every other columnar section, so the name
+            // column is measured across the whole run rather than guessed
+            // per row.
+            Node::Package(_) => batch(
+                run,
+                &mut items,
+                &mut first_item,
+                |node| match node {
+                    Node::Package(package) => Some(package.clone()),
+                    _ => None,
+                },
+                |section| view::package_lines(section, theme),
+            ),
+            Node::Interface { .. } => batch(
+                run,
+                &mut items,
+                &mut first_item,
+                |node| match node {
+                    Node::Interface { interface, rate } => Some((interface.clone(), *rate)),
+                    _ => None,
+                },
+                |section| view::interface_lines(section, theme),
+            ),
+            Node::DirEntry { .. } => batch(
+                run,
+                &mut items,
+                &mut first_item,
+                |node| match node {
+                    Node::DirEntry {
+                        path,
+                        bytes,
+                        depth,
+                        share,
+                        expanded,
+                        has_children,
+                    } => Some(view::DirRow {
                         path: path.clone(),
                         bytes: *bytes,
                         depth: *depth,
                         share: *share,
                         expanded: *expanded,
                         has_children: *has_children,
-                    });
-                    index += 1;
-                }
-                first_item.extend(items.len()..items.len() + section.len());
-                items.extend(view::dir_entry_lines(&section, theme).into_iter().map(indented).map(ListItem::new));
-            }
-            Node::Filesystem { .. } => {
-                let mut section: Vec<(masys_domain::sample::Filesystem, bool)> = Vec::new();
-                while let Some(Node::Filesystem { filesystem: fs, expanded }) = nodes.get(index) {
-                    section.push((fs.clone(), *expanded));
-                    index += 1;
-                }
-                // One item per row in the batch, so these nodes keep a
-                // one-to-one place among the items.
-                first_item.extend(items.len()..items.len() + section.len());
-                items.extend(view::filesystem_lines(&section, theme).into_iter().map(indented).map(ListItem::new));
-            }
-            Node::JournalEntry(_) => {
-                let mut section: Vec<masys_domain::journal::Entry> = Vec::new();
-                while let Some(Node::JournalEntry(entry)) = nodes.get(index) {
-                    section.push(entry.clone());
-                    index += 1;
-                }
-                // One item per row in the batch, so these nodes keep a
-                // one-to-one place among the items.
-                first_item.extend(items.len()..items.len() + section.len());
-                items.extend(view::journal_lines(&section, theme, scope).into_iter().map(indented).map(ListItem::new));
-            }
-            // The Nix view's three columnar sections, batched for the
-            // reason findings and units are: each pads a column across a
-            // whole run, so the builder has to see the run.
-            //
-            // A maximal run is exactly one section here too.
-            // `masys_app::nix_buffer::build_nix_rows` emits a
-            // `SectionHeader` ahead of every profile's generations, so
-            // two profiles' generations can never end up adjacent and the
-            // home profile's ids are never padded to the system
-            // profile's.
-            Node::Generation { .. } => {
-                let mut section: Vec<view::GenerationRow> = Vec::new();
-                while let Some(Node::Generation { generation, age_ms, .. }) = nodes.get(index) {
-                    section.push(view::GenerationRow { generation: generation.clone(), age_ms: *age_ms });
-                    index += 1;
-                }
-                // One item per row in the batch, so these nodes keep a
-                // one-to-one place among the items.
-                first_item.extend(items.len()..items.len() + section.len());
-                items.extend(view::generation_lines(&section, theme).into_iter().map(indented).map(ListItem::new));
-            }
-            Node::Input { .. } => {
-                let mut section: Vec<(masys_domain::declarative::Input, Option<u32>)> = Vec::new();
-                while let Some(Node::Input { input, age_days }) = nodes.get(index) {
-                    section.push((input.clone(), *age_days));
-                    index += 1;
-                }
-                // One item per row in the batch, so these nodes keep a
-                // one-to-one place among the items.
-                first_item.extend(items.len()..items.len() + section.len());
-                items.extend(view::input_lines(&section, theme).into_iter().map(indented).map(ListItem::new));
-            }
-            Node::NixPolicy { .. } => {
-                let mut section: Vec<view::NixPolicyRow> = Vec::new();
-                while let Some(Node::NixPolicy { job, unit, retention, next_in_ms, last_ago_ms, enabled }) = nodes.get(index) {
-                    section.push(view::NixPolicyRow {
+                    }),
+                    _ => None,
+                },
+                |section| view::dir_entry_lines(section, theme),
+            ),
+            Node::Filesystem { .. } => batch(
+                run,
+                &mut items,
+                &mut first_item,
+                |node| match node {
+                    Node::Filesystem {
+                        filesystem,
+                        expanded,
+                    } => Some((filesystem.clone(), *expanded)),
+                    _ => None,
+                },
+                |section| view::filesystem_lines(section, theme),
+            ),
+            Node::JournalEntry(_) => batch(
+                run,
+                &mut items,
+                &mut first_item,
+                |node| match node {
+                    Node::JournalEntry(entry) => Some(entry.clone()),
+                    _ => None,
+                },
+                |section| view::journal_lines(section, theme, scope),
+            ),
+            Node::Generation { .. } => batch(
+                run,
+                &mut items,
+                &mut first_item,
+                |node| match node {
+                    Node::Generation {
+                        generation, age_ms, ..
+                    } => Some(view::GenerationRow {
+                        generation: generation.clone(),
+                        age_ms: *age_ms,
+                    }),
+                    _ => None,
+                },
+                |section| view::generation_lines(section, theme),
+            ),
+            Node::Input { .. } => batch(
+                run,
+                &mut items,
+                &mut first_item,
+                |node| match node {
+                    Node::Input { input, age_days } => Some((input.clone(), *age_days)),
+                    _ => None,
+                },
+                |section| view::input_lines(section, theme),
+            ),
+            Node::NixPolicy { .. } => batch(
+                run,
+                &mut items,
+                &mut first_item,
+                |node| match node {
+                    Node::NixPolicy {
+                        job,
+                        unit,
+                        retention,
+                        next_in_ms,
+                        last_ago_ms,
+                        enabled,
+                    } => Some(view::NixPolicyRow {
                         job: job.clone(),
                         unit: unit.clone(),
                         retention: retention.clone(),
                         next_in_ms: *next_in_ms,
                         last_ago_ms: *last_ago_ms,
                         enabled: *enabled,
-                    });
-                    index += 1;
-                }
-                // One item per row in the batch, so these nodes keep a
-                // one-to-one place among the items.
-                first_item.extend(items.len()..items.len() + section.len());
-                items.extend(view::nix_policy_lines(&section, theme).into_iter().map(indented).map(ListItem::new));
-            }
-            // The two blocks that are several lines: one item each, so a
-            // long one scrolls rather than vanishing.
+                    }),
+                    _ => None,
+                },
+                |section| view::nix_policy_lines(section, theme),
+            ),
+            // The two blocks that are several lines: one item each per
+            // line, so a long one scrolls rather than vanishing.
             Node::UnitDetail { unit, detail } => {
                 first_item.push(items.len());
-                items.extend(view::unit_detail_lines(unit, detail.as_deref(), theme).into_iter().map(indented).map(ListItem::new));
-                index += 1;
+                items.extend(
+                    view::unit_detail_lines(unit, detail.as_deref(), theme)
+                        .into_iter()
+                        .map(indented)
+                        .map(ListItem::new),
+                );
+                1
             }
             Node::ProcDetail { proc, detail } => {
                 first_item.push(items.len());
-                items.extend(view::proc_detail_lines(proc, detail.as_deref(), theme).into_iter().map(indented).map(ListItem::new));
-                index += 1;
+                items.extend(
+                    view::proc_detail_lines(proc, detail.as_deref(), theme)
+                        .into_iter()
+                        .map(indented)
+                        .map(ListItem::new),
+                );
+                1
             }
-            node => {
-                first_item.push(items.len());
-                items.push(row_item(node, theme, columns));
-                index += 1;
-            }
-        }
+            // One item each, and the item is built here rather than in a
+            // second match over `Node`. There was one: `row_item` named
+            // all twenty-one variants, was reached for these six, and
+            // answered the other fifteen with a blank line under a
+            // comment saying it never would. Its doc argued that
+            // exhaustiveness there was what made a new row type
+            // impossible to forget - but the guard was this match, and
+            // what a new variant met in `row_item` was fifteen
+            // neighbours returning `Line::default()`, which is the wrong
+            // thing to copy.
+            //
+            // The one row that is *not* indented: it is what the others
+            // are indented under.
+            Node::SectionHeader { title, count, .. } => single(
+                &mut items,
+                &mut first_item,
+                ListItem::new(view::section_header_line(title, *count, theme)),
+            ),
+            Node::OverviewLine { overview, part } => single(
+                &mut items,
+                &mut first_item,
+                ListItem::new(indented(view::overview_part_line(overview, *part, theme))),
+            ),
+            Node::ProcGroup { .. } => single(
+                &mut items,
+                &mut first_item,
+                ListItem::new(view::proc_group_line(&nodes[index], theme, columns)),
+            ),
+            // The Nix buffer's two blocks: several lines in one item,
+            // because each is one statement rather than a list. Nothing
+            // selects inside either. The reboot block is the only row in
+            // that buffer which is not indented - `NixBuffer::rows` gives
+            // it no section header, so it stands where one would.
+            Node::RebootPending { .. } => single(
+                &mut items,
+                &mut first_item,
+                ListItem::new(view::reboot_lines(&nodes[index], theme)),
+            ),
+            Node::NixStore { .. } => single(
+                &mut items,
+                &mut first_item,
+                ListItem::new(
+                    view::nix_store_lines(&nodes[index], theme)
+                        .into_iter()
+                        .map(indented)
+                        .collect::<Vec<_>>(),
+                ),
+            ),
+            // Structure rather than content, and the only variant whose
+            // blank line is the answer rather than a placeholder.
+            Node::Spacer => single(&mut items, &mut first_item, ListItem::new(Line::default())),
+        };
     }
     (items, first_item)
 }
@@ -363,12 +492,16 @@ fn footer_hint_spans(model: &View, theme: &Theme) -> Vec<Span<'static>> {
             spans.push(Span::raw("  "));
         }
         let text = format!("[{}] {}", hint.chord, hint.label);
-        // The view you are in is marked rather than removed, so the row
+        // The buffer you are in is marked rather than removed, so the row
         // stays the same width and the same keys stay in the same places.
         // Reversed rather than merely bold: this is the one thing on the
         // footer that answers "where am I", and it has to survive a glance
         // at a row of eight similar-looking entries.
-        let style = if hint.active { Style::default().add_modifier(Modifier::REVERSED) } else { Style::default().fg(theme.info) };
+        let style = if hint.active {
+            Style::default().add_modifier(Modifier::REVERSED)
+        } else {
+            Style::default().fg(theme.info)
+        };
         spans.push(Span::styled(text, style));
     }
     spans
@@ -377,7 +510,7 @@ fn footer_hint_spans(model: &View, theme: &Theme) -> Vec<Span<'static>> {
 /// How many rows of keys the footer will spend on itself.
 ///
 /// Wrapping without a cap would let a long enough action set eat the
-/// list it is describing. Three holds the systemd view's thirteen keys
+/// list it is describing. Three holds the systemd buffer's thirteen keys
 /// at 80 columns, which is the widest set masys offers and the narrowest
 /// terminal it targets.
 const MAX_ACTION_ROWS: usize = 3;
@@ -393,7 +526,7 @@ struct ActionRows<'a> {
 ///
 /// The keys wrap rather than truncating at the right margin. Truncation
 /// silently drops the rightmost keys, which is how the action keys went
-/// missing twice before, and on the systemd view the rightmost key is
+/// missing twice before, and on the systemd buffer the rightmost key is
 /// `[l] logs` - the one most worth reaching. Past `MAX_ACTION_ROWS` the
 /// last row is still marked, because a cap that hides keys without
 /// saying so is the same failure one row further out.
@@ -412,7 +545,10 @@ fn wrap_actions<'a>(actions: &'a [KeyBinding], width: u16) -> ActionRows<'a> {
         if !row.is_empty() && used + sep + text_width + reserve > width as usize {
             if last_row {
                 rows.push(row);
-                return ActionRows { rows, clipped: true };
+                return ActionRows {
+                    rows,
+                    clipped: true,
+                };
             }
             rows.push(std::mem::take(&mut row));
             used = 0;
@@ -423,7 +559,10 @@ fn wrap_actions<'a>(actions: &'a [KeyBinding], width: u16) -> ActionRows<'a> {
     if !row.is_empty() {
         rows.push(row);
     }
-    ActionRows { rows, clipped: false }
+    ActionRows {
+        rows,
+        clipped: false,
+    }
 }
 
 /// The open buffer's own keys, as spans so the inapplicable ones can be
@@ -451,7 +590,10 @@ fn footer_action_lines(model: &View, width: u16, theme: &Theme) -> Vec<Line<'sta
                 } else {
                     Style::default().fg(theme.section_header)
                 };
-                spans.push(Span::styled(format!("[{}] {}", binding.chord, binding.label), style));
+                spans.push(Span::styled(
+                    format!("[{}] {}", binding.chord, binding.label),
+                    style,
+                ));
             }
             if wrapped.clipped && n == last {
                 spans.push(Span::raw(" ..."));
@@ -469,12 +611,20 @@ fn footer_lines(model: &View, theme: &Theme, height: u16, width: u16) -> Vec<Lin
             lines.push(Line::from(footer_hint_spans(model, theme)));
             lines
         }
-        StatusLine::Busy => vec![Line::from(Span::styled("Working...", Style::default().fg(theme.section_header)))],
+        StatusLine::Busy => vec![Line::from(Span::styled(
+            "Working...",
+            Style::default().fg(theme.section_header),
+        ))],
         StatusLine::Message(text) => vec![Line::from(text.to_string())],
         StatusLine::Error(text) => text
             .lines()
             .take(height as usize)
-            .map(|line| Line::from(Span::styled(line.to_string(), Style::default().fg(theme.status_error))))
+            .map(|line| {
+                Line::from(Span::styled(
+                    line.to_string(),
+                    Style::default().fg(theme.status_error),
+                ))
+            })
             .collect(),
     }
 }
@@ -531,7 +681,10 @@ pub fn render(frame: &mut Frame, model: &View, theme: &Theme) -> Metrics {
         // interrupting for.
         if let Some(matched) = model.filter_matches {
             let (text, style) = match matched {
-                0 => ("no matches".to_string(), Style::default().fg(theme.severity_warning)),
+                0 => (
+                    "no matches".to_string(),
+                    Style::default().fg(theme.severity_warning),
+                ),
                 1 => ("1 match".to_string(), Style::default().fg(theme.info)),
                 many => (format!("{many} matches"), Style::default().fg(theme.info)),
             };
@@ -559,10 +712,15 @@ pub fn render(frame: &mut Frame, model: &View, theme: &Theme) -> Metrics {
     // list at all. Reserve the header plus one list row, and let the
     // error take what's left - `footer_lines` truncates to the height it
     // is handed, so clamping here is what makes that `take` do any work.
-    let footer_height = footer_height(model, width).min(area.height.saturating_sub(header_height + 1));
+    let footer_height =
+        footer_height(model, width).min(area.height.saturating_sub(header_height + 1));
 
-    let [header_area, list_area, footer_area] =
-        Layout::vertical([Constraint::Length(header_height), Constraint::Min(0), Constraint::Length(footer_height)]).areas(area);
+    let [header_area, list_area, footer_area] = Layout::vertical([
+        Constraint::Length(header_height),
+        Constraint::Min(0),
+        Constraint::Length(footer_height),
+    ])
+    .areas(area);
 
     frame.render_widget(Paragraph::new(header), header_area);
     // `render_stateful_widget` with a `ListState` rather than styling the
@@ -572,7 +730,7 @@ pub fn render(frame: &mut Frame, model: &View, theme: &Theme) -> Metrics {
     // between frames yet - ratatui only needs it to compute the offset,
     // and a fresh one recomputes the same offset from the same selection.
     let mut list_state = ListState::default();
-    // The unit this view is scoped to, if it is scoped to one: a log row
+    // The unit this buffer is scoped to, if it is scoped to one: a log row
     // names its own unit only where that differs.
     let scope = match model.header {
         Header::Log { unit, .. } => Some(unit),
@@ -581,7 +739,11 @@ pub fn render(frame: &mut Frame, model: &View, theme: &Theme) -> Metrics {
     let (items, first_item) = build_items(model.rows, theme, &columns, scope);
     // The cursor is a node index; a detail block spans several items, so
     // the two only coincide when nothing is open above the cursor.
-    list_state.select(model.selected.and_then(|node| first_item.get(node).copied()));
+    list_state.select(
+        model
+            .selected
+            .and_then(|node| first_item.get(node).copied()),
+    );
     frame.render_stateful_widget(
         List::new(items)
             .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
@@ -602,10 +764,21 @@ pub fn render(frame: &mut Frame, model: &View, theme: &Theme) -> Metrics {
         list_area,
         &mut list_state,
     );
-    frame.render_widget(Paragraph::new(footer_lines(model, theme, footer_height, width)), footer_area);
+    frame.render_widget(
+        Paragraph::new(footer_lines(model, theme, footer_height, width)),
+        footer_area,
+    );
 
-    let modal = model.modal.as_ref().map(|modal| draw_modal(frame, modal, area, theme)).unwrap_or((0, 0));
-    Metrics { list_height: list_area.height, modal_height: modal.0, modal_content: modal.1 }
+    let modal = model
+        .modal
+        .as_ref()
+        .map(|modal| draw_modal(frame, modal, area, theme))
+        .unwrap_or((0, 0));
+    Metrics {
+        list_height: list_area.height,
+        modal_height: modal.0,
+        modal_content: modal.1,
+    }
 }
 
 /// Draws a popup centred over the buffer and reports `(height, content)` -
@@ -622,13 +795,20 @@ fn draw_modal(frame: &mut Frame, modal: &ModalView, area: Rect, theme: &Theme) -
         // terminal the popup silently dropped the last nine - including
         // every action key. A reference card that hides half the keys is
         // worse than no reference card.
-        ModalView::Keys { groups } => (" keys ".to_string(), key_help_lines(groups, theme, area.height.saturating_sub(2))),
+        ModalView::Keys { groups } => (
+            " keys ".to_string(),
+            key_help_lines(groups, theme, area.height.saturating_sub(2)),
+        ),
         // A confirmation is one line and deliberately plain: the prompt
         // already names the signal and the process, and decorating it
         // would only make the two outcomes harder to tell apart.
-        ModalView::Confirm { prompt } => {
-            (" confirm ".to_string(), vec![Line::from(Span::styled(prompt.to_string(), Style::default().fg(theme.status_error)))])
-        }
+        ModalView::Confirm { prompt } => (
+            " confirm ".to_string(),
+            vec![Line::from(Span::styled(
+                prompt.to_string(),
+                Style::default().fg(theme.status_error),
+            ))],
+        ),
         // A block for a cursor, so it is obvious the popup is taking
         // keystrokes rather than the buffer behind it.
         //
@@ -637,19 +817,29 @@ fn draw_modal(frame: &mut Frame, modal: &ModalView, area: Rect, theme: &Theme) -
         // the buffer filter is not a popup at all. The old title dates
         // from before that was settled, and nothing caught it because
         // nothing had ever constructed an `Input`.
-        ModalView::Input { prompt, typed, candidates } => (
+        //
+        // One line, because the sub-step is text entry and nothing else.
+        ModalView::Input { prompt, typed } => (
             " input ".to_string(),
-            std::iter::once(Line::from(vec![
-                Span::styled(format!("{prompt}: "), Style::default().fg(theme.section_header)),
+            vec![Line::from(vec![
+                Span::styled(
+                    format!("{prompt}: "),
+                    Style::default().fg(theme.section_header),
+                ),
                 Span::raw(format!("{typed}\u{2588}")),
-            ]))
-            .chain(candidates.iter().flat_map(|list| candidate_lines(list, theme)))
-            .collect(),
+            ])],
         ),
         // The title names the subject - `Unit . restic-backup.service`,
         // `Generation 436` - so it is padded here the way the fixed titles
         // above are written padded, and not by every caller.
-        ModalView::Transient { title, switches, groups } => (format!(" {title} "), transient_lines(switches, groups, theme)),
+        ModalView::Transient {
+            title,
+            switches,
+            groups,
+        } => (
+            format!(" {title} "),
+            transient_lines(switches, groups, theme),
+        ),
     };
 
     let content = lines.len() as u16;
@@ -658,18 +848,31 @@ fn draw_modal(frame: &mut Frame, modal: &ModalView, area: Rect, theme: &Theme) -
     // routinely wider than any row under it. Sized to the rows alone, the
     // border ate the end of the title, which is the one part of a popup
     // that says what you are about to act on.
-    let widest = lines.iter().map(|l| l.width()).chain([UnicodeWidthStr::width(title.as_str())]).max().unwrap_or(0) as u16;
+    let widest = lines
+        .iter()
+        .map(|l| l.width())
+        .chain([UnicodeWidthStr::width(title.as_str())])
+        .max()
+        .unwrap_or(0) as u16;
     // +2 on each axis for the border.
     let height = (content + 2).min(area.height);
     let width = (widest + 4).min(area.width);
-    let popup =
-        Rect { x: area.x + (area.width.saturating_sub(width)) / 2, y: area.y + (area.height.saturating_sub(height)) / 2, width, height };
+    let popup = Rect {
+        x: area.x + (area.width.saturating_sub(width)) / 2,
+        y: area.y + (area.height.saturating_sub(height)) / 2,
+        width,
+        height,
+    };
 
     // Clear first: a popup drawn over a list would otherwise show the
     // rows through its own blank cells.
     frame.render_widget(Clear, popup);
     frame.render_widget(
-        Paragraph::new(lines).block(Block::bordered().title(title).border_style(Style::default().fg(theme.section_header))),
+        Paragraph::new(lines).block(
+            Block::bordered()
+                .title(title)
+                .border_style(Style::default().fg(theme.section_header)),
+        ),
         popup,
     );
     (height, content)
@@ -683,9 +886,17 @@ fn draw_modal(frame: &mut Frame, modal: &ModalView, area: Rect, theme: &Theme) -
 /// to scroll a list of keys to find the key that scrolls is the kind of
 /// joke a tool should not make. Groups are kept whole - a heading in one
 /// column with its bindings in the next would be worse than either.
-fn key_help_lines(groups: &[masys_view::KeyGroup], theme: &Theme, max_height: u16) -> Vec<Line<'static>> {
-    let blocks: Vec<Vec<Line<'static>>> = groups.iter().map(|group| group_block(group, theme)).collect();
-    let total: usize = blocks.iter().map(|b| b.len()).sum::<usize>() + blocks.len().saturating_sub(1);
+fn key_help_lines(
+    groups: &[masys_view::KeyGroup],
+    theme: &Theme,
+    max_height: u16,
+) -> Vec<Line<'static>> {
+    let blocks: Vec<Vec<Line<'static>>> = groups
+        .iter()
+        .map(|group| group_block(group, theme))
+        .collect();
+    let total: usize =
+        blocks.iter().map(|b| b.len()).sum::<usize>() + blocks.len().saturating_sub(1);
     let height = (max_height as usize).max(1);
 
     if total <= height {
@@ -720,8 +931,12 @@ fn spaced(block: Vec<Line<'static>>) -> Vec<Line<'static>> {
 }
 
 fn group_block(group: &masys_view::KeyGroup, theme: &Theme) -> Vec<Line<'static>> {
-    let mut lines =
-        vec![Line::from(Span::styled(group.heading.clone(), Style::default().fg(theme.section_header).add_modifier(Modifier::BOLD)))];
+    let mut lines = vec![Line::from(Span::styled(
+        group.heading.clone(),
+        Style::default()
+            .fg(theme.section_header)
+            .add_modifier(Modifier::BOLD),
+    ))];
     for binding in &group.bindings {
         let (chord_style, label_style) = row_styles(binding.dimmed, theme);
         lines.push(Line::from(vec![
@@ -732,44 +947,26 @@ fn group_block(group: &masys_view::KeyGroup, theme: &Theme) -> Vec<Line<'static>
     lines
 }
 
-/// A picker's candidates, the highlighted one reversed.
-///
-/// `REVERSED` rather than a `>` marker because it is what already means
-/// "the cursor is here" everywhere else in masys - the list's
-/// `highlight_style` and the footer's active buffer - and a second idiom
-/// for the same idea would have to be learned separately.
-///
-/// An empty match set draws a line saying so. Drawing nothing would leave
-/// the typed text with blank space under it, which reads as a picker
-/// still thinking rather than one that has answered.
-fn candidate_lines(list: &masys_view::CandidateList, theme: &Theme) -> Vec<Line<'static>> {
-    if list.matches.is_empty() {
-        return vec![Line::from(Span::styled("  no matches".to_string(), Style::default().fg(theme.info).add_modifier(Modifier::DIM)))];
-    }
-
-    list.matches
-        .iter()
-        .enumerate()
-        .map(|(index, candidate)| {
-            let style = match index == list.selected {
-                true => Style::default().add_modifier(Modifier::REVERSED),
-                false => Style::default(),
-            };
-            Line::from(Span::styled(format!("  {candidate}"), style))
-        })
-        .collect()
-}
-
 /// A transient's contents: its switch groups, then its action groups,
 /// one blank line between each.
 ///
 /// Switches lead because they change what the actions under them will
 /// do. Read after choosing an action, they have been read too late.
-fn transient_lines(switches: &[SwitchRow], groups: &[ActionGroup], theme: &Theme) -> Vec<Line<'static>> {
-    let blocks: Vec<Vec<Line<'static>>> =
-        switch_blocks(switches, theme).into_iter().chain(groups.iter().map(|group| action_block(group, theme))).collect();
+fn transient_lines(
+    switches: &[SwitchRow],
+    groups: &[ActionGroup],
+    theme: &Theme,
+) -> Vec<Line<'static>> {
+    let blocks: Vec<Vec<Line<'static>>> = switch_blocks(switches, theme)
+        .into_iter()
+        .chain(groups.iter().map(|group| action_block(group, theme)))
+        .collect();
 
-    blocks.into_iter().enumerate().flat_map(|(index, block)| (index > 0).then(Line::default).into_iter().chain(block)).collect()
+    blocks
+        .into_iter()
+        .enumerate()
+        .flat_map(|(index, block)| (index > 0).then(Line::default).into_iter().chain(block))
+        .collect()
 }
 
 /// The switch rows, bucketed by their `group` in first-appearance order.
@@ -781,22 +978,35 @@ fn transient_lines(switches: &[SwitchRow], groups: &[ActionGroup], theme: &Theme
 /// switches in is the order its author chose, and alphabetising it here
 /// would silently overrule them.
 fn switch_blocks(switches: &[SwitchRow], theme: &Theme) -> Vec<Vec<Line<'static>>> {
-    let headings = switches.iter().map(|switch| switch.group).fold(Vec::new(), |mut seen, group| {
-        if !seen.contains(&group) {
-            seen.push(group);
-        }
-        seen
-    });
+    let headings =
+        switches
+            .iter()
+            .map(|switch| switch.group)
+            .fold(Vec::new(), |mut seen, group| {
+                if !seen.contains(&group) {
+                    seen.push(group);
+                }
+                seen
+            });
     // One label column across every switch group, not one per group, so
     // the `[x]` boxes line up down the whole popup rather than stepping
     // in and out at each heading.
-    let width = switches.iter().map(|switch| UnicodeWidthStr::width(switch.label)).max().unwrap_or(0);
+    let width = switches
+        .iter()
+        .map(|switch| UnicodeWidthStr::width(switch.label))
+        .max()
+        .unwrap_or(0);
 
     headings
         .into_iter()
         .map(|heading| {
             std::iter::once(heading_line(heading.to_string(), None, theme))
-                .chain(switches.iter().filter(|switch| switch.group == heading).map(|switch| switch_line(switch, theme, width)))
+                .chain(
+                    switches
+                        .iter()
+                        .filter(|switch| switch.group == heading)
+                        .map(|switch| switch_line(switch, theme, width)),
+                )
                 .collect()
         })
         .collect()
@@ -811,8 +1021,14 @@ fn switch_line(switch: &SwitchRow, theme: &Theme, width: usize) -> Line<'static>
     let (chord_style, label_style) = row_styles(!switch.supported, theme);
     Line::from(vec![
         Span::styled(format!("  {:<4}", switch.chord), chord_style),
-        Span::styled(format!("{:<width$}", switch.label, width = width), label_style),
-        Span::styled(if switch.on { "  [x]" } else { "  [ ]" }.to_string(), label_style),
+        Span::styled(
+            format!("{:<width$}", switch.label, width = width),
+            label_style,
+        ),
+        Span::styled(
+            if switch.on { "  [x]" } else { "  [ ]" }.to_string(),
+            label_style,
+        ),
     ])
 }
 
@@ -827,14 +1043,22 @@ fn switch_line(switch: &SwitchRow, theme: &Theme, width: usize) -> Line<'static>
 /// two different places to look.
 fn action_block(group: &ActionGroup, theme: &Theme) -> Vec<Line<'static>> {
     let heading = heading_line(group.heading.clone(), group.note.clone(), theme);
-    let width = group.rows.iter().map(|row| UnicodeWidthStr::width(row.label)).max().unwrap_or(0);
+    let width = group
+        .rows
+        .iter()
+        .map(|row| UnicodeWidthStr::width(row.label))
+        .max()
+        .unwrap_or(0);
     let annotated = group.rows.iter().any(|row| row.note.is_some());
     let per_line = if annotated { 1 } else { 2 };
 
     std::iter::once(heading)
         .chain(group.rows.chunks(per_line).map(|pair| {
             Line::from(
-                pair.iter().enumerate().flat_map(|(index, row)| action_cell(row, theme, width, index + 1 < pair.len())).collect::<Vec<_>>(),
+                pair.iter()
+                    .enumerate()
+                    .flat_map(|(index, row)| action_cell(row, theme, width, index + 1 < pair.len()))
+                    .collect::<Vec<_>>(),
             )
         }))
         .collect()
@@ -846,11 +1070,20 @@ fn action_block(group: &ActionGroup, theme: &Theme) -> Vec<Line<'static>> {
 /// Spans rather than a `Line` so that two cells can be laid on one.
 fn action_cell(row: &ActionRow, theme: &Theme, width: usize, paired: bool) -> Vec<Span<'static>> {
     let (chord_style, label_style) = row_styles(row.dimmed, theme);
-    let label = if paired || row.note.is_some() { format!("{:<width$}", row.label, width = width) } else { row.label.to_string() };
+    let label = if paired || row.note.is_some() {
+        format!("{:<width$}", row.label, width = width)
+    } else {
+        row.label.to_string()
+    };
 
     std::iter::once(Span::styled(format!("  {}  ", row.chord), chord_style))
         .chain(std::iter::once(Span::styled(label, label_style)))
-        .chain(row.note.iter().map(|note| Span::styled(format!("  {note}"), Style::default().add_modifier(Modifier::DIM))))
+        .chain(row.note.iter().map(|note| {
+            Span::styled(
+                format!("  {note}"),
+                Style::default().add_modifier(Modifier::DIM),
+            )
+        }))
         .chain(paired.then(|| Span::raw("   ".to_string())))
         .collect()
 }
@@ -865,9 +1098,14 @@ fn action_cell(row: &ActionRow, theme: &Theme, width: usize, paired: bool) -> Ve
 /// which kind it is.
 fn heading_line(heading: String, note: Option<String>, theme: &Theme) -> Line<'static> {
     Line::from(
-        std::iter::once(Span::styled(heading, Style::default().fg(theme.section_header).add_modifier(Modifier::BOLD)))
-            .chain(note.map(|note| Span::styled(format!("   {note}"), Style::default().fg(theme.info))))
-            .collect::<Vec<_>>(),
+        std::iter::once(Span::styled(
+            heading,
+            Style::default()
+                .fg(theme.section_header)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .chain(note.map(|note| Span::styled(format!("   {note}"), Style::default().fg(theme.info))))
+        .collect::<Vec<_>>(),
     )
 }
 
@@ -875,7 +1113,10 @@ fn heading_line(heading: String, note: Option<String>, theme: &Theme) -> Line<'s
 /// still works, so only the styling says anything is different about it.
 fn row_styles(dimmed: bool, theme: &Theme) -> (Style, Style) {
     match dimmed {
-        true => (Style::default().fg(theme.info).add_modifier(Modifier::DIM), Style::default().add_modifier(Modifier::DIM)),
+        true => (
+            Style::default().fg(theme.info).add_modifier(Modifier::DIM),
+            Style::default().add_modifier(Modifier::DIM),
+        ),
         false => (Style::default().fg(theme.info), Style::default()),
     }
 }
@@ -884,7 +1125,10 @@ fn row_styles(dimmed: bool, theme: &Theme) -> (Style, Style) {
 /// next one starts in a straight edge.
 fn join(columns: Vec<Vec<Line<'static>>>) -> Vec<Line<'static>> {
     let height = columns.iter().map(|c| c.len()).max().unwrap_or(0);
-    let widths: Vec<usize> = columns.iter().map(|c| c.iter().map(|l| l.width()).max().unwrap_or(0)).collect();
+    let widths: Vec<usize> = columns
+        .iter()
+        .map(|c| c.iter().map(|l| l.width()).max().unwrap_or(0))
+        .collect();
 
     (0..height)
         .map(|row| {
@@ -897,7 +1141,9 @@ fn join(columns: Vec<Vec<Line<'static>>>) -> Vec<Line<'static>> {
                 }
                 // Three columns of gutter, except after the last.
                 if index + 1 < columns.len() {
-                    spans.push(Span::raw(" ".repeat(widths[index].saturating_sub(used) + 3)));
+                    spans.push(Span::raw(
+                        " ".repeat(widths[index].saturating_sub(used) + 3),
+                    ));
                 }
             }
             Line::from(spans)

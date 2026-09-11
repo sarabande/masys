@@ -12,9 +12,10 @@ use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 
 use fake::{FakePlatformService, FakeSystemService};
+use masys_app::io_buffer::IoBuffer;
 use masys_app::key::{Key, KeyCode};
 use masys_app::{App, Buffer};
-use masys_domain::sample::{Filesystem, Pressure, Snapshot, SystemState};
+use masys_domain::sample::{Disk, Filesystem, Interface, Pressure, Snapshot, SystemState};
 use masys_domain::scan::{DirScanner, DirSize, ScanProgress};
 use masys_view::Node;
 
@@ -28,7 +29,9 @@ struct ScriptedScanner {
 
 impl DirScanner for ScriptedScanner {
     fn start(&self, root: &Path) {
-        self.calls.borrow_mut().push(format!("start {}", root.display()));
+        self.calls
+            .borrow_mut()
+            .push(format!("start {}", root.display()));
     }
     fn poll(&self) -> ScanProgress {
         self.progress.borrow().clone()
@@ -79,6 +82,8 @@ fn snapshot() -> Snapshot {
         load: None,
         uptime_secs: None,
         memory: None,
+        cpu_times: None,
+        thermal_throttled_ms_by_core: None,
     }
 }
 
@@ -95,18 +100,30 @@ fn io_app() -> (App, Shared) {
         queued: Default::default(),
         proc_details: Default::default(),
         detail_queries: Default::default(),
+        units_fail_with: None,
+        sample_fail_with: None,
+        smart: None,
+        smart_reads: Default::default(),
     };
-    let platform = FakePlatformService { boot_pressure: None, pending_reboot: None };
-    let mut app = App::new(Box::new(system), Box::new(platform), Box::new(Handle(std::rc::Rc::clone(&scanner))), "devbox".to_string());
-    app.tick(1_000, "t".to_string()).expect("tick");
-    // Into the IO view, onto the filesystem row past its section header.
+    let platform = FakePlatformService::default();
+    let mut app = App::new(
+        Box::new(system),
+        Box::new(platform),
+        Box::new(Handle(std::rc::Rc::clone(&scanner))),
+        "devbox".to_string(),
+    );
+    app.tick(1_000, "t".to_string());
+    // Into the IO buffer, onto the filesystem row past its section header.
     app.handle_key(Key::char('4'));
     app.handle_key(Key::new(KeyCode::Down));
     (app, scanner)
 }
 
 fn dir(path: &str, bytes: u64) -> DirSize {
-    DirSize { path: PathBuf::from(path), bytes }
+    DirSize {
+        path: PathBuf::from(path),
+        bytes,
+    }
 }
 
 fn dir_rows(app: &App) -> Vec<(String, u64)> {
@@ -120,13 +137,16 @@ fn dir_rows(app: &App) -> Vec<(String, u64)> {
         .collect()
 }
 
-/// The IO view says how full a filesystem is and cannot say why. Opening
+/// The IO buffer says how full a filesystem is and cannot say why. Opening
 /// the row is the question "why", and it is the only thing that starts a
 /// scan - masys never walks a filesystem nobody asked about.
 #[test]
 fn opening_a_filesystem_starts_a_scan_of_its_mount_point() {
     let (mut app, scanner) = io_app();
-    assert!(scanner.calls.borrow().is_empty(), "nothing scans until asked");
+    assert!(
+        scanner.calls.borrow().is_empty(),
+        "nothing scans until asked"
+    );
 
     app.handle_key(Key::new(KeyCode::Enter));
     assert_eq!(*scanner.calls.borrow(), vec!["start /".to_string()]);
@@ -145,15 +165,22 @@ fn drilling_into_a_directory_does_not_restart_the_scan() {
         done: true,
         ..Default::default()
     };
-    app.tick(3_000, "t".to_string()).expect("tick");
+    app.tick(3_000, "t".to_string());
 
     // Onto the first directory row, and open it.
-    while !matches!(app.view().rows.get(app.view().selected.unwrap_or(0)), Some(Node::DirEntry { .. })) {
+    while !matches!(
+        app.view().rows.get(app.view().selected.unwrap_or(0)),
+        Some(Node::DirEntry { .. })
+    ) {
         app.handle_key(Key::new(KeyCode::Down));
     }
     app.handle_key(Key::new(KeyCode::Enter));
 
-    assert_eq!(*scanner.calls.borrow(), vec!["start /".to_string()], "still just the one scan");
+    assert_eq!(
+        *scanner.calls.borrow(),
+        vec!["start /".to_string()],
+        "still just the one scan"
+    );
 }
 
 /// Largest first: the question is what is using the disk, and the answer
@@ -164,14 +191,21 @@ fn directories_are_listed_largest_first() {
     app.handle_key(Key::new(KeyCode::Enter));
     *scanner.progress.borrow_mut() = ScanProgress {
         root: Some(PathBuf::from("/")),
-        dirs: vec![dir("/var", 4 << 30), dir("/nix", 40 << 30), dir("/home", 20 << 30)],
+        dirs: vec![
+            dir("/var", 4 << 30),
+            dir("/nix", 40 << 30),
+            dir("/home", 20 << 30),
+        ],
         done: true,
         ..Default::default()
     };
-    app.tick(3_000, "t".to_string()).expect("tick");
+    app.tick(3_000, "t".to_string());
 
     let rows = dir_rows(&app);
-    assert_eq!(rows.iter().map(|(p, _)| p.as_str()).collect::<Vec<_>>(), vec!["/nix", "/home", "/var"]);
+    assert_eq!(
+        rows.iter().map(|(p, _)| p.as_str()).collect::<Vec<_>>(),
+        vec!["/nix", "/home", "/var"]
+    );
 }
 
 /// Only the children of what is open. A flat dump of every retained
@@ -182,13 +216,24 @@ fn only_the_children_of_an_open_directory_are_shown() {
     app.handle_key(Key::new(KeyCode::Enter));
     *scanner.progress.borrow_mut() = ScanProgress {
         root: Some(PathBuf::from("/")),
-        dirs: vec![dir("/nix", 40 << 30), dir("/nix/store", 39 << 30), dir("/nix/var", 1 << 30)],
+        dirs: vec![
+            dir("/nix", 40 << 30),
+            dir("/nix/store", 39 << 30),
+            dir("/nix/var", 1 << 30),
+        ],
         done: true,
         ..Default::default()
     };
-    app.tick(3_000, "t".to_string()).expect("tick");
+    app.tick(3_000, "t".to_string());
 
-    assert_eq!(dir_rows(&app).iter().map(|(p, _)| p.as_str()).collect::<Vec<_>>(), vec!["/nix"], "the grandchildren stay shut");
+    assert_eq!(
+        dir_rows(&app)
+            .iter()
+            .map(|(p, _)| p.as_str())
+            .collect::<Vec<_>>(),
+        vec!["/nix"],
+        "the grandchildren stay shut"
+    );
 }
 
 /// Sizes climb while the walk proceeds, which is the whole point of a
@@ -199,9 +244,13 @@ fn sizes_climb_as_the_scan_proceeds() {
     let (mut app, scanner) = io_app();
     app.handle_key(Key::new(KeyCode::Enter));
 
-    *scanner.progress.borrow_mut() =
-        ScanProgress { root: Some(PathBuf::from("/")), dirs: vec![dir("/nix", 5 << 30)], counted_bytes: 5 << 30, ..Default::default() };
-    app.tick(3_000, "t".to_string()).expect("tick");
+    *scanner.progress.borrow_mut() = ScanProgress {
+        root: Some(PathBuf::from("/")),
+        dirs: vec![dir("/nix", 5 << 30)],
+        counted_bytes: 5 << 30,
+        ..Default::default()
+    };
+    app.tick(3_000, "t".to_string());
     assert_eq!(dir_rows(&app), vec![("/nix".to_string(), 5 << 30)]);
 
     *scanner.progress.borrow_mut() = ScanProgress {
@@ -211,7 +260,7 @@ fn sizes_climb_as_the_scan_proceeds() {
         done: true,
         ..Default::default()
     };
-    app.tick(5_000, "t".to_string()).expect("tick");
+    app.tick(5_000, "t".to_string());
     assert_eq!(dir_rows(&app), vec![("/nix".to_string(), 40 << 30)]);
 }
 
@@ -220,21 +269,126 @@ fn sizes_climb_as_the_scan_proceeds() {
 fn closing_the_filesystem_cancels_the_scan() {
     let (mut app, scanner) = io_app();
     app.handle_key(Key::new(KeyCode::Enter));
-    *scanner.progress.borrow_mut() =
-        ScanProgress { root: Some(PathBuf::from("/")), dirs: vec![dir("/nix", 40 << 30)], done: true, ..Default::default() };
-    app.tick(3_000, "t".to_string()).expect("tick");
+    *scanner.progress.borrow_mut() = ScanProgress {
+        root: Some(PathBuf::from("/")),
+        dirs: vec![dir("/nix", 40 << 30)],
+        done: true,
+        ..Default::default()
+    };
+    app.tick(3_000, "t".to_string());
     assert!(!dir_rows(&app).is_empty());
 
     app.handle_key(Key::new(KeyCode::Enter));
-    assert!(scanner.calls.borrow().contains(&"cancel".to_string()), "{:?}", scanner.calls.borrow());
+    assert!(
+        scanner.calls.borrow().contains(&"cancel".to_string()),
+        "{:?}",
+        scanner.calls.borrow()
+    );
     assert!(dir_rows(&app).is_empty(), "and the rows go with it");
 }
 
-/// The view stays in the IO buffer while all this happens - opening a row
+/// The session stays in the IO buffer while all this happens - opening a row
 /// is not a drill-down to somewhere else.
 #[test]
-fn scanning_never_leaves_the_io_view() {
+fn scanning_never_leaves_the_io_buffer() {
     let (mut app, _) = io_app();
     app.handle_key(Key::new(KeyCode::Enter));
     assert_eq!(app.buffer(), Buffer::Io);
+}
+
+fn interface(name: &str, rx_bytes: u64, tx_bytes: u64, loopback: bool) -> Interface {
+    Interface {
+        name: name.to_string(),
+        rx_bytes,
+        tx_bytes,
+        rx_packets: rx_bytes / 100,
+        tx_packets: tx_bytes / 100,
+        rx_errs: 0,
+        tx_errs: 0,
+        rx_drop: 0,
+        tx_drop: 0,
+        up: true,
+        loopback,
+    }
+}
+
+fn disk(name: &str, read_sectors: u64, write_sectors: u64) -> Disk {
+    Disk {
+        name: name.to_string(),
+        reads: read_sectors / 8,
+        writes: write_sectors / 8,
+        read_sectors,
+        write_sectors,
+        io_ms: 100,
+    }
+}
+
+/// The header's totals and the IO buffer's rows are one reading. This is
+/// the test that says so: the total is the sum of exactly the rows the
+/// buffer shows, loopback excluded, because `lo` is not a network path
+/// and a total that counted it would contradict the rows beneath it.
+#[test]
+fn the_overview_totals_are_the_sum_of_the_rows_the_io_buffer_shows() {
+    let mut io = IoBuffer::default();
+    let at = |taken_at_ms: u64, bytes: u64| Snapshot {
+        taken_at_ms,
+        interfaces: vec![
+            interface("eth0", bytes, bytes / 2, false),
+            interface("lo", bytes * 10, bytes * 10, true),
+        ],
+        disks: vec![disk("nvme0n1", bytes / 512, bytes / 1024)],
+        ..snapshot()
+    };
+    let (first, second) = (at(0, 0), at(1_000, 2_048_000));
+
+    io.refresh(&fake::NoScanner, None, &first);
+    assert_eq!(io.net_total, None, "one sample is not a rate");
+    assert_eq!(io.disk_total, None);
+
+    io.refresh(&fake::NoScanner, Some(&first), &second);
+    let net = io.net_total.expect("two samples");
+    let shown: f64 = io
+        .net_rates
+        .iter()
+        .filter(|(name, _)| name == "eth0")
+        .map(|(_, rate)| rate.rx_bytes_per_sec)
+        .sum();
+    assert_eq!(net.in_bytes_per_sec, shown, "eth0 alone");
+    assert!(
+        net.in_bytes_per_sec > 0.0 && net.in_bytes_per_sec < 20_480_000.0,
+        "loopback moved ten times as much and must not be in here: {net:?}"
+    );
+
+    let disk_total = io.disk_total.expect("two samples");
+    let disks: f64 = io
+        .disk_rates
+        .iter()
+        .map(|(_, rate)| rate.read_bytes_per_sec)
+        .sum();
+    assert_eq!(disk_total.in_bytes_per_sec, disks);
+}
+
+/// A total is a derivative like the rates it is made of, and it is not
+/// kept once there is nothing to derive against. A figure held over from
+/// an earlier tick is a reading with a timestamp nobody can see.
+#[test]
+fn a_total_is_not_carried_over_from_an_earlier_tick() {
+    let mut io = IoBuffer::default();
+    let at = |taken_at_ms: u64, bytes: u64| Snapshot {
+        taken_at_ms,
+        interfaces: vec![interface("eth0", bytes, bytes, false)],
+        disks: vec![disk("nvme0n1", bytes, bytes)],
+        ..snapshot()
+    };
+    let (first, second) = (at(0, 0), at(1_000, 4_096_000));
+
+    io.refresh(&fake::NoScanner, Some(&first), &second);
+    assert!(io.net_total.is_some(), "measured once");
+
+    io.refresh(&fake::NoScanner, None, &second);
+    assert_eq!(
+        io.net_total, None,
+        "and not still reported when there is nothing to derive against"
+    );
+    assert_eq!(io.disk_total, None);
 }

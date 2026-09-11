@@ -1,6 +1,6 @@
 use crate::error::MasysError;
-use crate::journal::Entry;
-use crate::platform::{BootPressure, Ownership, Package, PendingReboot, PlatformId, UpdateStatus};
+use crate::journal::{Entry, Priority};
+use crate::platform::{BootPressure, Ownership, Package, PendingReboot, PlatformId};
 use crate::sample::Snapshot;
 use crate::unit::Unit;
 
@@ -45,6 +45,28 @@ pub trait SystemService {
     /// a unit's name by anything else and misses every line that does not
     /// happen to contain it.
     fn unit_journal(&self, unit: &str, lines: usize) -> Result<Vec<Entry>, MasysError>;
+    /// Everything the host logged since `since_ms` at `min_priority` or
+    /// worse, oldest first.
+    ///
+    /// The only read here that names no unit, and the Status buffer's
+    /// two journal sections are its only caller. That is not a whole-
+    /// system tail returning: the Log buffer dropped one of those
+    /// deliberately, because "what happened on this machine" has no row
+    /// you can put a cursor on. What comes back here is turned into
+    /// findings - a handful of deduplicated rows with a count on each -
+    /// and never listed line by line.
+    ///
+    /// **One read for both sections.** Kernel-origin and userspace lines
+    /// are separated by `Entry::origin` above this port, rather than
+    /// by asking twice. Two queries would be two windows that drift
+    /// apart, and two sections disagreeing about the same instant is
+    /// worse than either being slightly stale.
+    ///
+    /// `since_ms` is Unix milliseconds - the clock `Entry::timestamp_ms`
+    /// is on, and the one `App::tick` already carries. Not
+    /// `Snapshot::taken_at_ms`, which is monotonic and means nothing to
+    /// journald.
+    fn journal(&self, since_ms: u64, min_priority: Priority) -> Result<Vec<Entry>, MasysError>;
     /// The properties a unit shows when its row is opened.
     ///
     /// Separate from `units` because the cost is different in kind: this
@@ -63,8 +85,35 @@ pub trait SystemService {
     /// adapter reading through a subprocess: a bounded query per wake
     /// would cost 100 ms and it cannot be told what changed. Such a host
     /// still sees its log refresh on the ordinary tick.
-    fn follow_unit_journal(&self, _unit: &str, _lines: usize) -> Result<Option<Vec<Entry>>, MasysError> {
+    fn follow_unit_journal(
+        &self,
+        _unit: &str,
+        _lines: usize,
+    ) -> Result<Option<Vec<Entry>>, MasysError> {
         Ok(None)
+    }
+
+    /// Whether every disk masys can ask reports its SMART self-assessment
+    /// as passing.
+    ///
+    /// **The one read here with no `Result`, and deliberately.** Every way
+    /// this can fail is a way of not knowing: `smartctl` is not installed,
+    /// the caller is not root, the device is virtual, the disk has no
+    /// SMART data. None of those is a fault an operator can act on and
+    /// none of them says anything about the disks, so all of them answer
+    /// `None` and the overview draws no segment. An `Err` here would put
+    /// a row on the Status buffer saying masys could not run a program,
+    /// on the majority of hosts, forever.
+    ///
+    /// `Some(true)` is a claim about *every* disk, so it requires every
+    /// disk to have answered. A host where two disks pass and a third
+    /// cannot be read answers `None`: "all healthy" would be a reading
+    /// nobody took of the one that matters.
+    ///
+    /// Defaults to `None`, which is the honest answer for an adapter that
+    /// has no way to ask.
+    fn smart_health(&self) -> Option<bool> {
+        None
     }
 
     fn unit_detail(&self, unit: &str) -> Result<crate::unit::UnitDetail, MasysError>;
@@ -141,20 +190,60 @@ pub trait SystemService {
     fn ionice(&self, pid: u32, class: IoNiceClass, level: i32) -> Result<(), MasysError>;
 }
 
-/// Distro-specific facts `SystemService` cannot answer on its own: how
-/// packages and generations are managed, and whether a runtime change to a
-/// unit persists. Two implementations planned - `masys-platform-nixos`,
-/// and `masys-platform-fallback`, which answers everything below with
-/// "not supported on this platform" so the rest of the app can treat
-/// "unknown distro" as a normal, working state rather than an error.
+/// Distro-specific facts `SystemService` cannot answer on its own: what
+/// this host is, whether it wants rebooting, what its generations cost,
+/// and whether a runtime change to a unit persists.
+///
+/// Four methods, and every one of them has a caller. It carried `packages`
+/// and `updates` until 2026-08-29, on the argument that "a port is the
+/// whole contract or it is a suggestion" - but the only adapter that
+/// answers anything refused both with `Err("not implemented")`, no caller
+/// asked, and no row drew the result. A contract neither side performs is
+/// not a contract, so they were removed rather than kept as a promise
+/// (#16). The Packages buffer can bring its own port when it exists.
+///
+/// The port models *not being able to answer*, so that a host with no
+/// adapter of its own is a normal working state rather than an error. That
+/// property is carried by the return types below rather than by any
+/// implementation: `PlatformId::Unsupported` is a real answer,
+/// `unit_ownership` resolves to `Ownership` in words Debian can speak, and
+/// `pending_reboot` and `boot_pressure` return `Option` because "nothing
+/// is known to be pending" and "I could not find out" must not be the same
+/// value. A method returning `generation: u32` would fail that test on
+/// sight, which is what keeps NixOS's shape out of this trait.
+///
+/// Stated of the types deliberately. An adapter that answers nothing
+/// cannot fail to satisfy a badly shaped port - it would return `0` as
+/// happily as anything else - so the check has to live where it can
+/// actually be made.
 pub trait PlatformService {
     fn id(&self) -> PlatformId;
-    /// Deferred past v1 - the Packages buffer is out of scope, but the
-    /// method is part of the port now so both adapters implement the full
-    /// contract from day one.
-    fn packages(&self) -> Result<Vec<Package>, MasysError>;
-    fn updates(&self) -> Result<UpdateStatus, MasysError>;
     fn pending_reboot(&self) -> Result<Option<PendingReboot>, MasysError>;
     fn unit_ownership(&self, unit: &str) -> Result<Ownership, MasysError>;
     fn boot_pressure(&self) -> Result<Option<BootPressure>, MasysError>;
+}
+
+/// What this host has installed.
+///
+/// **Its own port rather than a method on [`PlatformService`]**, and the
+/// difference is which question a host that cannot answer is asked.
+/// `PlatformService` is answered by every host - the fallback included -
+/// so a `packages()` there would have to return *something*, and the only
+/// somethings available are an empty list, which claims this host has no
+/// packages, and an `Err`, which is what the NixOS adapter returned for a
+/// year while nothing called it.
+///
+/// An `Option<Box<dyn PackageService>>` asks it once, at selection: either
+/// this host has an adapter that can list packages or it has none, and
+/// where it has none the Packages buffer is simply absent. That is
+/// `DeclarativeService`'s shape and it is here for
+/// `DeclarativeService`'s reason - a buffer of dashes pretending to be
+/// readings is worse than a buffer that is not there.
+pub trait PackageService {
+    /// Every package this host has installed, ascending by name.
+    ///
+    /// Sorted by the adapter rather than the buffer, because the order is
+    /// a property of the answer and two adapters sorting differently would
+    /// be a difference the operator sees and cannot explain.
+    fn packages(&self) -> Result<Vec<Package>, MasysError>;
 }

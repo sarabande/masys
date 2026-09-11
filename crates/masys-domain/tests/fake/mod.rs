@@ -9,8 +9,8 @@
 use std::cell::RefCell;
 
 use masys_domain::error::MasysError;
-use masys_domain::journal::Entry;
-use masys_domain::platform::{BootPressure, Ownership, Package, PendingReboot, PlatformId, UpdateStatus};
+use masys_domain::journal::{Entry, Priority};
+use masys_domain::platform::{BootPressure, Ownership, PendingReboot, PlatformId};
 use masys_domain::sample::Snapshot;
 use masys_domain::service::{IoNiceClass, PlatformService, Signal, SystemService};
 use masys_domain::unit::Unit;
@@ -21,9 +21,19 @@ pub enum Call {
     Stop(String),
     Restart(String),
     Reload(String),
-    Kill { pid: u32, signal: Signal },
-    Renice { pid: u32, value: i32 },
-    Ionice { pid: u32, class: IoNiceClass, level: i32 },
+    Kill {
+        pid: u32,
+        signal: Signal,
+    },
+    Renice {
+        pid: u32,
+        value: i32,
+    },
+    Ionice {
+        pid: u32,
+        class: IoNiceClass,
+        level: i32,
+    },
 }
 
 #[derive(Default)]
@@ -61,13 +71,25 @@ impl SystemService for FakeSystemService {
         unimplemented!("no method under test reads a unit's journal")
     }
 
+    /// Nothing logged. These tests exercise the domain's own rules,
+    /// which take entries as an argument rather than reading them.
+    fn journal(&self, _since_ms: u64, _min_priority: Priority) -> Result<Vec<Entry>, MasysError> {
+        Ok(Vec::new())
+    }
+
     /// Whatever the test configured, or nothing. A unit's detail is
     /// read on demand, so most tests never look at it.
     fn unit_detail(&self, unit: &str) -> Result<masys_domain::unit::UnitDetail, MasysError> {
-        Ok(masys_domain::unit::UnitDetail { description: Some(format!("{unit} description")), ..Default::default() })
+        Ok(masys_domain::unit::UnitDetail {
+            description: Some(format!("{unit} description")),
+            ..Default::default()
+        })
     }
     fn proc_detail(&self, pid: u32) -> Result<masys_domain::proc_detail::ProcDetail, MasysError> {
-        Ok(masys_domain::proc_detail::ProcDetail { cmdline: Some(format!("/usr/bin/fake --pid {pid}")), ..Default::default() })
+        Ok(masys_domain::proc_detail::ProcDetail {
+            cmdline: Some(format!("/usr/bin/fake --pid {pid}")),
+            ..Default::default()
+        })
     }
     fn start(&self, unit: &str) -> Result<(), MasysError> {
         self.record(Call::Start(unit.to_string()));
@@ -135,12 +157,6 @@ pub struct FakePlatformService;
 impl PlatformService for FakePlatformService {
     fn id(&self) -> PlatformId {
         PlatformId::Unsupported
-    }
-    fn packages(&self) -> Result<Vec<Package>, MasysError> {
-        Ok(vec![])
-    }
-    fn updates(&self) -> Result<UpdateStatus, MasysError> {
-        Ok(UpdateStatus::default())
     }
     fn pending_reboot(&self) -> Result<Option<PendingReboot>, MasysError> {
         Ok(None)

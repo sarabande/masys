@@ -1,10 +1,11 @@
 //! Unit state over D-Bus.
 //!
-//! Two rules, both measured rather than assumed (see the design doc):
-//! never call `GetAll` - the `Unit` interface carries ~100 properties,
-//! several computed on demand, and costs 48x a targeted `Get` - and never
-//! construct a `Proxy` per unit, which adds ~40% per call over
-//! `Connection::call_method` on one long-lived connection.
+//! Two rules, both measured rather than assumed, and the numbers are
+//! why they are rules: never call `GetAll` - the `Unit` interface
+//! carries ~100 properties, several computed on demand, and costs 48x a
+//! targeted `Get` - and never construct a `Proxy` per unit, which adds
+//! ~40% per call over `Connection::call_method` on one long-lived
+//! connection.
 
 use masys_domain::error::MasysError;
 use masys_domain::unit::{ActiveState, Timer, UnitKind};
@@ -21,7 +22,18 @@ pub const PROPS_IF: &str = "org.freedesktop.DBus.Properties";
 
 /// `ListUnits`'s `a(ssssssouso)` row. Only four of the ten fields are
 /// used, but the tuple must match the signature exactly to deserialize.
-pub type ListedUnit = (String, String, String, String, String, String, OwnedObjectPath, u32, String, OwnedObjectPath);
+pub type ListedUnit = (
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    OwnedObjectPath,
+    u32,
+    String,
+    OwnedObjectPath,
+);
 
 pub fn active_state_of(raw: &str) -> ActiveState {
     match raw {
@@ -98,11 +110,16 @@ impl StateStamps {
     /// was taken in.
     pub fn get(&self, unit: &str, active_state: &str, sub_state: &str) -> Option<u64> {
         let stamp = self.entries.get(unit)?;
-        (stamp.active_state == active_state && stamp.sub_state == sub_state).then_some(stamp.since_ms)
+        (stamp.active_state == active_state && stamp.sub_state == sub_state)
+            .then_some(stamp.since_ms)
     }
 
     pub fn insert(&mut self, unit: &str, active_state: &str, sub_state: &str, since_ms: u64) {
-        let stamp = Stamp { active_state: active_state.to_string(), sub_state: sub_state.to_string(), since_ms };
+        let stamp = Stamp {
+            active_state: active_state.to_string(),
+            sub_state: sub_state.to_string(),
+            since_ms,
+        };
         self.entries.insert(unit.to_string(), stamp);
     }
 
@@ -119,26 +136,61 @@ impl StateStamps {
     }
 }
 
-fn get(conn: &Connection, path: &OwnedObjectPath, iface: &str, prop: &str) -> Result<OwnedValue, MasysError> {
-    conn.call_method(Some(DEST), path.as_str(), Some(PROPS_IF), "Get", &(iface, prop))
-        .and_then(|reply| reply.body().deserialize())
+fn get(
+    conn: &Connection,
+    path: &OwnedObjectPath,
+    iface: &str,
+    prop: &str,
+) -> Result<OwnedValue, MasysError> {
+    conn.call_method(
+        Some(DEST),
+        path.as_str(),
+        Some(PROPS_IF),
+        "Get",
+        &(iface, prop),
+    )
+    .and_then(|reply| reply.body().deserialize())
+    .map_err(|e| MasysError::System(format!("{prop}: {e}")))
+}
+
+pub fn get_string(
+    conn: &Connection,
+    path: &OwnedObjectPath,
+    iface: &str,
+    prop: &str,
+) -> Result<String, MasysError> {
+    String::try_from(get(conn, path, iface, prop)?)
         .map_err(|e| MasysError::System(format!("{prop}: {e}")))
 }
 
-pub fn get_string(conn: &Connection, path: &OwnedObjectPath, iface: &str, prop: &str) -> Result<String, MasysError> {
-    String::try_from(get(conn, path, iface, prop)?).map_err(|e| MasysError::System(format!("{prop}: {e}")))
+pub fn get_u64(
+    conn: &Connection,
+    path: &OwnedObjectPath,
+    iface: &str,
+    prop: &str,
+) -> Result<u64, MasysError> {
+    u64::try_from(get(conn, path, iface, prop)?)
+        .map_err(|e| MasysError::System(format!("{prop}: {e}")))
 }
 
-pub fn get_u64(conn: &Connection, path: &OwnedObjectPath, iface: &str, prop: &str) -> Result<u64, MasysError> {
-    u64::try_from(get(conn, path, iface, prop)?).map_err(|e| MasysError::System(format!("{prop}: {e}")))
+pub fn get_u32(
+    conn: &Connection,
+    path: &OwnedObjectPath,
+    iface: &str,
+    prop: &str,
+) -> Result<u32, MasysError> {
+    u32::try_from(get(conn, path, iface, prop)?)
+        .map_err(|e| MasysError::System(format!("{prop}: {e}")))
 }
 
-pub fn get_u32(conn: &Connection, path: &OwnedObjectPath, iface: &str, prop: &str) -> Result<u32, MasysError> {
-    u32::try_from(get(conn, path, iface, prop)?).map_err(|e| MasysError::System(format!("{prop}: {e}")))
-}
-
-pub fn get_i32(conn: &Connection, path: &OwnedObjectPath, iface: &str, prop: &str) -> Result<i32, MasysError> {
-    i32::try_from(get(conn, path, iface, prop)?).map_err(|e| MasysError::System(format!("{prop}: {e}")))
+pub fn get_i32(
+    conn: &Connection,
+    path: &OwnedObjectPath,
+    iface: &str,
+    prop: &str,
+) -> Result<i32, MasysError> {
+    i32::try_from(get(conn, path, iface, prop)?)
+        .map_err(|e| MasysError::System(format!("{prop}: {e}")))
 }
 
 /// The properties that change rarely - `UnitFileState` only on
@@ -203,13 +255,20 @@ impl ColdCache {
 pub fn read_cold(conn: &Connection, path: &OwnedObjectPath, kind: UnitKind) -> ColdProperties {
     let is_service = kind == UnitKind::Service;
     ColdProperties {
-        enabled: get_string(conn, path, UNIT_IF, "UnitFileState").map(|s| is_enabled(&s)).unwrap_or(false),
-        cgroup: is_service.then(|| get_string(conn, path, SERVICE_IF, "ControlGroup").ok()).flatten().filter(|c| !c.is_empty()),
+        enabled: get_string(conn, path, UNIT_IF, "UnitFileState")
+            .map(|s| is_enabled(&s))
+            .unwrap_or(false),
+        cgroup: is_service
+            .then(|| get_string(conn, path, SERVICE_IF, "ControlGroup").ok())
+            .flatten()
+            .filter(|c| !c.is_empty()),
         // `Slice` is served by each unit type's own interface, not by
         // `Unit` - `sshd.service` answers on `...systemd1.Service`, and a
         // slice on `...systemd1.Slice`. A type that cannot be in a slice
         // has no such property, and the error is the answer.
-        slice: sliceable_interface(kind).and_then(|iface| get_string(conn, path, iface, "Slice").ok()).filter(|s| !s.is_empty()),
+        slice: sliceable_interface(kind)
+            .and_then(|iface| get_string(conn, path, iface, "Slice").ok())
+            .filter(|s| !s.is_empty()),
         // `Triggers` lives on `Unit`, not on the per-type interface, so
         // one read covers timers, paths and activation sockets alike -
         // and answers empty for everything that starts nothing.
@@ -218,8 +277,16 @@ pub fn read_cold(conn: &Connection, path: &OwnedObjectPath, kind: UnitKind) -> C
 }
 
 /// A `as` property, or empty when the unit does not have one.
-pub fn get_strings(conn: &Connection, path: &OwnedObjectPath, iface: &str, prop: &str) -> Vec<String> {
-    get(conn, path, iface, prop).ok().and_then(|value| Vec::<String>::try_from(value).ok()).unwrap_or_default()
+pub fn get_strings(
+    conn: &Connection,
+    path: &OwnedObjectPath,
+    iface: &str,
+    prop: &str,
+) -> Vec<String> {
+    get(conn, path, iface, prop)
+        .ok()
+        .and_then(|value| Vec::<String>::try_from(value).ok())
+        .unwrap_or_default()
 }
 
 /// The interface carrying `Slice`, for the unit types that can be in one.
@@ -235,7 +302,12 @@ fn sliceable_interface(kind: UnitKind) -> Option<&'static str> {
         UnitKind::Socket => Some("org.freedesktop.systemd1.Socket"),
         UnitKind::Mount => Some("org.freedesktop.systemd1.Mount"),
         UnitKind::Swap => Some("org.freedesktop.systemd1.Swap"),
-        UnitKind::Target | UnitKind::Timer | UnitKind::Path | UnitKind::Device | UnitKind::Automount | UnitKind::Other => None,
+        UnitKind::Target
+        | UnitKind::Timer
+        | UnitKind::Path
+        | UnitKind::Device
+        | UnitKind::Automount
+        | UnitKind::Other => None,
     }
 }
 
@@ -247,7 +319,12 @@ fn sliceable_interface(kind: UnitKind) -> Option<&'static str> {
 /// systemd reports 0 rather than absent for "no next elapse" and "never
 /// fired", which are genuinely different facts from a time of zero.
 pub fn read_timer(conn: &Connection, path: &OwnedObjectPath) -> Option<Timer> {
-    let at = |prop: &str| get_u64(conn, path, TIMER_IF, prop).ok().filter(|v| *v > 0).map(|usec| usec / 1000);
+    let at = |prop: &str| {
+        get_u64(conn, path, TIMER_IF, prop)
+            .ok()
+            .filter(|v| *v > 0)
+            .map(|usec| usec / 1000)
+    };
     Some(Timer {
         next_ms: at("NextElapseUSecRealtime"),
         last_ms: at("LastTriggerUSec"),
@@ -261,9 +338,15 @@ pub fn read_timer(conn: &Connection, path: &OwnedObjectPath) -> Option<Timer> {
 /// is triggered by a keypress and has no reply to hand - and asking for
 /// one path is cheaper than re-listing 366 of them.
 pub fn unit_path(conn: &Connection, unit: &str) -> Result<OwnedObjectPath, MasysError> {
-    conn.call_method(Some(DEST), MANAGER_PATH, Some(MANAGER_IF), "GetUnit", &(unit))
-        .and_then(|reply| reply.body().deserialize())
-        .map_err(|e| MasysError::System(format!("GetUnit {unit}: {e}")))
+    conn.call_method(
+        Some(DEST),
+        MANAGER_PATH,
+        Some(MANAGER_IF),
+        "GetUnit",
+        &(unit),
+    )
+    .and_then(|reply| reply.body().deserialize())
+    .map_err(|e| MasysError::System(format!("GetUnit {unit}: {e}")))
 }
 
 /// One unit's on-demand properties.
@@ -274,11 +357,19 @@ pub fn unit_path(conn: &Connection, unit: &str) -> Result<OwnedObjectPath, Masys
 /// `MemoryCurrent` and friends also report `u64::MAX` for "not accounted",
 /// which is filtered here so the view never renders 16 exabytes.
 pub fn read_detail(conn: &Connection, path: &OwnedObjectPath) -> masys_domain::unit::UnitDetail {
-    let counter = |iface: &str, prop: &str| get_u64(conn, path, iface, prop).ok().filter(|v| *v != u64::MAX);
+    let counter = |iface: &str, prop: &str| {
+        get_u64(conn, path, iface, prop)
+            .ok()
+            .filter(|v| *v != u64::MAX)
+    };
     masys_domain::unit::UnitDetail {
-        description: get_string(conn, path, UNIT_IF, "Description").ok().filter(|d| !d.is_empty()),
+        description: get_string(conn, path, UNIT_IF, "Description")
+            .ok()
+            .filter(|d| !d.is_empty()),
         // `success` on a healthy unit, and the reason on a broken one.
-        result: get_string(conn, path, SERVICE_IF, "Result").ok().filter(|r| !r.is_empty()),
+        result: get_string(conn, path, SERVICE_IF, "Result")
+            .ok()
+            .filter(|r| !r.is_empty()),
         documentation: get_strings(conn, path, UNIT_IF, "Documentation"),
         memory_peak_bytes: counter(SERVICE_IF, "MemoryPeak"),
         tasks_max: counter(SERVICE_IF, "TasksMax"),
@@ -286,13 +377,19 @@ pub fn read_detail(conn: &Connection, path: &OwnedObjectPath) -> masys_domain::u
         io_write_bytes: counter(SERVICE_IF, "IOWriteBytes"),
         ip_ingress_bytes: counter(SERVICE_IF, "IPIngressBytes"),
         ip_egress_bytes: counter(SERVICE_IF, "IPEgressBytes"),
-        fragment_path: get_string(conn, path, UNIT_IF, "FragmentPath").ok().filter(|p| !p.is_empty()),
+        fragment_path: get_string(conn, path, UNIT_IF, "FragmentPath")
+            .ok()
+            .filter(|p| !p.is_empty()),
         // MainPID is 0 for a unit with no running process, which is a
         // different fact from a pid of zero and must not render as one.
-        main_pid: get_u32(conn, path, SERVICE_IF, "MainPID").ok().filter(|pid| *pid > 0),
+        main_pid: get_u32(conn, path, SERVICE_IF, "MainPID")
+            .ok()
+            .filter(|pid| *pid > 0),
         tasks: counter(SERVICE_IF, "TasksCurrent"),
         memory_bytes: counter(SERVICE_IF, "MemoryCurrent"),
         cpu_nsec: counter(SERVICE_IF, "CPUUsageNSec"),
-        cgroup: get_string(conn, path, SERVICE_IF, "ControlGroup").ok().filter(|c| !c.is_empty()),
+        cgroup: get_string(conn, path, SERVICE_IF, "ControlGroup")
+            .ok()
+            .filter(|c| !c.is_empty()),
     }
 }

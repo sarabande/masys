@@ -18,7 +18,11 @@ use masys_domain::sample::Disk;
 /// since 4.18 append discard and flush statistics, which are ignored -
 /// reading by index from the left is what makes that forward-compatible.
 pub fn parse_diskstats(text: &str) -> Vec<Disk> {
-    let rows: Vec<Vec<&str>> = text.lines().map(|line| line.split_whitespace().collect()).filter(|f: &Vec<&str>| f.len() >= 14).collect();
+    let rows: Vec<Vec<&str>> = text
+        .lines()
+        .map(|line| line.split_whitespace().collect())
+        .filter(|f: &Vec<&str>| f.len() >= 14)
+        .collect();
     let devices: Vec<&str> = rows.iter().map(|f| f[2]).collect();
 
     rows.iter()
@@ -29,14 +33,18 @@ pub fn parse_diskstats(text: &str) -> Vec<Disk> {
         // buffer with rows that can only ever read zero.
         .filter(|fields| fields[3] != "0" || fields[7] != "0")
         .map(|fields| {
-            let num = |at: usize| fields.get(at).and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
+            let num = |at: usize| {
+                fields
+                    .get(at)
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .unwrap_or(0)
+            };
             Disk {
                 name: fields[2].to_string(),
                 reads: num(3),
                 read_sectors: num(5),
                 writes: num(7),
                 write_sectors: num(9),
-                in_flight: num(11),
                 io_ms: num(12),
             }
         })

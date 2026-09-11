@@ -24,13 +24,15 @@ pub mod machine;
 pub mod proc;
 pub mod restarts;
 pub mod sd_journal;
+pub mod smart;
+pub mod thermal;
 pub mod units;
 
 use std::cell::RefCell;
 use std::time::Instant;
 
 use masys_domain::error::MasysError;
-use masys_domain::journal::Entry;
+use masys_domain::journal::{Entry, Priority};
 use masys_domain::sample::{OomKill, Snapshot, SystemState};
 use masys_domain::service::{IoNiceClass, Signal, SystemService};
 use masys_domain::unit::Unit;
@@ -90,7 +92,8 @@ impl SystemdService {
     /// with: it is how far back restart history is retained, and pruning
     /// tighter than the triage window would hide real flapping.
     pub fn connect(flapping_window_ms: u64) -> Result<Self, MasysError> {
-        let conn = Connection::system().map_err(|e| MasysError::System(format!("system bus: {e}")))?;
+        let conn =
+            Connection::system().map_err(|e| MasysError::System(format!("system bus: {e}")))?;
         let proc_stat = std::fs::read_to_string("/proc/stat").map_err(MasysError::Io)?;
         Ok(Self {
             conn,
@@ -146,7 +149,14 @@ impl SystemdService {
         let mut history = restarts::RestartHistory::new();
         let since = Self::now_unix_ms().saturating_sub(window_ms) / 1000;
         let Ok(output) = std::process::Command::new("journalctl")
-            .args(["--no-pager", "-o", "json", "--since", &format!("@{since}"), &format!("MESSAGE_ID={}", journal::UNIT_FAILED)])
+            .args([
+                "--no-pager",
+                "-o",
+                "json",
+                "--since",
+                &format!("@{since}"),
+                &format!("MESSAGE_ID={}", journal::UNIT_FAILED),
+            ])
             .output()
         else {
             return history;
@@ -154,7 +164,8 @@ impl SystemdService {
         if !output.status.success() {
             return history;
         }
-        let mut by_unit: std::collections::HashMap<String, Vec<u64>> = std::collections::HashMap::new();
+        let mut by_unit: std::collections::HashMap<String, Vec<u64>> =
+            std::collections::HashMap::new();
         for (unit, stamp) in journal::parse_unit_events(&String::from_utf8_lossy(&output.stdout)) {
             by_unit.entry(unit).or_default().push(stamp);
         }
@@ -167,11 +178,15 @@ impl SystemdService {
     /// Unix milliseconds now. Named apart from `Snapshot::taken_at_ms`'s
     /// monotonic clock so the two are hard to confuse at a call site.
     fn now_unix_ms() -> u64 {
-        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0)
     }
 
     fn manager_property(&self, name: &str) -> Result<String, MasysError> {
-        let path = OwnedObjectPath::try_from(units::MANAGER_PATH).map_err(|e| MasysError::System(format!("{e}")))?;
+        let path = OwnedObjectPath::try_from(units::MANAGER_PATH)
+            .map_err(|e| MasysError::System(format!("{e}")))?;
         units::get_string(&self.conn, &path, units::MANAGER_IF, name)
     }
 
@@ -179,7 +194,9 @@ impl SystemdService {
     /// Readable unprivileged. A host with no `timedate1` at all answers
     /// "synchronised" rather than firing a spurious finding.
     fn clock_synced(&self) -> bool {
-        let Ok(path) = OwnedObjectPath::try_from("/org/freedesktop/timedate1") else { return true };
+        let Ok(path) = OwnedObjectPath::try_from("/org/freedesktop/timedate1") else {
+            return true;
+        };
         self.conn
             .call_method(
                 Some("org.freedesktop.timedate1"),
@@ -189,7 +206,12 @@ impl SystemdService {
                 &("org.freedesktop.timedate1", "NTPSynchronized"),
             )
             .ok()
-            .and_then(|reply| reply.body().deserialize::<zbus::zvariant::OwnedValue>().ok())
+            .and_then(|reply| {
+                reply
+                    .body()
+                    .deserialize::<zbus::zvariant::OwnedValue>()
+                    .ok()
+            })
             .and_then(|v| bool::try_from(v).ok())
             .unwrap_or(true)
     }
@@ -202,13 +224,20 @@ impl SystemdService {
 /// so the value tracks daylight saving instead of freezing at whatever
 /// was true when masys started.
 fn local_utc_offset_secs() -> i32 {
-    let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0) as libc::time_t;
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0) as libc::time_t;
     // SAFETY: `tm` is zeroed and correctly sized, and `localtime_r` writes
     // into it rather than returning a shared static the way `localtime`
     // does. A null return means the timestamp is unrepresentable, and UTC
     // is the honest answer when the zone cannot be established.
     let mut tm: libc::tm = unsafe { std::mem::zeroed() };
-    if unsafe { libc::localtime_r(&secs, &mut tm) }.is_null() { 0 } else { tm.tm_gmtoff as i32 }
+    if unsafe { libc::localtime_r(&secs, &mut tm) }.is_null() {
+        0
+    } else {
+        tm.tm_gmtoff as i32
+    }
 }
 
 impl SystemService for SystemdService {
@@ -229,13 +258,21 @@ impl SystemService for SystemdService {
             load: proc::read_load(),
             uptime_secs: proc::read_uptime(),
             memory: proc::read_memory(),
+            cpu_times: proc::read_cpu_times(),
+            thermal_throttled_ms_by_core: thermal::throttled_ms_by_core(),
         })
     }
 
     fn units(&self) -> Result<Vec<Unit>, MasysError> {
         let listed: Vec<units::ListedUnit> = self
             .conn
-            .call_method(Some(units::DEST), units::MANAGER_PATH, Some(units::MANAGER_IF), "ListUnits", &())
+            .call_method(
+                Some(units::DEST),
+                units::MANAGER_PATH,
+                Some(units::MANAGER_IF),
+                "ListUnits",
+                &(),
+            )
             .and_then(|reply| reply.body().deserialize())
             .map_err(|e| MasysError::System(format!("ListUnits: {e}")))?;
 
@@ -284,11 +321,26 @@ impl SystemService for SystemdService {
 
             // The restart counter is the one hot property with no cheaper
             // source: flapping is derived from it rising between polls.
-            let n_restarts = if is_service { units::get_u32(&self.conn, path, units::SERVICE_IF, "NRestarts").unwrap_or(0) } else { 0 };
+            //
+            // `None` is "could not read", and is *not* zero. This was
+            // `unwrap_or(0)`, and the collapse fabricated findings: a
+            // failed `Get` reads as a counter that fell to nothing,
+            // `observe` re-baselines on the fall, and the next good poll
+            // replays the unit's whole lifetime count as restarts dated
+            // to that moment. Three lifetime restarts on a service that
+            // has been up for months was enough to put `FlappingUnit` on
+            // the Status buffer. `StateChangeTimestamp` below has always
+            // treated its own failure as a failure; this now matches it.
+            let n_restarts = match is_service {
+                true => units::get_u32(&self.conn, path, units::SERVICE_IF, "NRestarts").ok(),
+                // Not a service: there is no counter to read, which is a
+                // real answer rather than a failed look.
+                false => Some(0),
+            };
             // A rise means the unit went away and came back, which
             // `ListUnits` may not have caught between two polls - so the
             // cached timestamp describes a state it has since left.
-            if is_service && restarts.count_rose(name, n_restarts) {
+            if is_service && n_restarts.is_some_and(|n| restarts.count_rose(name, n)) {
                 stamps.forget(name);
             }
 
@@ -297,7 +349,11 @@ impl SystemService for SystemdService {
                 // A unit can vanish between ListUnits and the property
                 // fetch; dropping it is correct, failing the poll is not.
                 None => {
-                    let Ok(since_us) = units::get_u64(&self.conn, path, units::UNIT_IF, "StateChangeTimestamp") else { continue };
+                    let Ok(since_us) =
+                        units::get_u64(&self.conn, path, units::UNIT_IF, "StateChangeTimestamp")
+                    else {
+                        continue;
+                    };
                     stamps.insert(name, raw_active, raw_sub, since_us / 1000);
                     since_us / 1000
                 }
@@ -309,12 +365,20 @@ impl SystemService for SystemdService {
                 sub_state: raw_sub.clone(),
                 exit_code,
                 enabled: cached.enabled,
-                restart_timestamps_ms: restarts.observe(name, n_restarts, now, self.flapping_window_ms),
+                restart_timestamps_ms: restarts.observe(
+                    name,
+                    n_restarts,
+                    now,
+                    self.flapping_window_ms,
+                ),
                 since_ms,
                 cgroup: cached.cgroup.clone(),
                 slice: cached.slice.clone(),
                 triggers: cached.triggers.clone(),
-                timer: name.ends_with(".timer").then(|| units::read_timer(&self.conn, path)).flatten(),
+                timer: name
+                    .ends_with(".timer")
+                    .then(|| units::read_timer(&self.conn, path))
+                    .flatten(),
                 name: name.clone(),
             });
         }
@@ -332,16 +396,73 @@ impl SystemService for SystemdService {
             return Ok(reader.tail(lines));
         }
         let output = std::process::Command::new("journalctl")
-            .args(["--no-pager", "-o", "json", "-u", unit, "-n", &lines.to_string()])
+            .args([
+                "--no-pager",
+                "-o",
+                "json",
+                "-u",
+                unit,
+                "-n",
+                &lines.to_string(),
+            ])
             .output()
             .map_err(MasysError::Io)?;
         if !output.status.success() {
-            return Err(MasysError::System(format!("journalctl -u {unit}: {}", String::from_utf8_lossy(&output.stderr).trim())));
+            return Err(MasysError::System(format!(
+                "journalctl -u {unit}: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            )));
         }
-        Ok(journal::parse_stream(&String::from_utf8_lossy(&output.stdout)))
+        Ok(journal::parse_stream(&String::from_utf8_lossy(
+            &output.stdout,
+        )))
     }
 
-    fn follow_unit_journal(&self, unit: &str, lines: usize) -> Result<Option<Vec<Entry>>, MasysError> {
+    fn journal(&self, since_ms: u64, min_priority: Priority) -> Result<Vec<Entry>, MasysError> {
+        // journalctl rather than the library path, which opens a cursor
+        // per unit and has no host-wide reader. This runs once a tick
+        // over a bounded window at error priority, which on any healthy
+        // host is a handful of records.
+        //
+        // `--since @<epoch seconds>` is systemd's own absolute time
+        // syntax, so the window is decided by the caller's clock rather
+        // than by a relative string this would have to compose - and the
+        // caller is the one holding `now_ms`.
+        let output = std::process::Command::new("journalctl")
+            .args([
+                "--no-pager",
+                "-o",
+                "json",
+                "--since",
+                &format!("@{}", since_ms / 1000),
+                "-p",
+                &journal::priority_code(min_priority).to_string(),
+            ])
+            .output()
+            // Named, rather than `MasysError::Io`, which is
+            // `#[error(transparent)]` and so renders as a bare
+            // `No such file or directory (os error 2)`. This error is
+            // the only one in masys that reaches an operator as the
+            // whole content of a row - `FindingKind::Unreadable`
+            // shows it and nothing else - so a subject is the difference
+            // between something to act on and a shrug.
+            .map_err(|why| MasysError::System(format!("journalctl: {why}")))?;
+        if !output.status.success() {
+            return Err(MasysError::System(format!(
+                "journalctl --since: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            )));
+        }
+        Ok(journal::parse_stream(&String::from_utf8_lossy(
+            &output.stdout,
+        )))
+    }
+
+    fn follow_unit_journal(
+        &self,
+        unit: &str,
+        lines: usize,
+    ) -> Result<Option<Vec<Entry>>, MasysError> {
         let Some(reader) = self.reader_for(unit) else {
             return Ok(None);
         };
@@ -349,6 +470,12 @@ impl SystemService for SystemdService {
             return Ok(None);
         }
         Ok(Some(reader.tail(lines)))
+    }
+
+    /// Delegated whole: the three-answer rule and the device filter are
+    /// [`smart`]'s, and both are testable there without a subprocess.
+    fn smart_health(&self) -> Option<bool> {
+        smart::health()
     }
 
     /// Seven targeted `Get`s against one unit.

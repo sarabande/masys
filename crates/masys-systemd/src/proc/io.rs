@@ -11,8 +11,15 @@ pub fn parse_io(text: &str) -> Result<(u64, u64), MasysError> {
     let mut read = None;
     let mut write = None;
     for line in text.lines() {
-        let Some((key, value)) = line.split_once(':') else { continue };
-        let parsed = || value.trim().parse::<u64>().map_err(|_| MasysError::System(format!("io: {key} is not a number")));
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        let parsed = || {
+            value
+                .trim()
+                .parse::<u64>()
+                .map_err(|_| MasysError::System(format!("io: {key} is not a number")))
+        };
         match key {
             "read_bytes" => read = Some(parsed()?),
             "write_bytes" => write = Some(parsed()?),
@@ -21,6 +28,8 @@ pub fn parse_io(text: &str) -> Result<(u64, u64), MasysError> {
     }
     match (read, write) {
         (Some(r), Some(w)) => Ok((r, w)),
-        _ => Err(MasysError::System("io: missing read_bytes or write_bytes".into())),
+        _ => Err(MasysError::System(
+            "io: missing read_bytes or write_bytes".into(),
+        )),
     }
 }

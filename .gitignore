@@ -1,1 +1,15 @@
 /target/
+# `nix build` drops its output symlink here.
+/result
+/result-*
+/.envrc
+/.worktrees/
+# Local cargo settings. The tree carries none: a committed
+# `rustc-wrapper` or `linker` silently overrides whatever a contributor
+# has configured for themselves, and a workaround for one machine's
+# toolchain is not this project's build policy. The dev shell in
+# `flake.nix` clears all three through the environment instead, which
+# wins over these keys wherever the build runs.
+/.cargo/config.toml
+CLAUDE.md
+.claude/

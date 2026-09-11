@@ -37,6 +37,11 @@ pub fn renice(service: &dyn SystemService, pid: u32, value: i32) -> Result<(), M
     service.renice(pid, value)
 }
 
-pub fn ionice(service: &dyn SystemService, pid: u32, class: IoNiceClass, level: i32) -> Result<(), MasysError> {
+pub fn ionice(
+    service: &dyn SystemService,
+    pid: u32,
+    class: IoNiceClass,
+    level: i32,
+) -> Result<(), MasysError> {
     service.ionice(pid, class, level)
 }

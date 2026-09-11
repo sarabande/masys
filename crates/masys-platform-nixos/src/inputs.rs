@@ -16,10 +16,13 @@ use masys_domain::error::MasysError;
 /// The lock's `root` node lists the direct inputs and is not itself an
 /// input, so it contributes the `direct` flag and no row of its own.
 pub fn parse_lock(text: &str) -> Result<Vec<Input>, MasysError> {
-    let lock: serde_json::Value =
-        serde_json::from_str(text).map_err(|error| MasysError::Platform(format!("flake.lock is not readable: {error}")))?;
+    let lock: serde_json::Value = serde_json::from_str(text)
+        .map_err(|error| MasysError::Platform(format!("flake.lock is not readable: {error}")))?;
 
-    let root_key = lock.get("root").and_then(|value| value.as_str()).unwrap_or("root");
+    let root_key = lock
+        .get("root")
+        .and_then(|value| value.as_str())
+        .unwrap_or("root");
     let nodes = lock
         .get("nodes")
         .and_then(|value| value.as_object())
@@ -53,8 +56,15 @@ pub fn parse_lock(text: &str) -> Result<Vec<Input>, MasysError> {
         // `locked` - but skipping it costs nothing and guards against a
         // lock shape this crate has not seen rather than assuming the
         // shape it has.
-        let Some(locked) = node.get("locked") else { continue };
-        let text_at = |key: &str| locked.get(key).and_then(|value| value.as_str()).map(str::to_string);
+        let Some(locked) = node.get("locked") else {
+            continue;
+        };
+        let text_at = |key: &str| {
+            locked
+                .get(key)
+                .and_then(|value| value.as_str())
+                .map(str::to_string)
+        };
         let origin = match (text_at("owner"), text_at("repo")) {
             (Some(owner), Some(repo)) => Some(format!("{owner}/{repo}")),
             _ => text_at("url").or_else(|| text_at("path")),
@@ -63,7 +73,9 @@ pub fn parse_lock(text: &str) -> Result<Vec<Input>, MasysError> {
             name: name.clone(),
             origin,
             rev: text_at("rev"),
-            last_modified_secs: locked.get("lastModified").and_then(serde_json::Value::as_u64),
+            last_modified_secs: locked
+                .get("lastModified")
+                .and_then(serde_json::Value::as_u64),
             direct: direct.contains(&name.as_str()),
         });
     }
@@ -80,8 +92,12 @@ pub fn parse_lock(text: &str) -> Result<Vec<Input>, MasysError> {
 /// costs one `env::var`. Reading a variable another tool defines is not a
 /// dependency on that tool.
 pub fn locate_lock(configured: Option<&str>) -> Option<std::path::PathBuf> {
-    let candidates =
-        [configured.map(str::to_string), std::env::var("NH_FLAKE").ok(), std::env::var("FLAKE").ok(), Some("/etc/nixos".to_string())];
+    let candidates = [
+        configured.map(str::to_string),
+        std::env::var("NH_FLAKE").ok(),
+        std::env::var("FLAKE").ok(),
+        Some("/etc/nixos".to_string()),
+    ];
     candidates
         .into_iter()
         .flatten()

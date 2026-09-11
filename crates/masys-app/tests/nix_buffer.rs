@@ -1,4 +1,4 @@
-use masys_app::nix_buffer::{build_nix_rows, is_nix_unit};
+use masys_app::nix_buffer::{NixBuffer, is_nix_unit};
 use masys_domain::declarative::{Generation, HomeMode, Inputs, Profile, ProfileKind, RebootState};
 use masys_domain::unit::{ActiveState, Unit, UnitKind};
 use masys_view::{Node, SectionKind};
@@ -19,11 +19,24 @@ fn generation(id: u64, current: bool, booted: bool) -> Generation {
 /// A generation whose link could not be resolved: no store path, no
 /// mtime. Two of these must never compare equal to each other.
 fn dangling(id: u64) -> Generation {
-    Generation { id, created_ms: None, store_path: None, label: None, kernel: None, current: false, booted: false }
+    Generation {
+        id,
+        created_ms: None,
+        store_path: None,
+        label: None,
+        kernel: None,
+        current: false,
+        booted: false,
+    }
 }
 
 fn system(generations: Vec<Generation>) -> Profile {
-    Profile { kind: ProfileKind::System, path: "/nix/var/nix/profiles/system".to_string(), writable: Some(true), generations }
+    Profile {
+        kind: ProfileKind::System,
+        path: "/nix/var/nix/profiles/system".to_string(),
+        writable: Some(true),
+        generations,
+    }
 }
 
 fn channels(generations: Vec<Generation>) -> Profile {
@@ -52,22 +65,23 @@ fn headers(rows: &[Node]) -> Vec<SectionKind> {
 /// not a complaint, so it renders on the healthiest host there is.
 #[test]
 fn no_reboot_row_when_no_reboot_is_pending() {
-    let rows = build_nix_rows(
-        Some(&[system(vec![generation(1, true, true)])]),
-        None,
-        None,
-        HomeMode::Absent,
-        None,
-        Some(0),
-        2_000_000,
-        None,
-        None,
-        Vec::new(),
-        Vec::new(),
-        &HashSet::new(),
+    let rows = NixBuffer {
+        profiles: Some(vec![system(vec![generation(1, true, true)])]),
+        home_mode: Some(HomeMode::Absent),
+        gc_roots: Some(0),
+        ..Default::default()
+    }
+    .rows(&[], &[], &HashSet::new(), &HashSet::new(), 2_000_000);
+    assert!(
+        !rows
+            .iter()
+            .any(|row| matches!(row, Node::RebootPending { .. }))
     );
-    assert!(!rows.iter().any(|row| matches!(row, Node::RebootPending { .. })));
-    assert!(headers(&rows).contains(&SectionKind::NixStore), "Store renders even with nothing wrong, got {:?}", headers(&rows));
+    assert!(
+        headers(&rows).contains(&SectionKind::NixStore),
+        "Store renders even with nothing wrong, got {:?}",
+        headers(&rows)
+    );
 }
 
 /// The dangling generation is the point of the arrangement, not scenery.
@@ -75,31 +89,35 @@ fn no_reboot_row_when_no_reboot_is_pending() {
 /// is one - so a builder that lets an unknown match anything reports it as
 /// both the booted and the current system, and this fails.
 #[test]
-fn a_pending_reboot_leads_the_view_and_carries_both_generation_numbers() {
+fn a_pending_reboot_leads_the_buffer_and_carries_both_generation_numbers() {
     let state = RebootState {
         booted_store_path: "/nix/store/g2".to_string(),
         current_store_path: "/nix/store/g3".to_string(),
         kernel_changed: false,
         initrd_changed: false,
     };
-    let profiles = [system(vec![dangling(1), generation(2, false, true), generation(3, true, false)])];
+    let profiles = [system(vec![
+        dangling(1),
+        generation(2, false, true),
+        generation(3, true, false),
+    ])];
 
-    let rows = build_nix_rows(
-        Some(&profiles),
-        Some(&state),
-        None,
-        HomeMode::Absent,
-        None,
-        Some(0),
-        2_000_000,
-        None,
-        None,
-        Vec::new(),
-        Vec::new(),
-        &HashSet::new(),
-    );
+    let rows = NixBuffer {
+        profiles: Some(profiles.to_vec()),
+        reboot: Some(state),
+        home_mode: Some(HomeMode::Absent),
+        gc_roots: Some(0),
+        ..Default::default()
+    }
+    .rows(&[], &[], &HashSet::new(), &HashSet::new(), 2_000_000);
 
-    let Some(Node::RebootPending { booted, current, kernel_changed, .. }) = rows.first() else {
+    let Some(Node::RebootPending {
+        booted,
+        current,
+        kernel_changed,
+        ..
+    }) = rows.first()
+    else {
         panic!("the reboot row leads the view, got {:?}", rows.first());
     };
     assert_eq!((*booted, *current), (Some(2), Some(3)));
@@ -108,10 +126,16 @@ fn a_pending_reboot_leads_the_view_and_carries_both_generation_numbers() {
     // And its row reports no age at all. An mtime that could not be read
     // is not a generation built on 1970-01-01.
     let age = rows.iter().find_map(|row| match row {
-        Node::Generation { generation, age_ms, .. } if generation.id == 1 => Some(*age_ms),
+        Node::Generation {
+            generation, age_ms, ..
+        } if generation.id == 1 => Some(*age_ms),
         _ => None,
     });
-    assert_eq!(age, Some(None), "a dangling generation has no age to report");
+    assert_eq!(
+        age,
+        Some(None),
+        "a dangling generation has no age to report"
+    );
 }
 
 /// Newest first: the generation you want is almost always the last one or
@@ -119,22 +143,19 @@ fn a_pending_reboot_leads_the_view_and_carries_both_generation_numbers() {
 /// put both off screen.
 #[test]
 fn generations_are_listed_newest_first() {
-    let profiles = [system(vec![generation(1, false, false), generation(2, false, false), generation(3, true, false)])];
+    let profiles = [system(vec![
+        generation(1, false, false),
+        generation(2, false, false),
+        generation(3, true, false),
+    ])];
 
-    let rows = build_nix_rows(
-        Some(&profiles),
-        None,
-        None,
-        HomeMode::Absent,
-        None,
-        Some(0),
-        2_000_000,
-        None,
-        None,
-        Vec::new(),
-        Vec::new(),
-        &HashSet::new(),
-    );
+    let rows = NixBuffer {
+        profiles: Some(profiles.to_vec()),
+        home_mode: Some(HomeMode::Absent),
+        gc_roots: Some(0),
+        ..Default::default()
+    }
+    .rows(&[], &[], &HashSet::new(), &HashSet::new(), 2_000_000);
 
     let ids: Vec<u64> = rows
         .iter()
@@ -155,44 +176,43 @@ fn generations_are_listed_newest_first() {
 /// operator hunting for channels they do not have.
 #[test]
 fn a_profile_with_no_generations_contributes_no_section() {
-    let profiles = [system(vec![generation(1, true, false)]), channels(Vec::new())];
-    let rows = build_nix_rows(
-        Some(&profiles),
-        None,
-        None,
-        HomeMode::Absent,
-        None,
-        Some(0),
-        2_000_000,
-        None,
-        None,
-        Vec::new(),
-        Vec::new(),
-        &HashSet::new(),
+    let profiles = [
+        system(vec![generation(1, true, false)]),
+        channels(Vec::new()),
+    ];
+    let rows = NixBuffer {
+        profiles: Some(profiles.to_vec()),
+        home_mode: Some(HomeMode::Absent),
+        gc_roots: Some(0),
+        ..Default::default()
+    }
+    .rows(&[], &[], &HashSet::new(), &HashSet::new(), 2_000_000);
+    assert_eq!(
+        headers(&rows)
+            .iter()
+            .filter(|kind| matches!(kind, SectionKind::Generations(_)))
+            .count(),
+        1
     );
-    assert_eq!(headers(&rows).iter().filter(|kind| matches!(kind, SectionKind::Generations(_))).count(), 1);
 }
 
 /// And no separator left where that section would have been: the spacer
 /// between sections is a separator, not a trailing margin.
 #[test]
 fn no_inputs_means_no_inputs_section() {
-    let rows = build_nix_rows(
-        Some(&[system(vec![generation(1, true, false)])]),
-        None,
-        None,
-        HomeMode::Absent,
-        None,
-        Some(0),
-        2_000_000,
-        None,
-        None,
-        Vec::new(),
-        Vec::new(),
-        &HashSet::new(),
-    );
+    let rows = NixBuffer {
+        profiles: Some(vec![system(vec![generation(1, true, false)])]),
+        home_mode: Some(HomeMode::Absent),
+        gc_roots: Some(0),
+        ..Default::default()
+    }
+    .rows(&[], &[], &HashSet::new(), &HashSet::new(), 2_000_000);
     assert!(!headers(&rows).contains(&SectionKind::Inputs));
-    assert!(!matches!(rows.last(), Some(Node::Spacer)), "the buffer does not end on a blank line, got {:?}", rows.last());
+    assert!(
+        !matches!(rows.last(), Some(Node::Spacer)),
+        "the buffer does not end on a blank line, got {:?}",
+        rows.last()
+    );
 }
 
 /// The drift check. Nothing else reports this state.
@@ -200,7 +220,9 @@ fn no_inputs_means_no_inputs_section() {
 fn a_lock_that_has_moved_past_the_running_system_is_reported() {
     use masys_domain::declarative::{Input, InputSource};
     let inputs = Inputs {
-        source: InputSource::Flake { lock_path: "/x/flake.lock".to_string() },
+        source: InputSource::Flake {
+            lock_path: "/x/flake.lock".to_string(),
+        },
         inputs: vec![Input {
             name: "nixpkgs".to_string(),
             origin: Some("NixOS/nixpkgs".to_string()),
@@ -210,37 +232,41 @@ fn a_lock_that_has_moved_past_the_running_system_is_reported() {
         }],
     };
 
-    let rows = build_nix_rows(
-        Some(&[system(vec![generation(1, true, false)])]),
-        None,
-        Some(&inputs),
-        HomeMode::Absent,
-        Some("aaaa"),
-        Some(0),
-        2_000_000,
-        None,
-        None,
-        Vec::new(),
-        Vec::new(),
-        &HashSet::new(),
-    );
+    let rows = NixBuffer {
+        profiles: Some(vec![system(vec![generation(1, true, false)])]),
+        inputs: Some(inputs),
+        home_mode: Some(HomeMode::Absent),
+        nixpkgs_rev: Some("aaaa".to_string()),
+        gc_roots: Some(0),
+        ..Default::default()
+    }
+    .rows(&[], &[], &HashSet::new(), &HashSet::new(), 2_000_000);
 
-    let Some(Node::SectionHeader { title, .. }) =
-        rows.iter().find(|row| matches!(row, Node::SectionHeader { kind: SectionKind::Inputs, .. }))
-    else {
+    let Some(Node::SectionHeader { title, .. }) = rows.iter().find(|row| {
+        matches!(
+            row,
+            Node::SectionHeader {
+                kind: SectionKind::Inputs,
+                ..
+            }
+        )
+    }) else {
         panic!("an Inputs section header");
     };
-    assert!(title.contains("drift"), "header should report drift, got {title:?}");
+    assert!(
+        title.contains("drift"),
+        "header should report drift, got {title:?}"
+    );
 }
 
 /// A section that was folded stays folded when its heading changes under
-/// it - which, for two of this view's headings, is a thing that happens.
+/// it - which, for two of this buffer's headings, is a thing that happens.
 ///
 /// The Inputs title carries both revisions and the drift verdict, so a
 /// rebuild in the next terminal turns `drift - not rebuilt` into
 /// `in sync`. While `collapsed` was keyed on the title, that renamed the
 /// section: the fold silently came undone and the old key was stranded in
-/// the set for the rest of the session. It is the exact workflow this view
+/// the set for the rest of the session. It is the exact workflow this buffer
 /// is for - watch for drift, rebuild, watch it clear.
 ///
 /// The fold key comes from `SectionKind`, which does not move.
@@ -248,7 +274,9 @@ fn a_lock_that_has_moved_past_the_running_system_is_reported() {
 fn folding_inputs_survives_the_drift_verdict_clearing() {
     use masys_domain::declarative::{Input, InputSource};
     let inputs = Inputs {
-        source: InputSource::Flake { lock_path: "/x/flake.lock".to_string() },
+        source: InputSource::Flake {
+            lock_path: "/x/flake.lock".to_string(),
+        },
         inputs: vec![Input {
             name: "nixpkgs".to_string(),
             origin: Some("NixOS/nixpkgs".to_string()),
@@ -258,20 +286,15 @@ fn folding_inputs_survives_the_drift_verdict_clearing() {
         }],
     };
     let build = |running: &str, collapsed: &HashSet<String>| {
-        build_nix_rows(
-            Some(&[system(vec![generation(1, true, false)])]),
-            None,
-            Some(&inputs),
-            HomeMode::Absent,
-            Some(running),
-            Some(0),
-            2_000_000,
-            None,
-            None,
-            Vec::new(),
-            Vec::new(),
-            collapsed,
-        )
+        NixBuffer {
+            profiles: Some(vec![system(vec![generation(1, true, false)])]),
+            inputs: Some(inputs.clone()),
+            home_mode: Some(HomeMode::Absent),
+            nixpkgs_rev: Some(running.to_string()),
+            gc_roots: Some(0),
+            ..Default::default()
+        }
+        .rows(&[], &[], &HashSet::new(), collapsed, 2_000_000)
     };
     let title_of = |rows: &[Node], wanted: SectionKind| {
         rows.iter()
@@ -287,13 +310,25 @@ fn folding_inputs_survives_the_drift_verdict_clearing() {
     // `App::cycle_section` folds it: by the key its `SectionKind` gives.
     let drifting = build("aaaa", &HashSet::new());
     let drifting_title = title_of(&drifting, SectionKind::Inputs);
-    let collapsed: HashSet<String> = [SectionKind::Inputs.fold_key(&drifting_title)].into_iter().collect();
-    assert!(!inputs_shown(&build("aaaa", &collapsed)), "the fold takes effect");
+    let collapsed: HashSet<String> = [SectionKind::Inputs.fold_key(&drifting_title)]
+        .into_iter()
+        .collect();
+    assert!(
+        !inputs_shown(&build("aaaa", &collapsed)),
+        "the fold takes effect"
+    );
 
     // And now the rebuild lands.
     let synced = build("bbbb", &collapsed);
-    assert_ne!(title_of(&synced, SectionKind::Inputs), drifting_title, "the heading has to change for this test to mean anything");
-    assert!(!inputs_shown(&synced), "the section reopened itself when its heading changed");
+    assert_ne!(
+        title_of(&synced, SectionKind::Inputs),
+        drifting_title,
+        "the heading has to change for this test to mean anything"
+    );
+    assert!(
+        !inputs_shown(&synced),
+        "the section reopened itself when its heading changed"
+    );
 }
 
 /// The same hazard on the other moving heading. `home_mode` is a
@@ -310,27 +345,29 @@ fn folding_home_manager_survives_learning_how_it_is_deployed() {
         generations: vec![generation(1, true, false)],
     };
     let build = |home_mode: HomeMode, collapsed: &HashSet<String>| {
-        build_nix_rows(
-            Some(std::slice::from_ref(&home)),
-            None,
-            None,
-            home_mode,
-            None,
-            Some(0),
-            2_000_000,
-            None,
-            None,
-            Vec::new(),
-            Vec::new(),
-            collapsed,
-        )
+        NixBuffer {
+            profiles: Some(vec![home.clone()]),
+            home_mode: Some(home_mode),
+            gc_roots: Some(0),
+            ..Default::default()
+        }
+        .rows(&[], &[], &HashSet::new(), collapsed, 2_000_000)
     };
-    let generations_shown = |rows: &[Node]| rows.iter().any(|row| matches!(row, Node::Generation { .. }));
+    let generations_shown = |rows: &[Node]| {
+        rows.iter()
+            .any(|row| matches!(row, Node::Generation { .. }))
+    };
 
     let key = SectionKind::Generations(ProfileKind::Home).fold_key("Home-manager");
     let collapsed: HashSet<String> = [key].into_iter().collect();
-    assert!(!generations_shown(&build(HomeMode::Absent, &collapsed)), "the fold takes effect");
-    assert!(!generations_shown(&build(HomeMode::Module, &collapsed)), "the section reopened itself when its heading changed");
+    assert!(
+        !generations_shown(&build(HomeMode::Absent, &collapsed)),
+        "the fold takes effect"
+    );
+    assert!(
+        !generations_shown(&build(HomeMode::Module, &collapsed)),
+        "the section reopened itself when its heading changed"
+    );
 }
 
 /// Three generation sections are on screen at once and each folds on its
@@ -338,10 +375,14 @@ fn folding_home_manager_survives_learning_how_it_is_deployed() {
 /// would file all three under one string and fold them together.
 #[test]
 fn each_profile_folds_under_a_key_of_its_own() {
-    let keys: HashSet<String> = [ProfileKind::System, ProfileKind::Home, ProfileKind::Channels]
-        .into_iter()
-        .map(|profile| SectionKind::Generations(profile).fold_key("System generations"))
-        .collect();
+    let keys: HashSet<String> = [
+        ProfileKind::System,
+        ProfileKind::Home,
+        ProfileKind::Channels,
+    ]
+    .into_iter()
+    .map(|profile| SectionKind::Generations(profile).fold_key("System generations"))
+    .collect();
     assert_eq!(keys.len(), 3, "two profiles share a fold key: {keys:?}");
 }
 
@@ -353,29 +394,33 @@ fn an_input_with_no_recorded_mtime_has_no_age() {
     use masys_domain::declarative::{Input, InputSource};
     let inputs = Inputs {
         source: InputSource::Channels,
-        inputs: vec![Input { name: "nixos".to_string(), origin: None, rev: None, last_modified_secs: None, direct: true }],
+        inputs: vec![Input {
+            name: "nixos".to_string(),
+            origin: None,
+            rev: None,
+            last_modified_secs: None,
+            direct: true,
+        }],
     };
 
-    let rows = build_nix_rows(
-        Some(&[system(vec![generation(1, true, false)])]),
-        None,
-        Some(&inputs),
-        HomeMode::Absent,
-        None,
-        Some(0),
-        2_000_000,
-        None,
-        None,
-        Vec::new(),
-        Vec::new(),
-        &HashSet::new(),
-    );
+    let rows = NixBuffer {
+        profiles: Some(vec![system(vec![generation(1, true, false)])]),
+        inputs: Some(inputs),
+        home_mode: Some(HomeMode::Absent),
+        gc_roots: Some(0),
+        ..Default::default()
+    }
+    .rows(&[], &[], &HashSet::new(), &HashSet::new(), 2_000_000);
 
     let age = rows.iter().find_map(|row| match row {
         Node::Input { input, age_days } if input.name == "nixos" => Some(*age_days),
         _ => None,
     });
-    assert_eq!(age, Some(None), "a channel input with no recorded mtime has no age to report");
+    assert_eq!(
+        age,
+        Some(None),
+        "a channel input with no recorded mtime has no age to report"
+    );
 }
 
 /// The one predicate the section costs, and the two deliberate holes in
@@ -402,40 +447,44 @@ fn nix_owns_its_units_but_the_store_section_keeps_the_two_timers() {
     for name in ["nix-gc.timer", "nix-optimise.timer"] {
         assert!(!is_nix_unit(name), "{name} is already a Store policy row");
     }
-    for name in ["sshd.service", "dbus.socket", "home-assistant.service", "unixodbc.service"] {
+    for name in [
+        "sshd.service",
+        "dbus.socket",
+        "home-assistant.service",
+        "unixodbc.service",
+    ] {
         assert!(!is_nix_unit(name), "{name} is not Nix's");
     }
 }
 
-fn an_open_detail(name: &str) -> Node {
-    let Node::Unit { unit, .. } = a_unit(name) else { unreachable!() };
-    Node::UnitDetail { unit, detail: None }
+/// The unit whose detail is open, as the expansion map answers it.
+///
+/// `HashSet<String>`'s `Expanded` impl reports the unit open and its
+/// detail unread, which is exactly the pair of rows an operator pressing
+/// `enter` gets before the read comes back - and what this test used to
+/// build by hand as a `Node::UnitDetail { detail: None }`.
+fn open(name: &str) -> HashSet<String> {
+    [name.to_string()].into_iter().collect()
 }
 
-fn a_unit(name: &str) -> Node {
-    Node::Unit {
-        unit: Unit {
-            name: name.to_string(),
-            kind: UnitKind::Service,
-            active_state: ActiveState::Active,
-            sub_state: "running".to_string(),
-            exit_code: None,
-            enabled: true,
-            restart_timestamps_ms: Vec::new(),
-            since_ms: 1_000,
-            cgroup: None,
-            slice: None,
-            timer: None,
-            triggers: Vec::new(),
-        },
-        age_ms: Some(1_000),
-        expanded: false,
-        depth: 0,
-        children: false,
+fn unit(name: &str) -> Unit {
+    Unit {
+        name: name.to_string(),
+        kind: UnitKind::Service,
+        active_state: ActiveState::Active,
+        sub_state: "running".to_string(),
+        exit_code: None,
+        enabled: true,
+        restart_timestamps_ms: Vec::new(),
+        since_ms: 1_000,
+        cgroup: None,
+        slice: None,
+        timer: None,
+        triggers: Vec::new(),
     }
 }
 
-/// The section the design's mock has and the view did not: `SectionKind`
+/// The section the design's mock has and the buffer did not: `SectionKind`
 /// named it, `cycle_section` and `group_names` both matched on it, and
 /// nothing constructed it.
 ///
@@ -444,30 +493,56 @@ fn a_unit(name: &str) -> Node {
 /// what was realised from it.
 #[test]
 fn nix_units_are_a_section_of_their_own_at_the_end() {
-    let rows = build_nix_rows(
-        Some(&[system(vec![generation(1, true, true)])]),
-        None,
-        None,
-        HomeMode::Absent,
-        None,
-        Some(0),
-        2_000_000,
-        None,
-        None,
-        Vec::new(),
-        // With one of them open, which is what an operator pressing
-        // `enter` produces: the detail is a row of its own beside the
-        // unit's, and the heading counts units.
-        vec![a_unit("nix-daemon.service"), an_open_detail("nix-daemon.service"), a_unit("nix-daemon.socket")],
+    let rows = NixBuffer {
+        profiles: Some(vec![system(vec![generation(1, true, true)])]),
+        home_mode: Some(HomeMode::Absent),
+        gc_roots: Some(0),
+        ..Default::default()
+    }
+    .rows(
+        &[],
+        &[unit("nix-daemon.service"), unit("nix-daemon.socket")],
+        &open("nix-daemon.service"),
         &HashSet::new(),
+        2_000_000,
     );
     let header = rows.iter().find_map(|row| match row {
-        Node::SectionHeader { title, kind: SectionKind::NixUnits, count } => Some((title.clone(), *count)),
+        Node::SectionHeader {
+            title,
+            kind: SectionKind::NixUnits,
+            count,
+        } => Some((title.clone(), *count)),
         _ => None,
     });
-    assert_eq!(header, Some(("Nix units".to_string(), Some(2))), "a heading that grew because somebody opened a row reports the cursor");
-    assert_eq!(headers(&rows).last(), Some(&SectionKind::NixUnits), "it comes last, got {:?}", headers(&rows));
-    assert_eq!(rows.iter().filter(|row| matches!(row, Node::Unit { .. })).count(), 2);
+    assert_eq!(
+        header,
+        Some(("Nix units".to_string(), Some(2))),
+        "a heading that grew because somebody opened a row reports the cursor"
+    );
+    assert_eq!(
+        headers(&rows).last(),
+        Some(&SectionKind::NixUnits),
+        "it comes last, got {:?}",
+        headers(&rows)
+    );
+    assert_eq!(
+        rows.iter()
+            .filter(|row| matches!(row, Node::Unit { .. }))
+            .count(),
+        2
+    );
+    // The open row's detail, which is what makes the count above mean
+    // anything: three rows, two units. Asserted rather than assumed
+    // because the detail is now built by the code under test - the
+    // version of this test that handed the section its rows already made
+    // could not tell an honoured expansion from an ignored one.
+    assert_eq!(
+        rows.iter()
+            .filter(|row| matches!(row, Node::UnitDetail { .. }))
+            .count(),
+        1,
+        "the unit reported open contributes a detail row of its own"
+    );
 }
 
 /// Absent is not empty, the rule every other section here follows: a host
@@ -475,47 +550,55 @@ fn nix_units_are_a_section_of_their_own_at_the_end() {
 /// one reading zero.
 #[test]
 fn no_nix_units_means_no_nix_units_section() {
-    let rows = build_nix_rows(
-        Some(&[system(vec![generation(1, true, true)])]),
-        None,
-        None,
-        HomeMode::Absent,
-        None,
-        Some(0),
-        2_000_000,
-        None,
-        None,
-        Vec::new(),
-        Vec::new(),
-        &HashSet::new(),
-    );
+    let rows = NixBuffer {
+        profiles: Some(vec![system(vec![generation(1, true, true)])]),
+        home_mode: Some(HomeMode::Absent),
+        gc_roots: Some(0),
+        ..Default::default()
+    }
+    .rows(&[], &[], &HashSet::new(), &HashSet::new(), 2_000_000);
     assert!(!headers(&rows).contains(&SectionKind::NixUnits));
-    assert!(!matches!(rows.last(), Some(Node::Spacer)), "and no separator where it would have been");
+    assert!(
+        !matches!(rows.last(), Some(Node::Spacer)),
+        "and no separator where it would have been"
+    );
 }
 
 /// It folds like every other section here, and under a key from its kind
 /// rather than its title.
 #[test]
 fn the_nix_units_section_folds() {
-    let collapsed: HashSet<String> = [SectionKind::NixUnits.fold_key("Nix units")].into_iter().collect();
-    let rows = build_nix_rows(
-        Some(&[system(vec![generation(1, true, true)])]),
-        None,
-        None,
-        HomeMode::Absent,
-        None,
-        Some(0),
-        2_000_000,
-        None,
-        None,
-        Vec::new(),
-        vec![a_unit("nix-daemon.service"), a_unit("nix-daemon.socket")],
+    let collapsed: HashSet<String> = [SectionKind::NixUnits.fold_key("Nix units")]
+        .into_iter()
+        .collect();
+    let rows = NixBuffer {
+        profiles: Some(vec![system(vec![generation(1, true, true)])]),
+        home_mode: Some(HomeMode::Absent),
+        gc_roots: Some(0),
+        ..Default::default()
+    }
+    .rows(
+        &[],
+        &[unit("nix-daemon.service"), unit("nix-daemon.socket")],
+        &HashSet::new(),
         &collapsed,
+        2_000_000,
     );
     let count = rows.iter().find_map(|row| match row {
-        Node::SectionHeader { kind: SectionKind::NixUnits, count, .. } => Some(*count),
+        Node::SectionHeader {
+            kind: SectionKind::NixUnits,
+            count,
+            ..
+        } => Some(*count),
         _ => None,
     });
-    assert_eq!(count, Some(Some(2)), "the heading stays, and keeps saying how many are behind it");
-    assert!(!rows.iter().any(|row| matches!(row, Node::Unit { .. })), "the rows are gone");
+    assert_eq!(
+        count,
+        Some(Some(2)),
+        "the heading stays, and keeps saying how many are behind it"
+    );
+    assert!(
+        !rows.iter().any(|row| matches!(row, Node::Unit { .. })),
+        "the rows are gone"
+    );
 }

@@ -1,19 +1,140 @@
-//! The log view: one unit's journal, scrollable and searchable.
+//! The log buffer: one unit's journal, scrollable and searchable.
 //!
 //! Always scoped to a unit. There used to be a whole-system tail and a
 //! boot list here, and both were dropped: "what happened on this machine"
 //! is a different question from "what happened to this unit", and only the
-//! second one has a row you can put a cursor on. What is left is the view
+//! second one has a row you can put a cursor on. What is left is the buffer
 //! `l` opens, and it is reached no other way than by naming a unit first.
 //!
-//! An open unit in the systemd view shows what `systemctl status` leads
+//! An open unit in the systemd buffer shows what `systemctl status` leads
 //! with, which answers "what is it doing". This is where you go to read
 //! what it said.
 
+use std::collections::HashSet;
+
+use masys_domain::error::MasysError;
 use masys_domain::journal::Entry;
+use masys_domain::service::SystemService;
 use masys_view::{Node, SectionKind};
 
-/// How many entries the view holds. A cap rather than everything the unit
+/// How many lines the log buffer fetches. It is a log viewer - scrollable
+/// and searchable - so it holds more than the few a glance needs, while
+/// staying well short of asking journalctl for a unit's entire history.
+const LINES: usize = 2_000;
+
+/// The log buffer: whose journal is open, what it said, and which way it
+/// reads.
+///
+/// Three fields of `App`, one of them in its `Facts`, and the row builder
+/// took all three back as arguments. What crosses now is the buffer-wide
+/// fold set and the sample's UTC offset - `masys-app` reads no
+/// environment, so the zone has to arrive with a reading rather than be
+/// looked up here.
+///
+/// `SystemService` is a port and is handed to the three methods that read
+/// the journal, the way `IoBuffer` takes its `DirScanner`.
+///
+/// Where the operator was when they pressed `l` is *not* here. That is
+/// navigation - it names a buffer as well as a row, and the buffer it
+/// names is whichever one you came from - so `App` keeps it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LogBuffer {
+    /// Whose log is showing. `None` before `l` has ever been pressed,
+    /// which is the only state in which this buffer has no identity.
+    pub unit: Option<String>,
+    /// What that unit said. Only ever non-empty while this buffer is the
+    /// open one.
+    pub entries: Vec<Entry>,
+    /// Which way it reads. Newest first by default: `l` is pressed
+    /// because something just happened, and the answer should not be two
+    /// thousand lines down.
+    pub newest_first: bool,
+}
+
+impl Default for LogBuffer {
+    fn default() -> Self {
+        LogBuffer {
+            unit: None,
+            entries: Vec::new(),
+            newest_first: true,
+        }
+    }
+}
+
+impl LogBuffer {
+    /// Every row this buffer shows.
+    pub fn rows(&self, utc_offset_secs: i32, folds: &HashSet<String>) -> Vec<Node> {
+        layout(
+            &self.entries,
+            self.unit.as_deref(),
+            utc_offset_secs,
+            self.newest_first,
+            folds,
+        )
+    }
+
+    /// Scopes the buffer to one unit and reads its log.
+    ///
+    /// The scope moves before the read, and the entries are replaced
+    /// whatever the read returned. Assigning them only on success left a
+    /// failed fetch showing the *previous* unit's log under the previous
+    /// unit's name, with an error line underneath that most people would
+    /// not read before believing the rows.
+    pub fn open(&mut self, system: &dyn SystemService, unit: &str) -> Result<(), MasysError> {
+        self.unit = Some(unit.to_string());
+        match system.unit_journal(unit, LINES) {
+            Ok(entries) => {
+                self.entries = entries;
+                Ok(())
+            }
+            Err(e) => {
+                self.entries.clear();
+                Err(e)
+            }
+        }
+    }
+
+    /// Re-reads the open unit's log, keeping the buffer scoped to it.
+    ///
+    /// A failed read leaves the last good entries in place: this runs on
+    /// the ordinary tick, and blanking a log you are reading because one
+    /// poll failed is worse than showing it a couple of seconds stale.
+    pub fn refresh(&mut self, system: &dyn SystemService) {
+        let Some(unit) = self.unit.clone() else {
+            return;
+        };
+        if let Ok(entries) = system.unit_journal(&unit, LINES) {
+            self.entries = entries;
+        }
+    }
+
+    /// Picks up whatever has been appended.
+    ///
+    /// Reports whether anything arrived, so the session can skip a redraw
+    /// it does not need - this runs four times a second and answers "no"
+    /// almost every time.
+    pub fn follow(&mut self, system: &dyn SystemService) -> bool {
+        let Some(unit) = self.unit.clone() else {
+            return false;
+        };
+        match system.follow_unit_journal(&unit, LINES) {
+            Ok(Some(entries)) => {
+                self.entries = entries;
+                true
+            }
+            // Nothing new, or an adapter that cannot follow at all - on
+            // which the ordinary tick still refreshes the buffer.
+            _ => false,
+        }
+    }
+
+    /// Flips oldest/newest first.
+    pub fn flip_order(&mut self) {
+        self.newest_first = !self.newest_first;
+    }
+}
+
+/// How many entries the buffer holds. A cap rather than everything the unit
 /// has ever logged: a busy unit can emit thousands of lines, and a buffer
 /// that long is slower to build than it is useful to read.
 pub const TAIL: usize = 2_000;
@@ -52,7 +173,7 @@ fn day_label(day: i64) -> String {
 /// One unit's log, grouped into a section per local calendar day.
 ///
 /// A real `Node::SectionHeader` rather than a divider drawn at the last
-/// moment, which buys the view three things it would otherwise need code
+/// moment, which buys the buffer three things it would otherwise need code
 /// for: `jump_section` matches any section header, so `n` and `p` move
 /// day to day; `tab` folds a day; and the cursor can rest on one.
 ///
@@ -65,10 +186,10 @@ fn day_label(day: i64) -> String {
 /// changed the window would be a different feature wearing this one's
 /// clothes.
 ///
-/// A unit that has logged nothing says so. This view is the answer to a
+/// A unit that has logged nothing says so. This buffer is the answer to a
 /// direct request for one unit's log, and replying with a blank screen
 /// looks like the key failed rather than like the unit is quiet.
-pub fn build_log_rows(
+fn layout(
     entries: &[Entry],
     unit: Option<&str>,
     utc_offset_secs: i32,
@@ -79,7 +200,11 @@ pub fn build_log_rows(
         return Vec::new();
     };
     if entries.is_empty() {
-        return vec![Node::SectionHeader { title: format!("{unit} - nothing in the journal"), kind: SectionKind::Journal, count: None }];
+        return vec![Node::SectionHeader {
+            title: format!("{unit} - nothing in the journal"),
+            kind: SectionKind::Journal,
+            count: None,
+        }];
     }
 
     let mut ordered: Vec<&Entry> = entries.iter().collect();
@@ -107,7 +232,11 @@ pub fn build_log_rows(
             }
             counted = 0;
             count_at = rows.len();
-            rows.push(Node::SectionHeader { title: day_label(day), kind: SectionKind::Journal, count: Some(0) });
+            rows.push(Node::SectionHeader {
+                title: day_label(day),
+                kind: SectionKind::Journal,
+                count: Some(0),
+            });
             open_day = Some(day);
             // Through `fold_key`, for the reason `build_unit_rows` gives:
             // one place decides what a section is filed under.

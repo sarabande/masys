@@ -9,7 +9,10 @@ use masys_view::{ModalView, Node, StatusLine};
 fn snapshot() -> Snapshot {
     Snapshot {
         taken_at_ms: 0,
-        procs: vec![with_cgroup(proc(1, "chrome", 0)), with_cgroup(proc(2, "rust-analyzer", 0))],
+        procs: vec![
+            with_cgroup(proc(1, "chrome", 0)),
+            with_cgroup(proc(2, "rust-analyzer", 0)),
+        ],
         pressure: Some(Pressure::default()),
         filesystems: Vec::new(),
         disks: Vec::new(),
@@ -23,6 +26,8 @@ fn snapshot() -> Snapshot {
         load: None,
         uptime_secs: None,
         memory: None,
+        cpu_times: None,
+        thermal_throttled_ms_by_core: None,
     }
 }
 
@@ -46,10 +51,19 @@ fn app_with(fails_with: Option<String>) -> (App, Calls) {
         queued: Default::default(),
         proc_details: Default::default(),
         detail_queries: Default::default(),
+        units_fail_with: None,
+        sample_fail_with: None,
+        smart: None,
+        smart_reads: Default::default(),
     };
-    let platform = FakePlatformService { boot_pressure: None, pending_reboot: None };
-    let mut app = App::new(Box::new(system), Box::new(platform), Box::new(fake::NoScanner), "devbox".to_string());
-    app.tick(1_000, "t".to_string()).expect("tick");
+    let platform = FakePlatformService::default();
+    let mut app = App::new(
+        Box::new(system),
+        Box::new(platform),
+        Box::new(fake::NoScanner),
+        "devbox".to_string(),
+    );
+    app.tick(1_000, "t".to_string());
     (app, calls)
 }
 
@@ -63,7 +77,10 @@ fn press(app: &mut App, keys: &str) {
 fn on_a_process(app: &mut App) {
     press(app, "2");
     for _ in 0..8 {
-        if matches!(app.view().rows.get(app.view().selected.unwrap_or(0)), Some(Node::Proc { .. })) {
+        if matches!(
+            app.view().rows.get(app.view().selected.unwrap_or(0)),
+            Some(Node::Proc { .. })
+        ) {
             return;
         }
         app.handle_key(Key::new(KeyCode::Down));
@@ -79,8 +96,15 @@ fn killing_asks_before_it_acts() {
     on_a_process(&mut app);
     press(&mut app, "k");
 
-    assert!(matches!(app.view().modal, Some(ModalView::Confirm { .. })), "a confirmation opens");
-    assert!(calls.borrow().is_empty(), "nothing was signalled yet: {:?}", calls.borrow());
+    assert!(
+        matches!(app.view().modal, Some(ModalView::Confirm { .. })),
+        "a confirmation opens"
+    );
+    assert!(
+        calls.borrow().is_empty(),
+        "nothing was signalled yet: {:?}",
+        calls.borrow()
+    );
 }
 
 /// A destructive action needs the one key that means yes, not merely a
@@ -93,8 +117,54 @@ fn only_y_confirms_and_anything_else_declines() {
         press(&mut app, "k");
         press(&mut app, answer);
         assert_eq!(calls.borrow().len(), expected, "answering {answer:?}");
-        assert!(app.view().modal.is_none(), "the confirmation closes either way");
+        assert!(
+            app.view().modal.is_none(),
+            "the confirmation closes either way"
+        );
     }
+}
+
+/// A confirmation takes `esc` before the escape ladder does.
+///
+/// `esc` normally peels a layer - a filter in effect, then a drill-down -
+/// and a confirmation is not a layer it may peel. With a filter set and a
+/// confirmation open, `esc` has to answer the confirmation, because the
+/// alternative is lifting the filter under a question still on screen and
+/// leaving the operator looking at a `y / n` over rows that just changed.
+///
+/// Written because nothing else in the suite presses `esc` at a
+/// confirmation, and the behaviour used to rest on one condition -
+/// `pending.is_none()`, inside the escape arm - which is the sort of
+/// guard that goes missing in a refactor and takes a behaviour with it.
+/// It did go, deliberately: `Mode::Confirm` answers the key in its own
+/// arm now, so the escape ladder is somewhere `esc` cannot reach from a
+/// confirmation. This is what says the deletion cost nothing.
+#[test]
+fn a_confirmation_answers_esc_rather_than_the_filter_under_it() {
+    let (mut app, calls) = app_with(None);
+    on_a_process(&mut app);
+    press(&mut app, "/");
+    press(&mut app, "a");
+    app.handle_key(Key::new(KeyCode::Enter));
+    let filtered = app.view().filter.map(str::to_string);
+    assert!(
+        filtered.is_some(),
+        "the filter has to be in effect for this to be testing anything"
+    );
+
+    on_a_process(&mut app);
+    press(&mut app, "k");
+    assert!(app.view().modal.is_some(), "the confirmation is open");
+
+    app.handle_key(Key::new(KeyCode::Esc));
+    assert!(app.view().modal.is_none(), "esc declined the confirmation");
+    assert_eq!(calls.borrow().len(), 0, "and declining killed nothing");
+    assert_eq!(
+        app.view().filter.map(str::to_string),
+        filtered,
+        "the filter is still in effect - esc answered the question in \
+         front of it, not the layer behind it"
+    );
 }
 
 #[test]
@@ -102,7 +172,9 @@ fn the_confirmation_names_the_signal_and_the_process() {
     let (mut app, _) = app_with(None);
     on_a_process(&mut app);
     press(&mut app, "K");
-    let Some(ModalView::Confirm { prompt }) = app.view().modal else { panic!("no confirmation") };
+    let Some(ModalView::Confirm { prompt }) = app.view().modal else {
+        panic!("no confirmation")
+    };
     assert!(prompt.contains("SIGKILL"), "{prompt}");
     assert!(prompt.contains("pid"), "{prompt}");
 }
@@ -114,9 +186,16 @@ fn nicing_acts_without_asking() {
     let (mut app, calls) = app_with(None);
     on_a_process(&mut app);
     press(&mut app, "]");
-    assert!(app.view().modal.is_none(), "no confirmation for a reversible nudge");
+    assert!(
+        app.view().modal.is_none(),
+        "no confirmation for a reversible nudge"
+    );
     assert_eq!(calls.borrow().len(), 1, "{:?}", calls.borrow());
-    assert!(calls.borrow()[0].starts_with("renice"), "{:?}", calls.borrow());
+    assert!(
+        calls.borrow()[0].starts_with("renice"),
+        "{:?}",
+        calls.borrow()
+    );
 }
 
 /// The design's error table: an action's failure is shown and *held*,
@@ -128,9 +207,14 @@ fn a_refused_action_reports_and_the_message_survives_a_tick() {
     on_a_process(&mut app);
     press(&mut app, "]");
 
-    assert!(matches!(app.view().status, StatusLine::Error(_)), "the failure is shown");
-    app.tick(2_000, "t".to_string()).expect("tick");
-    let StatusLine::Error(message) = app.view().status else { panic!("the error was erased by a refresh") };
+    assert!(
+        matches!(app.view().status, StatusLine::Error(_)),
+        "the failure is shown"
+    );
+    app.tick(2_000, "t".to_string());
+    let StatusLine::Error(message) = app.view().status else {
+        panic!("the error was erased by a refresh")
+    };
     assert!(message.contains("not permitted"), "{message}");
 }
 
@@ -140,7 +224,10 @@ fn a_refused_action_reports_and_the_message_survives_a_tick() {
 fn an_action_on_a_non_process_row_does_nothing() {
     let (mut app, calls) = app_with(None);
     press(&mut app, "2");
-    assert!(matches!(app.view().rows.first(), Some(Node::ProcGroup { .. })), "the cursor starts on a group");
+    assert!(
+        matches!(app.view().rows.first(), Some(Node::ProcGroup { .. })),
+        "the cursor starts on a group"
+    );
     press(&mut app, "k");
     press(&mut app, "]");
     assert!(app.view().modal.is_none());
@@ -158,7 +245,11 @@ fn filtering_narrows_the_buffer_as_it_is_typed() {
     press(&mut app, "/");
     assert!(app.view().typing, "the filter is taking keys");
     press(&mut app, "chrome");
-    assert_eq!(app.view().filter, Some("chrome"), "and shows what was typed");
+    assert_eq!(
+        app.view().filter,
+        Some("chrome"),
+        "and shows what was typed"
+    );
 
     let names: Vec<String> = app
         .view()
@@ -184,7 +275,10 @@ fn escape_clears_the_filter_and_restores_every_row() {
     press(&mut app, "chrome");
     app.handle_key(Key::new(KeyCode::Esc));
 
-    assert!(app.view().filter.is_none(), "the filter is gone, not merely closed");
+    assert!(
+        app.view().filter.is_none(),
+        "the filter is gone, not merely closed"
+    );
     assert_eq!(app.view().rows.len(), before, "every row is back");
 }
 
@@ -207,9 +301,17 @@ fn escape_restores_the_filter_that_was_already_in_effect() {
     press(&mut app, "zzz");
     app.handle_key(Key::new(KeyCode::Esc));
 
-    assert_eq!(app.view().filter, Some("chrome"), "the filter that was already there survives");
+    assert_eq!(
+        app.view().filter,
+        Some("chrome"),
+        "the filter that was already there survives"
+    );
     assert!(!app.view().typing, "and it is no longer taking keys");
-    assert_eq!(app.view().rows.len(), narrowed, "so the rows are the ones it was narrowing to");
+    assert_eq!(
+        app.view().rows.len(),
+        narrowed,
+        "so the rows are the ones it was narrowing to"
+    );
 }
 
 /// A finding is the status buffer's content, not its scaffolding. If `/`
@@ -232,16 +334,35 @@ fn the_status_buffer_can_be_filtered_by_a_findings_own_text() {
         queued: Default::default(),
         proc_details: Default::default(),
         detail_queries: Default::default(),
+        units_fail_with: None,
+        sample_fail_with: None,
+        smart: None,
+        smart_reads: Default::default(),
     };
-    let platform = FakePlatformService { boot_pressure: None, pending_reboot: None };
-    let mut app = App::new(Box::new(system), Box::new(platform), Box::new(fake::NoScanner), "devbox".to_string());
-    app.tick(10_000, "t".to_string()).expect("tick");
+    let platform = FakePlatformService::default();
+    let mut app = App::new(
+        Box::new(system),
+        Box::new(platform),
+        Box::new(fake::NoScanner),
+        "devbox".to_string(),
+    );
+    app.tick(10_000, "t".to_string());
 
     press(&mut app, "/");
     press(&mut app, "restic");
 
-    let findings: Vec<&Node> = app.view().rows.iter().filter(|r| matches!(r, Node::Finding(_))).collect();
-    assert_eq!(findings.len(), 1, "the failed unit matches its own name: {:#?}", app.view().rows);
+    let findings: Vec<&Node> = app
+        .view()
+        .rows
+        .iter()
+        .filter(|r| matches!(r, Node::Finding { .. }))
+        .collect();
+    assert_eq!(
+        findings.len(),
+        1,
+        "the failed unit matches its own name: {:#?}",
+        app.view().rows
+    );
 }
 
 /// The other half of the same rule: a filter that matches nothing must
@@ -262,18 +383,34 @@ fn a_filter_matching_no_finding_empties_the_status_buffer() {
         queued: Default::default(),
         proc_details: Default::default(),
         detail_queries: Default::default(),
+        units_fail_with: None,
+        sample_fail_with: None,
+        smart: None,
+        smart_reads: Default::default(),
     };
-    let platform = FakePlatformService { boot_pressure: None, pending_reboot: None };
-    let mut app = App::new(Box::new(system), Box::new(platform), Box::new(fake::NoScanner), "devbox".to_string());
-    app.tick(10_000, "t".to_string()).expect("tick");
+    let platform = FakePlatformService::default();
+    let mut app = App::new(
+        Box::new(system),
+        Box::new(platform),
+        Box::new(fake::NoScanner),
+        "devbox".to_string(),
+    );
+    app.tick(10_000, "t".to_string());
 
     press(&mut app, "/");
     press(&mut app, "nosuchunit");
 
-    assert!(app.view().rows.iter().all(|r| !matches!(r, Node::Finding(_))), "{:#?}", app.view().rows);
+    assert!(
+        app.view()
+            .rows
+            .iter()
+            .all(|r| !matches!(r, Node::Finding { .. })),
+        "{:#?}",
+        app.view().rows
+    );
 }
 
-/// The whole point of the systemd view: narrow to the one unit you care
+/// The whole point of the systemd buffer: narrow to the one unit you care
 /// about, then open it where it sits.
 ///
 /// `enter` rather than `tab`, and the two are a pair: `tab` folds a
@@ -291,7 +428,12 @@ fn filter_then_enter_expands_the_unit_in_place() {
 
     // One unit survives the filter; put the cursor on it.
     step_onto_a_unit(&mut app);
-    assert_eq!(selected_unit(&app).as_deref(), Some("restic-backup.service"), "{:#?}", app.view().rows);
+    assert_eq!(
+        selected_unit(&app).as_deref(),
+        Some("restic-backup.service"),
+        "{:#?}",
+        app.view().rows
+    );
     assert_eq!(expanded(&app), Some(false), "a unit starts closed");
 
     app.handle_key(Key::new(KeyCode::Enter));
@@ -312,7 +454,7 @@ fn an_expanded_unit_stays_open_across_a_tick() {
     app.handle_key(Key::new(KeyCode::Enter));
     assert_eq!(expanded(&app), Some(true));
 
-    app.tick(20_000, "t".to_string()).expect("tick");
+    app.tick(20_000, "t".to_string());
     assert_eq!(expanded(&app), Some(true), "still open after a refresh");
 }
 
@@ -334,19 +476,26 @@ fn expanding_one_unit_leaves_the_others_closed() {
             _ => None,
         })
         .collect();
-    assert_eq!(open.iter().filter(|(_, e)| *e).count(), 1, "exactly one is open: {open:?}");
+    assert_eq!(
+        open.iter().filter(|(_, e)| *e).count(),
+        1,
+        "exactly one is open: {open:?}"
+    );
 }
 
 /// magit's `TAB`: shows or hides the section at point.
 ///
-/// Two states, not three. This view has one level of section - a type and
+/// Two states, not three. This buffer has one level of section - a type and
 /// the units in it - and a row's detail is not a deeper level of the
 /// outline, it is the row's own content, which `enter` owns. Cycling it
 /// wholesale would open every unit in the section, each costing a read, to
 /// show what nobody asked to see.
 #[test]
 fn tab_shows_and_hides_the_section_under_the_cursor() {
-    let mut app = app_with_units(vec![failed("restic-backup.service"), failed("borgmatic.service")]);
+    let mut app = app_with_units(vec![
+        failed("restic-backup.service"),
+        failed("borgmatic.service"),
+    ]);
     press(&mut app, "3");
 
     assert!(units_shown(&app) > 0, "rows start visible");
@@ -386,7 +535,10 @@ fn shift_tab_folds_and_unfolds_every_section() {
     let mut app = systemd_app();
     press(&mut app, "3");
     let start_shown = units_shown(&app);
-    assert!(start_shown >= 2, "more than one unit, in more than one section");
+    assert!(
+        start_shown >= 2,
+        "more than one unit, in more than one section"
+    );
 
     app.handle_key(Key::new(KeyCode::BackTab));
     assert_eq!(units_shown(&app), 0, "every section folded");
@@ -405,19 +557,34 @@ fn the_buffer_cycle_ignores_the_cursor() {
     step_onto_a_unit(&mut app);
 
     app.handle_key(Key::new(KeyCode::BackTab));
-    assert_eq!(units_shown(&app), 0, "every section folded, not just the one at point");
+    assert_eq!(
+        units_shown(&app),
+        0,
+        "every section folded, not just the one at point"
+    );
 }
 
 fn units_shown(app: &App) -> usize {
-    app.view().rows.iter().filter(|r| matches!(r, Node::Unit { .. })).count()
+    app.view()
+        .rows
+        .iter()
+        .filter(|r| matches!(r, Node::Unit { .. }))
+        .count()
 }
 
 fn units_open(app: &App) -> usize {
-    app.view().rows.iter().filter(|r| matches!(r, Node::Unit { expanded: true, .. })).count()
+    app.view()
+        .rows
+        .iter()
+        .filter(|r| matches!(r, Node::Unit { expanded: true, .. }))
+        .count()
 }
 
 fn systemd_app() -> App {
-    app_with_units(vec![failed("restic-backup.service"), unit("sshd.service", masys_domain::unit::ActiveState::Active)])
+    app_with_units(vec![
+        failed("restic-backup.service"),
+        unit("sshd.service", masys_domain::unit::ActiveState::Active),
+    ])
 }
 
 fn app_with_units(units: Vec<masys_domain::unit::Unit>) -> App {
@@ -434,10 +601,19 @@ fn app_with_units(units: Vec<masys_domain::unit::Unit>) -> App {
         queued: Default::default(),
         proc_details: Default::default(),
         detail_queries: Default::default(),
+        units_fail_with: None,
+        sample_fail_with: None,
+        smart: None,
+        smart_reads: Default::default(),
     };
-    let platform = FakePlatformService { boot_pressure: None, pending_reboot: None };
-    let mut app = App::new(Box::new(system), Box::new(platform), Box::new(fake::NoScanner), "devbox".to_string());
-    app.tick(10_000, "t".to_string()).expect("tick");
+    let platform = FakePlatformService::default();
+    let mut app = App::new(
+        Box::new(system),
+        Box::new(platform),
+        Box::new(fake::NoScanner),
+        "devbox".to_string(),
+    );
+    app.tick(10_000, "t".to_string());
     app
 }
 
@@ -483,8 +659,16 @@ fn typing_a_filter_does_not_trigger_the_keys_it_contains() {
     press(&mut app, "kus");
 
     assert_eq!(app.buffer(), Buffer::Procs, "still in Procs");
-    assert!(calls.borrow().is_empty(), "nothing was signalled: {:?}", calls.borrow());
-    assert_eq!(app.view().filter, Some("kus"), "the letters are text, not actions");
+    assert!(
+        calls.borrow().is_empty(),
+        "nothing was signalled: {:?}",
+        calls.borrow()
+    );
+    assert_eq!(
+        app.view().filter,
+        Some("kus"),
+        "the letters are text, not actions"
+    );
 }
 
 fn unit(name: &str, state: masys_domain::unit::ActiveState) -> masys_domain::unit::Unit {
@@ -505,34 +689,42 @@ fn unit(name: &str, state: masys_domain::unit::ActiveState) -> masys_domain::uni
 }
 
 /// A platform that answers the ownership question however a test needs.
-struct Owned(masys_domain::platform::Ownership);
+/// `None` makes `unit_ownership` fail, which is a third case and not
+/// a third answer.
+struct Owned(Option<masys_domain::platform::Ownership>);
 
 impl masys_domain::service::PlatformService for Owned {
     fn id(&self) -> masys_domain::platform::PlatformId {
         masys_domain::platform::PlatformId::NixOs
     }
-    fn packages(&self) -> Result<Vec<masys_domain::platform::Package>, masys_domain::MasysError> {
-        unimplemented!()
-    }
-    fn updates(&self) -> Result<masys_domain::platform::UpdateStatus, masys_domain::MasysError> {
-        unimplemented!()
-    }
-    fn pending_reboot(&self) -> Result<Option<masys_domain::platform::PendingReboot>, masys_domain::MasysError> {
+    fn pending_reboot(
+        &self,
+    ) -> Result<Option<masys_domain::platform::PendingReboot>, masys_domain::MasysError> {
         Ok(None)
     }
-    fn unit_ownership(&self, _unit: &str) -> Result<masys_domain::platform::Ownership, masys_domain::MasysError> {
-        Ok(self.0.clone())
+    fn unit_ownership(
+        &self,
+        _unit: &str,
+    ) -> Result<masys_domain::platform::Ownership, masys_domain::MasysError> {
+        self.0.clone().ok_or_else(|| {
+            masys_domain::MasysError::Platform("could not read who owns this unit".to_string())
+        })
     }
-    fn boot_pressure(&self) -> Result<Option<masys_domain::platform::BootPressure>, masys_domain::MasysError> {
+    fn boot_pressure(
+        &self,
+    ) -> Result<Option<masys_domain::platform::BootPressure>, masys_domain::MasysError> {
         Ok(None)
     }
 }
 
-fn units_app(ownership: masys_domain::platform::Ownership) -> (App, Calls) {
+fn units_app(ownership: Option<masys_domain::platform::Ownership>) -> (App, Calls) {
     let calls: Calls = Default::default();
     let system = FakeSystemService {
         snapshot: snapshot(),
-        units: vec![unit("sshd.service", masys_domain::unit::ActiveState::Active)],
+        units: vec![unit(
+            "sshd.service",
+            masys_domain::unit::ActiveState::Active,
+        )],
         calls: calls.clone(),
         fails_with: None,
         journal: Vec::new(),
@@ -541,9 +733,18 @@ fn units_app(ownership: masys_domain::platform::Ownership) -> (App, Calls) {
         queued: Default::default(),
         proc_details: Default::default(),
         detail_queries: Default::default(),
+        units_fail_with: None,
+        sample_fail_with: None,
+        smart: None,
+        smart_reads: Default::default(),
     };
-    let mut app = App::new(Box::new(system), Box::new(Owned(ownership)), Box::new(fake::NoScanner), "devbox".to_string());
-    app.tick(1_000, "t".to_string()).expect("tick");
+    let mut app = App::new(
+        Box::new(system),
+        Box::new(Owned(ownership)),
+        Box::new(fake::NoScanner),
+        "devbox".to_string(),
+    );
+    app.tick(1_000, "t".to_string());
     press(&mut app, "3");
     // Onto the unit row, past its section header.
     app.handle_key(Key::new(KeyCode::Down));
@@ -555,13 +756,15 @@ fn units_app(ownership: masys_domain::platform::Ownership) -> (App, Calls) {
 /// before pressing the key rather than after.
 #[test]
 fn enabling_warns_and_says_how_the_change_fails() {
-    let (mut app, _) = units_app(masys_domain::platform::Ownership::Declarative {
+    let (mut app, _) = units_app(Some(masys_domain::platform::Ownership::Declarative {
         source: "configuration.nix".to_string(),
         note: "refused now - the unit directory is read-only".to_string(),
         reverted_by: "nixos-rebuild switch".to_string(),
-    });
+    }));
     press(&mut app, "ee");
-    let Some(ModalView::Confirm { prompt }) = app.view().modal else { panic!("no confirmation") };
+    let Some(ModalView::Confirm { prompt }) = app.view().modal else {
+        panic!("no confirmation")
+    };
     assert!(prompt.contains("enable sshd.service"), "{prompt}");
     // The note says *how* it fails, which is the operator's actual
     // question: refused now, or undone by a later rebuild.
@@ -574,9 +777,11 @@ fn enabling_warns_and_says_how_the_change_fails() {
 /// noise - and noise is what trains an operator to stop reading prompts.
 #[test]
 fn enabling_says_nothing_extra_when_the_change_persists() {
-    let (mut app, _) = units_app(masys_domain::platform::Ownership::Imperative);
+    let (mut app, _) = units_app(Some(masys_domain::platform::Ownership::Imperative));
     press(&mut app, "ee");
-    let Some(ModalView::Confirm { prompt }) = app.view().modal else { panic!("no confirmation") };
+    let Some(ModalView::Confirm { prompt }) = app.view().modal else {
+        panic!("no confirmation")
+    };
     assert!(!prompt.contains("reverts"), "{prompt}");
 }
 
@@ -585,19 +790,21 @@ fn enabling_says_nothing_extra_when_the_change_persists() {
 /// the guard.
 #[test]
 fn starting_does_not_consult_the_ownership_guard() {
-    let (mut app, _) = units_app(masys_domain::platform::Ownership::Declarative {
+    let (mut app, _) = units_app(Some(masys_domain::platform::Ownership::Declarative {
         source: "configuration.nix".to_string(),
         note: "generated".to_string(),
         reverted_by: "nixos-rebuild switch".to_string(),
-    });
+    }));
     press(&mut app, "S");
-    let Some(ModalView::Confirm { prompt }) = app.view().modal else { panic!("no confirmation") };
+    let Some(ModalView::Confirm { prompt }) = app.view().modal else {
+        panic!("no confirmation")
+    };
     assert!(!prompt.contains("reverts"), "{prompt}");
 }
 
 #[test]
 fn a_confirmed_unit_verb_reaches_the_port() {
-    let (mut app, calls) = units_app(masys_domain::platform::Ownership::Imperative);
+    let (mut app, calls) = units_app(Some(masys_domain::platform::Ownership::Imperative));
     press(&mut app, "ee");
     press(&mut app, "y");
     assert_eq!(*calls.borrow(), vec!["enable sshd.service".to_string()]);
@@ -605,7 +812,7 @@ fn a_confirmed_unit_verb_reaches_the_port() {
 
 #[test]
 fn a_declined_unit_verb_does_not() {
-    let (mut app, calls) = units_app(masys_domain::platform::Ownership::Imperative);
+    let (mut app, calls) = units_app(Some(masys_domain::platform::Ownership::Imperative));
     press(&mut app, "D");
     press(&mut app, "n");
     assert!(calls.borrow().is_empty(), "{:?}", calls.borrow());
@@ -623,6 +830,7 @@ fn viewing_a_units_log_queries_that_unit_rather_than_filtering() {
             unit: Some("sshd.service".to_string()),
             priority: masys_domain::journal::Priority::Info,
             message: "Accepted publickey".to_string(),
+            origin: masys_domain::journal::Origin::Userspace,
         },
         masys_domain::journal::Entry {
             timestamp_ms: 2,
@@ -630,6 +838,7 @@ fn viewing_a_units_log_queries_that_unit_rather_than_filtering() {
             priority: masys_domain::journal::Priority::Info,
             // Mentions the unit by name: a text filter would keep this.
             message: "waiting for sshd.service".to_string(),
+            origin: masys_domain::journal::Origin::Userspace,
         },
     ]);
     press(&mut app, "l");
@@ -644,7 +853,11 @@ fn viewing_a_units_log_queries_that_unit_rather_than_filtering() {
             _ => None,
         })
         .collect();
-    assert_eq!(messages, vec!["Accepted publickey"], "field match, not text match");
+    assert_eq!(
+        messages,
+        vec!["Accepted publickey"],
+        "field match, not text match"
+    );
     assert!(app.view().filter.is_none(), "no filter is involved at all");
 }
 
@@ -659,26 +872,36 @@ fn the_log_splits_into_a_section_per_local_day() {
     // -06:00, so the local day turns over at 06:00 UTC. These two are two
     // hours apart across that line: one local day each, one UTC day
     // between them.
-    let (mut app, _) =
-        units_app_with_journal(vec![entry_at(1_779_166_800_000, "late last night"), entry_at(1_779_174_000_000, "early this morning")]);
+    let (mut app, _) = units_app_with_journal(vec![
+        entry_at(1_779_166_800_000, "late last night"),
+        entry_at(1_779_174_000_000, "early this morning"),
+    ]);
     press(&mut app, "l");
 
     let days: Vec<String> = section_titles(&app);
-    assert_eq!(days, vec!["2026-05-19".to_string(), "2026-05-18".to_string()], "local days, newest first: {days:?}");
+    assert_eq!(
+        days,
+        vec!["2026-05-19".to_string(), "2026-05-18".to_string()],
+        "local days, newest first: {days:?}"
+    );
 }
 
 /// Grouping on the UTC day would put both of those under 2026-05-19 - the
 /// same bug as rendering a journal in UTC, one level up.
 #[test]
 fn the_day_boundary_is_local_rather_than_utc() {
-    let (mut app, _) = units_app_with_journal(vec![entry_at(1_779_166_800_000, "23:00 local, 05:00 UTC")]);
+    let (mut app, _) =
+        units_app_with_journal(vec![entry_at(1_779_166_800_000, "23:00 local, 05:00 UTC")]);
     press(&mut app, "l");
     assert_eq!(section_titles(&app), vec!["2026-05-18".to_string()]);
 }
 
 #[test]
 fn a_log_inside_one_day_gets_exactly_one_section() {
-    let (mut app, _) = units_app_with_journal(vec![entry_at(1_779_174_000_000, "morning"), entry_at(1_779_220_800_000, "afternoon")]);
+    let (mut app, _) = units_app_with_journal(vec![
+        entry_at(1_779_174_000_000, "morning"),
+        entry_at(1_779_220_800_000, "afternoon"),
+    ]);
     press(&mut app, "l");
     assert_eq!(section_titles(&app), vec!["2026-05-19".to_string()]);
 }
@@ -687,9 +910,15 @@ fn a_log_inside_one_day_gets_exactly_one_section() {
 /// not be two thousand lines down.
 #[test]
 fn the_log_opens_newest_first() {
-    let (mut app, _) = units_app_with_journal(vec![entry_at(1_779_174_000_000, "older"), entry_at(1_779_220_800_000, "newer")]);
+    let (mut app, _) = units_app_with_journal(vec![
+        entry_at(1_779_174_000_000, "older"),
+        entry_at(1_779_220_800_000, "newer"),
+    ]);
     press(&mut app, "l");
-    assert_eq!(log_messages(&app), vec!["newer".to_string(), "older".to_string()]);
+    assert_eq!(
+        log_messages(&app),
+        vec!["newer".to_string(), "older".to_string()]
+    );
 }
 
 /// `o` reverses *both* levels - the days and the lines within them. A
@@ -702,23 +931,54 @@ fn o_reverses_the_days_and_the_lines_within_them() {
         entry_at(1_779_220_800_000, "day two, late"),
     ]);
     press(&mut app, "l");
-    assert_eq!(section_titles(&app), vec!["2026-05-19".to_string(), "2026-05-18".to_string()]);
-    assert_eq!(log_messages(&app), vec!["day two, late".to_string(), "day two, early".to_string(), "day one".to_string()]);
+    assert_eq!(
+        section_titles(&app),
+        vec!["2026-05-19".to_string(), "2026-05-18".to_string()]
+    );
+    assert_eq!(
+        log_messages(&app),
+        vec![
+            "day two, late".to_string(),
+            "day two, early".to_string(),
+            "day one".to_string()
+        ]
+    );
 
     press(&mut app, "o");
-    assert_eq!(section_titles(&app), vec!["2026-05-18".to_string(), "2026-05-19".to_string()]);
-    assert_eq!(log_messages(&app), vec!["day one".to_string(), "day two, early".to_string(), "day two, late".to_string()]);
+    assert_eq!(
+        section_titles(&app),
+        vec!["2026-05-18".to_string(), "2026-05-19".to_string()]
+    );
+    assert_eq!(
+        log_messages(&app),
+        vec![
+            "day one".to_string(),
+            "day two, early".to_string(),
+            "day two, late".to_string()
+        ]
+    );
 
     press(&mut app, "o");
-    assert_eq!(log_messages(&app), vec!["day two, late".to_string(), "day two, early".to_string(), "day one".to_string()], "and back");
+    assert_eq!(
+        log_messages(&app),
+        vec![
+            "day two, late".to_string(),
+            "day two, early".to_string(),
+            "day one".to_string()
+        ],
+        "and back"
+    );
 }
 
 /// Order changes how the window is shown, never which entries are in it.
 /// A sort key that silently refetched would be a different feature.
 #[test]
 fn reversing_the_order_keeps_the_same_entries() {
-    let (mut app, _) =
-        units_app_with_journal(vec![entry_at(1_779_166_800_000, "a"), entry_at(1_779_174_000_000, "b"), entry_at(1_779_220_800_000, "c")]);
+    let (mut app, _) = units_app_with_journal(vec![
+        entry_at(1_779_166_800_000, "a"),
+        entry_at(1_779_174_000_000, "b"),
+        entry_at(1_779_220_800_000, "c"),
+    ]);
     press(&mut app, "l");
     let mut before = log_messages(&app);
     press(&mut app, "o");
@@ -735,19 +995,26 @@ fn reversing_the_order_keeps_the_same_entries() {
 fn the_log_header_names_the_unit_and_the_direction() {
     let (mut app, _) = units_app_with_journal(vec![entry_at(1_779_174_000_000, "anything")]);
     press(&mut app, "l");
-    let masys_view::Header::Log { unit, newest_first } = app.view().header else { panic!("not a log header") };
+    let masys_view::Header::Log { unit, newest_first } = app.view().header else {
+        panic!("not a log header")
+    };
     assert_eq!(unit, "sshd.service");
     assert!(newest_first, "opens newest first");
 
     press(&mut app, "o");
-    let masys_view::Header::Log { newest_first, .. } = app.view().header else { panic!("not a log header") };
+    let masys_view::Header::Log { newest_first, .. } = app.view().header else {
+        panic!("not a log header")
+    };
     assert!(!newest_first, "and `o` says so");
 }
 
 /// The point of flipping is to look at the other end.
 #[test]
 fn reversing_the_order_puts_the_cursor_at_the_top() {
-    let (mut app, _) = units_app_with_journal(vec![entry_at(1_779_174_000_000, "older"), entry_at(1_779_220_800_000, "newer")]);
+    let (mut app, _) = units_app_with_journal(vec![
+        entry_at(1_779_174_000_000, "older"),
+        entry_at(1_779_220_800_000, "newer"),
+    ]);
     press(&mut app, "l");
     app.handle_key(Key::new(KeyCode::End));
     press(&mut app, "o");
@@ -758,25 +1025,47 @@ fn reversing_the_order_puts_the_cursor_at_the_top() {
 /// day, the day goes with them.
 #[test]
 fn a_day_whose_lines_all_filter_out_loses_its_header() {
-    let (mut app, _) = units_app_with_journal(vec![entry_at(1_779_166_800_000, "quiet"), entry_at(1_779_174_000_000, "interesting")]);
+    let (mut app, _) = units_app_with_journal(vec![
+        entry_at(1_779_166_800_000, "quiet"),
+        entry_at(1_779_174_000_000, "interesting"),
+    ]);
     press(&mut app, "l");
     press(&mut app, "/");
     press(&mut app, "interesting");
-    assert_eq!(section_titles(&app), vec!["2026-05-19".to_string()], "the emptied day is gone");
+    assert_eq!(
+        section_titles(&app),
+        vec!["2026-05-19".to_string()],
+        "the emptied day is gone"
+    );
 }
 
 /// Days are real sections, so the key that folds a section folds a day -
 /// no new key, and no new concept to learn.
 #[test]
 fn tab_folds_a_day() {
-    let (mut app, _) = units_app_with_journal(vec![entry_at(1_779_166_800_000, "day one"), entry_at(1_779_174_000_000, "day two")]);
+    let (mut app, _) = units_app_with_journal(vec![
+        entry_at(1_779_166_800_000, "day one"),
+        entry_at(1_779_174_000_000, "day two"),
+    ]);
     press(&mut app, "l");
     // Onto the first day's header.
-    assert!(matches!(app.view().rows.first(), Some(Node::SectionHeader { .. })), "{:#?}", app.view().rows);
+    assert!(
+        matches!(app.view().rows.first(), Some(Node::SectionHeader { .. })),
+        "{:#?}",
+        app.view().rows
+    );
     app.handle_key(Key::new(KeyCode::Tab));
 
-    assert_eq!(log_messages(&app), vec!["day one".to_string()], "the open day's line stays, the folded one's goes");
-    assert_eq!(section_titles(&app).len(), 2, "both headers are still there");
+    assert_eq!(
+        log_messages(&app),
+        vec!["day one".to_string()],
+        "the open day's line stays, the folded one's goes"
+    );
+    assert_eq!(
+        section_titles(&app).len(),
+        2,
+        "both headers are still there"
+    );
 }
 
 /// `jump_section` matches any section header, so day-to-day movement came
@@ -784,11 +1073,17 @@ fn tab_folds_a_day() {
 /// days are sections at all.
 #[test]
 fn n_moves_from_one_day_to_the_next() {
-    let (mut app, _) = units_app_with_journal(vec![entry_at(1_779_166_800_000, "day one"), entry_at(1_779_174_000_000, "day two")]);
+    let (mut app, _) = units_app_with_journal(vec![
+        entry_at(1_779_166_800_000, "day one"),
+        entry_at(1_779_174_000_000, "day two"),
+    ]);
     press(&mut app, "l");
     press(&mut app, "n");
     let row = app.view().selected.and_then(|i| app.view().rows.get(i));
-    assert!(matches!(row, Some(Node::SectionHeader { title, .. }) if title == "2026-05-18"), "n landed on the next day: {row:#?}");
+    assert!(
+        matches!(row, Some(Node::SectionHeader { title, .. }) if title == "2026-05-18"),
+        "n landed on the next day: {row:#?}"
+    );
 }
 
 fn entry_at(timestamp_ms: u64, message: &str) -> masys_domain::journal::Entry {
@@ -797,6 +1092,7 @@ fn entry_at(timestamp_ms: u64, message: &str) -> masys_domain::journal::Entry {
         unit: Some("sshd.service".to_string()),
         priority: masys_domain::journal::Priority::Info,
         message: message.to_string(),
+        origin: masys_domain::journal::Origin::Userspace,
     }
 }
 
@@ -826,7 +1122,10 @@ fn units_app_with_journal(journal: Vec<masys_domain::journal::Entry>) -> (App, C
     let calls: Calls = Default::default();
     let system = FakeSystemService {
         snapshot: snapshot(),
-        units: vec![unit("sshd.service", masys_domain::unit::ActiveState::Active)],
+        units: vec![unit(
+            "sshd.service",
+            masys_domain::unit::ActiveState::Active,
+        )],
         calls: calls.clone(),
         fails_with: None,
         journal,
@@ -835,14 +1134,18 @@ fn units_app_with_journal(journal: Vec<masys_domain::journal::Entry>) -> (App, C
         queued: Default::default(),
         proc_details: Default::default(),
         detail_queries: Default::default(),
+        units_fail_with: None,
+        sample_fail_with: None,
+        smart: None,
+        smart_reads: Default::default(),
     };
     let mut app = App::new(
         Box::new(system),
-        Box::new(Owned(masys_domain::platform::Ownership::Imperative)),
+        Box::new(Owned(Some(masys_domain::platform::Ownership::Imperative))),
         Box::new(fake::NoScanner),
         "devbox".to_string(),
     );
-    app.tick(1_000, "t".to_string()).expect("tick");
+    app.tick(1_000, "t".to_string());
     press(&mut app, "3");
     app.handle_key(Key::new(KeyCode::Down));
     (app, calls)
@@ -916,12 +1219,24 @@ fn sort_marker(app: &App) -> (String, bool) {
 #[test]
 fn pressing_a_sort_key_twice_reverses_it() {
     let mut app = procs_app();
-    assert_eq!(sort_marker(&app), ("cpu".to_string(), true), "cpu starts worst-first");
+    assert_eq!(
+        sort_marker(&app),
+        ("cpu".to_string(), true),
+        "cpu starts worst-first"
+    );
 
     press(&mut app, "c");
-    assert_eq!(sort_marker(&app), ("cpu".to_string(), false), "the same key again reverses");
+    assert_eq!(
+        sort_marker(&app),
+        ("cpu".to_string(), false),
+        "the same key again reverses"
+    );
     press(&mut app, "c");
-    assert_eq!(sort_marker(&app), ("cpu".to_string(), true), "and again reverses back");
+    assert_eq!(
+        sort_marker(&app),
+        ("cpu".to_string(), true),
+        "and again reverses back"
+    );
 }
 
 /// A different column takes its own natural direction rather than
@@ -931,12 +1246,24 @@ fn pressing_a_sort_key_twice_reverses_it() {
 fn switching_columns_resets_to_that_columns_natural_direction() {
     let mut app = procs_app();
     press(&mut app, "c");
-    assert_eq!(sort_marker(&app), ("cpu".to_string(), false), "cpu is now ascending");
+    assert_eq!(
+        sort_marker(&app),
+        ("cpu".to_string(), false),
+        "cpu is now ascending"
+    );
 
     press(&mut app, "a");
-    assert_eq!(sort_marker(&app), ("name".to_string(), false), "name starts a-z");
+    assert_eq!(
+        sort_marker(&app),
+        ("name".to_string(), false),
+        "name starts a-z"
+    );
     press(&mut app, "m");
-    assert_eq!(sort_marker(&app), ("memory".to_string(), true), "memory starts biggest-first");
+    assert_eq!(
+        sort_marker(&app),
+        ("memory".to_string(), true),
+        "memory starts biggest-first"
+    );
 }
 
 /// The direction has to actually move the rows, not just the marker.
@@ -949,7 +1276,11 @@ fn reversing_actually_reorders_the_buffer() {
     let descending: Vec<String> = comms(&app);
 
     assert!(!ascending.is_empty(), "there are rows to order");
-    assert_eq!(descending, ascending.iter().rev().cloned().collect::<Vec<_>>(), "reversed");
+    assert_eq!(
+        descending,
+        ascending.iter().rev().cloned().collect::<Vec<_>>(),
+        "reversed"
+    );
 }
 
 fn comms(app: &App) -> Vec<String> {
@@ -964,7 +1295,11 @@ fn comms(app: &App) -> Vec<String> {
 }
 
 fn action_dimming(app: &App) -> Vec<(String, bool)> {
-    app.view().actions.iter().map(|b| (b.chord.clone(), b.dimmed)).collect()
+    app.view()
+        .actions
+        .iter()
+        .map(|b| (b.chord.clone(), b.dimmed))
+        .collect()
 }
 
 /// The design's rule: masys never hides an action outright, only marks
@@ -972,11 +1307,11 @@ fn action_dimming(app: &App) -> Vec<(String, bool)> {
 /// and leaves the operator wondering whether they misremembered it.
 #[test]
 fn enable_and_disable_dim_where_the_manifest_owns_the_unit() {
-    let (app, _) = units_app(masys_domain::platform::Ownership::Declarative {
+    let (app, _) = units_app(Some(masys_domain::platform::Ownership::Declarative {
         source: "configuration.nix".to_string(),
         note: "refused now - the unit directory is read-only".to_string(),
         reverted_by: "nixos-rebuild switch".to_string(),
-    });
+    }));
     let dimming = action_dimming(&app);
 
     for (chord, dimmed) in &dimming {
@@ -991,7 +1326,10 @@ fn enable_and_disable_dim_where_the_manifest_owns_the_unit() {
         // because the popup it opens contains a dim row would be hiding
         // the explanation the mark exists to give.
         let expected = matches!(chord.as_str(), "D" | "E" | "F" | "M" | "U");
-        assert_eq!(*dimmed, expected, "{chord} dimmed={dimmed}, expected {expected}: {dimming:?}");
+        assert_eq!(
+            *dimmed, expected,
+            "{chord} dimmed={dimmed}, expected {expected}: {dimming:?}"
+        );
     }
     // Still present, still in position - dimmed is not hidden.
     assert!(dimming.iter().any(|(c, _)| c == "D"), "{dimming:?}");
@@ -1002,26 +1340,48 @@ fn enable_and_disable_dim_where_the_manifest_owns_the_unit() {
 /// and the one the design's mockup actually draws.
 #[test]
 fn the_ownership_guard_marks_enable_inside_the_transient() {
-    let (mut app, _) = units_app(masys_domain::platform::Ownership::Declarative {
+    let (mut app, _) = units_app(Some(masys_domain::platform::Ownership::Declarative {
         source: "configuration.nix".to_string(),
         note: "refused now - the unit directory is read-only".to_string(),
         reverted_by: "nixos-rebuild switch".to_string(),
-    });
+    }));
     press(&mut app, "e");
-    let Some(ModalView::Transient { title, groups, .. }) = app.view().modal else { panic!("no transient") };
+    let Some(ModalView::Transient { title, groups, .. }) = app.view().modal else {
+        panic!("no transient")
+    };
 
-    assert!(title.contains("sshd.service"), "the popup names its unit: {title}");
-    let persistence = groups.iter().find(|g| g.heading == "Persistence").expect("a Persistence group");
-    assert_eq!(persistence.note.as_deref(), Some("! refused now - the unit directory is read-only"));
+    assert!(
+        title.contains("sshd.service"),
+        "the popup names its unit: {title}"
+    );
+    let persistence = groups
+        .iter()
+        .find(|g| g.heading == "Persistence")
+        .expect("a Persistence group");
+    assert_eq!(
+        persistence.note.as_deref(),
+        Some("! refused now - the unit directory is read-only")
+    );
     for row in &persistence.rows {
         assert!(row.dimmed, "{} is marked: {persistence:?}", row.label);
-        assert_eq!(row.note.as_deref(), Some("reverts on nixos-rebuild switch"), "{}", row.label);
+        assert_eq!(
+            row.note.as_deref(),
+            Some("reverts on nixos-rebuild switch"),
+            "{}",
+            row.label
+        );
     }
-    assert_eq!(persistence.rows.iter().map(|r| r.label).collect::<Vec<_>>(), vec!["enable", "disable", "mask"]);
+    assert_eq!(
+        persistence.rows.iter().map(|r| r.label).collect::<Vec<_>>(),
+        vec!["enable", "disable", "mask"]
+    );
 
     // And the runtime verbs are untouched, which is the whole point of a
     // guard that asks about persistence rather than about writing.
-    let runtime = groups.iter().find(|g| g.heading == "Runtime").expect("a Runtime group");
+    let runtime = groups
+        .iter()
+        .find(|g| g.heading == "Runtime")
+        .expect("a Runtime group");
     assert!(runtime.rows.iter().all(|row| !row.dimmed), "{runtime:?}");
     assert_eq!(runtime.note, None);
 }
@@ -1029,28 +1389,42 @@ fn the_ownership_guard_marks_enable_inside_the_transient() {
 /// On a host where enablement sticks, nothing in the popup is marked.
 #[test]
 fn an_imperative_host_marks_nothing_in_the_transient() {
-    let (mut app, _) = units_app(masys_domain::platform::Ownership::Imperative);
+    let (mut app, _) = units_app(Some(masys_domain::platform::Ownership::Imperative));
     press(&mut app, "e");
-    let Some(ModalView::Transient { groups, .. }) = app.view().modal else { panic!("no transient") };
+    let Some(ModalView::Transient { groups, .. }) = app.view().modal else {
+        panic!("no transient")
+    };
 
-    let persistence = groups.iter().find(|g| g.heading == "Persistence").expect("a Persistence group");
+    let persistence = groups
+        .iter()
+        .find(|g| g.heading == "Persistence")
+        .expect("a Persistence group");
     assert_eq!(persistence.note, None);
-    assert!(persistence.rows.iter().all(|row| !row.dimmed && row.note.is_none()), "{persistence:?}");
+    assert!(
+        persistence
+            .rows
+            .iter()
+            .all(|row| !row.dimmed && row.note.is_none()),
+        "{persistence:?}"
+    );
 }
 
 /// Starting a unit writes nothing and contradicts no manifest, so it is
 /// never dimmed - only the two verbs that change what happens at boot.
 #[test]
 fn the_runtime_verbs_are_never_dimmed() {
-    let (app, _) = units_app(masys_domain::platform::Ownership::Declarative {
+    let (app, _) = units_app(Some(masys_domain::platform::Ownership::Declarative {
         source: "configuration.nix".to_string(),
         note: "refused".to_string(),
         reverted_by: "nixos-rebuild switch".to_string(),
-    });
+    }));
     // `alt+r` and `R` join them: try-restart and reload change what is
     // running now and write nothing, so no manifest contradicts them.
     for chord in ["r", "S", "X", "l", "/", "alt+r", "R"] {
-        let dimmed = action_dimming(&app).into_iter().find(|(c, _)| c == chord).map(|(_, d)| d);
+        let dimmed = action_dimming(&app)
+            .into_iter()
+            .find(|(c, _)| c == chord)
+            .map(|(_, d)| d);
         assert_eq!(dimmed, Some(false), "{chord} must stay lit");
     }
 }
@@ -1058,12 +1432,19 @@ fn the_runtime_verbs_are_never_dimmed() {
 /// On a host where enabling genuinely sticks, dimming would be a lie.
 #[test]
 fn nothing_dims_where_the_change_would_persist() {
-    let (app, _) = units_app(masys_domain::platform::Ownership::Imperative);
+    let (app, _) = units_app(Some(masys_domain::platform::Ownership::Imperative));
     // `F` still dims, for an unrelated reason - this unit is healthy -
     // so the ownership guard is asserted on the two verbs it governs.
     for chord in ["e", "D"] {
-        let dimmed = action_dimming(&app).into_iter().find(|(c, _)| c == chord).map(|(_, d)| d);
-        assert_eq!(dimmed, Some(false), "{chord} must stay lit where enabling persists");
+        let dimmed = action_dimming(&app)
+            .into_iter()
+            .find(|(c, _)| c == chord)
+            .map(|(_, d)| d);
+        assert_eq!(
+            dimmed,
+            Some(false),
+            "{chord} must stay lit where enabling persists"
+        );
     }
 }
 
@@ -1072,15 +1453,22 @@ fn nothing_dims_where_the_change_would_persist() {
 /// which means recomputing on movement and not only on a tick.
 #[test]
 fn dimming_follows_the_cursor_rather_than_the_host() {
-    let (mut app, _) = units_app(masys_domain::platform::Ownership::Imperative);
+    let (mut app, _) = units_app(Some(masys_domain::platform::Ownership::Imperative));
     // On a healthy unit: only the verb that needs a failure is marked.
-    let on_unit: Vec<String> = action_dimming(&app).into_iter().filter(|(_, d)| *d).map(|(c, _)| c).collect();
+    let on_unit: Vec<String> = action_dimming(&app)
+        .into_iter()
+        .filter(|(_, d)| *d)
+        .map(|(c, _)| c)
+        .collect();
     assert_eq!(on_unit, vec!["F".to_string()]);
 
     // Onto a row that is not a unit at all - the section header above it.
     app.handle_key(Key::new(KeyCode::Up));
     assert!(
-        matches!(app.view().rows.get(app.view().selected.unwrap_or(0)), Some(Node::SectionHeader { .. })),
+        matches!(
+            app.view().rows.get(app.view().selected.unwrap_or(0)),
+            Some(Node::SectionHeader { .. })
+        ),
         "the cursor moved off the unit"
     );
     // Every unit key is marked here, because not one of them will do
@@ -1089,30 +1477,82 @@ fn dimming_follows_the_cursor_rather_than_the_host() {
     // the answer was recomputed on the keypress rather than frozen from
     // the last tick.
     //
-    // This asserted the opposite until the Nix view got operations of its
+    // This asserted the opposite until the Nix buffer got operations of its
     // own. Nothing was marked on a heading, so the footer offered eleven
     // unit verbs against a row that had no unit - which is the same
     // footer-disagrees-with-the-key failure that has twice been fixed
     // here, sitting in the mechanism built to prevent it.
-    let lit: Vec<String> = action_dimming(&app).into_iter().filter(|(_, dimmed)| !dimmed).map(|(chord, _)| chord).collect();
-    assert_eq!(lit, vec!["/".to_string()], "only the filter applies to a section header");
+    let lit: Vec<String> = action_dimming(&app)
+        .into_iter()
+        .filter(|(_, dimmed)| !dimmed)
+        .map(|(chord, _)| chord)
+        .collect();
+    assert_eq!(
+        lit,
+        vec!["/".to_string()],
+        "only the filter applies to a section header"
+    );
 }
 
 /// The footer and the help must not disagree about whether a key applies.
 #[test]
+fn any_key_dismisses_the_help() {
+    // Each of these means something in the buffer underneath - a
+    // movement, a buffer switch, a filter, a quit - and none of them may
+    // reach it while the card is up. The card is a reference, not a mode
+    // with verbs of its own, so the key that leaves is every key.
+    for dismiss in ["j", "2", "/", "q", "?"] {
+        let (mut app, _) = units_app(None);
+        press(&mut app, "?");
+        assert!(
+            matches!(app.view().modal, Some(ModalView::Keys { .. })),
+            "the help did not open"
+        );
+
+        press(&mut app, dismiss);
+        assert!(
+            app.view().modal.is_none(),
+            "{dismiss:?} left the help on screen"
+        );
+        assert_eq!(
+            app.buffer(),
+            Buffer::Systemd,
+            "{dismiss:?} dismissed the help and then acted on the buffer \
+             as well - it does one or the other"
+        );
+    }
+}
+
+#[test]
 fn the_help_dims_the_same_keys_as_the_footer() {
-    let (mut app, _) = units_app(masys_domain::platform::Ownership::Declarative {
+    let (mut app, _) = units_app(Some(masys_domain::platform::Ownership::Declarative {
         source: "configuration.nix".to_string(),
         note: "refused".to_string(),
         reverted_by: "nixos-rebuild switch".to_string(),
-    });
+    }));
     press(&mut app, "?");
-    let Some(ModalView::Keys { groups }) = app.view().modal else { panic!("no help") };
-    let dimmed: Vec<String> = groups.iter().flat_map(|g| g.bindings.iter()).filter(|b| b.dimmed).map(|b| b.chord.clone()).collect();
+    let Some(ModalView::Keys { groups }) = app.view().modal else {
+        panic!("no help")
+    };
+    let dimmed: Vec<String> = groups
+        .iter()
+        .flat_map(|g| g.bindings.iter())
+        .filter(|b| b.dimmed)
+        .map(|b| b.chord.clone())
+        .collect();
     // `E` because editing writes where the manifest owns; `F` because the
     // unit is healthy and there is nothing to reset. `e` opens the
     // transient and is never dimmed on a unit row.
-    assert_eq!(dimmed, vec!["D".to_string(), "F".to_string(), "E".to_string(), "M".to_string(), "U".to_string()]);
+    assert_eq!(
+        dimmed,
+        vec![
+            "D".to_string(),
+            "F".to_string(),
+            "E".to_string(),
+            "M".to_string(),
+            "U".to_string()
+        ]
+    );
 }
 
 /// A tick two seconds after `l` used to re-fetch the whole system's
@@ -1126,12 +1566,14 @@ fn a_tick_does_not_unscope_a_units_log() {
             unit: Some("sshd.service".to_string()),
             priority: masys_domain::journal::Priority::Info,
             message: "Accepted publickey".to_string(),
+            origin: masys_domain::journal::Origin::Userspace,
         },
         masys_domain::journal::Entry {
             timestamp_ms: 2,
             unit: Some("other.service".to_string()),
             priority: masys_domain::journal::Priority::Info,
             message: "unrelated".to_string(),
+            origin: masys_domain::journal::Origin::Userspace,
         },
     ];
     let (mut app, _) = units_app_with_journal(entries);
@@ -1139,7 +1581,7 @@ fn a_tick_does_not_unscope_a_units_log() {
     let scoped = journal_messages(&app);
     assert_eq!(scoped, vec!["Accepted publickey"]);
 
-    app.tick(3_000, "t".to_string()).expect("tick");
+    app.tick(3_000, "t".to_string());
     assert_eq!(journal_messages(&app), scoped, "still just this unit's log");
 }
 
@@ -1159,7 +1601,7 @@ fn journal_messages(app: &App) -> Vec<String> {
 /// Two reasons, and the first is visible: the selection highlight covers
 /// a whole list item, so a unit and its detail sharing one item lit the
 /// entire block. The second is that the cursor belongs on the *unit* -
-/// every verb in this view acts on the row under it, and a cursor parked
+/// every verb in this buffer acts on the row under it, and a cursor parked
 /// on a property line would have nothing to act on.
 #[test]
 fn an_open_units_detail_is_a_row_the_cursor_skips() {
@@ -1170,8 +1612,17 @@ fn an_open_units_detail_is_a_row_the_cursor_skips() {
     app.handle_key(Key::new(KeyCode::Enter));
 
     let selected = app.view().selected.expect("a cursor");
-    assert!(matches!(app.view().rows.get(selected), Some(Node::Unit { .. })), "the cursor stayed on the unit");
-    assert!(matches!(app.view().rows.get(selected + 1), Some(Node::UnitDetail { .. })), "the detail is the next row");
+    assert!(
+        matches!(app.view().rows.get(selected), Some(Node::Unit { .. })),
+        "the cursor stayed on the unit"
+    );
+    assert!(
+        matches!(
+            app.view().rows.get(selected + 1),
+            Some(Node::UnitDetail { .. })
+        ),
+        "the detail is the next row"
+    );
 
     // Stepping past it lands on the following unit, never on the detail.
     app.handle_key(Key::new(KeyCode::Down));
@@ -1195,16 +1646,19 @@ fn an_open_units_detail_carries_no_log() {
     app.handle_key(Key::new(KeyCode::Enter));
 
     assert!(
-        !app.view().rows.iter().any(|r| matches!(r, Node::JournalEntry(_))),
-        "no journal rows in the systemd view: {:#?}",
+        !app.view()
+            .rows
+            .iter()
+            .any(|r| matches!(r, Node::JournalEntry(_))),
+        "no journal rows in the systemd buffer: {:#?}",
         app.view().rows
     );
 }
 
 /// `l` is a drill-down, so there is a way back - and it lands on the unit
-/// you drilled from, not merely in the view you left.
+/// you drilled from, not merely in the buffer you left.
 ///
-/// `esc` rather than `q`, which quits from everywhere. The systemd view
+/// `esc` rather than `q`, which quits from everywhere. The systemd buffer
 /// remembers its own cursor anyway, but that alone is not enough: the
 /// rows are rebuilt every tick and a unit can move between them, so back
 /// means "to that unit" and not "to that row number".
@@ -1215,6 +1669,7 @@ fn esc_returns_from_the_log_to_the_unit_it_was_opened_from() {
         unit: Some("sshd.service".to_string()),
         priority: masys_domain::journal::Priority::Info,
         message: "listening".to_string(),
+        origin: masys_domain::journal::Origin::Userspace,
     }];
     let (mut app, _) = units_app_with_journal(entries);
     let from = selected_unit(&app).expect("the cursor starts on a unit");
@@ -1224,7 +1679,11 @@ fn esc_returns_from_the_log_to_the_unit_it_was_opened_from() {
 
     app.handle_key(Key::new(KeyCode::Esc));
     assert_eq!(app.buffer(), Buffer::Systemd, "esc goes back");
-    assert_eq!(selected_unit(&app).as_deref(), Some(from.as_str()), "and onto the unit it came from");
+    assert_eq!(
+        selected_unit(&app).as_deref(),
+        Some(from.as_str()),
+        "and onto the unit it came from"
+    );
 }
 
 /// Esc with nowhere to go back to does nothing, rather than jumping
@@ -1241,7 +1700,7 @@ fn esc_outside_a_drill_down_is_inert() {
 ///
 /// It has no text of its own to match - it is the row above it, spelled
 /// out - so filtering it independently dropped it, and opening a unit
-/// inside a filtered view appeared to do nothing at all.
+/// inside a filtered buffer appeared to do nothing at all.
 #[test]
 fn a_filter_that_keeps_a_unit_keeps_its_open_detail() {
     let mut app = systemd_app();
@@ -1254,8 +1713,11 @@ fn a_filter_that_keeps_a_unit_keeps_its_open_detail() {
     app.handle_key(Key::new(KeyCode::Enter));
 
     assert!(
-        app.view().rows.iter().any(|r| matches!(r, Node::UnitDetail { .. })),
-        "the detail is gone from a filtered view: {:#?}",
+        app.view()
+            .rows
+            .iter()
+            .any(|r| matches!(r, Node::UnitDetail { .. })),
+        "the detail is gone from a filtered buffer: {:#?}",
         app.view().rows
     );
 }
@@ -1271,7 +1733,14 @@ fn a_filter_that_drops_a_unit_drops_its_detail() {
 
     press(&mut app, "/");
     press(&mut app, "nosuchunit");
-    assert!(!app.view().rows.iter().any(|r| matches!(r, Node::UnitDetail { .. })), "an orphaned detail survived: {:#?}", app.view().rows);
+    assert!(
+        !app.view()
+            .rows
+            .iter()
+            .any(|r| matches!(r, Node::UnitDetail { .. })),
+        "an orphaned detail survived: {:#?}",
+        app.view().rows
+    );
 }
 
 /// Search reaches units inside folded sections.
@@ -1292,7 +1761,12 @@ fn search_finds_units_inside_folded_sections() {
 
     press(&mut app, "/");
     press(&mut app, "restic");
-    assert_eq!(units_shown(&app), 1, "the match surfaces anyway: {:#?}", app.view().rows);
+    assert_eq!(
+        units_shown(&app),
+        1,
+        "the match surfaces anyway: {:#?}",
+        app.view().rows
+    );
 }
 
 /// And clearing the filter puts the folds back rather than leaving the
@@ -1319,15 +1793,24 @@ fn clearing_a_search_restores_the_folds() {
 /// it back.
 #[test]
 fn editing_asks_first_and_then_asks_for_the_terminal() {
-    let (mut app, calls) = units_app(masys_domain::platform::Ownership::Imperative);
+    let (mut app, calls) = units_app(Some(masys_domain::platform::Ownership::Imperative));
     press(&mut app, "E");
 
-    let Some(ModalView::Confirm { prompt }) = app.view().modal else { panic!("no confirmation") };
+    let Some(ModalView::Confirm { prompt }) = app.view().modal else {
+        panic!("no confirmation")
+    };
     assert!(prompt.contains("edit sshd.service"), "{prompt}");
     assert!(calls.borrow().is_empty(), "nothing has run yet");
 
-    assert_eq!(app.handle_key(Key::char('y')), Flow::Suspend, "the session asks for the terminal back");
-    assert!(calls.borrow().is_empty(), "and still nothing has run - the caller runs it");
+    assert_eq!(
+        app.handle_key(Key::char('y')),
+        Flow::Suspend,
+        "the session asks for the terminal back"
+    );
+    assert!(
+        calls.borrow().is_empty(),
+        "and still nothing has run - the caller runs it"
+    );
 
     // What the binary does once it has restored the terminal.
     app.run_suspended();
@@ -1344,12 +1827,16 @@ fn editing_asks_first_and_then_asks_for_the_terminal() {
 /// apart without knowing what either one runs.
 #[test]
 fn an_editor_leaves_nothing_unread_because_the_operator_was_reading_it() {
-    let (mut app, calls) = units_app(masys_domain::platform::Ownership::Imperative);
+    let (mut app, calls) = units_app(Some(masys_domain::platform::Ownership::Imperative));
     press(&mut app, "E");
     app.handle_key(Key::char('y'));
 
     assert_eq!(app.run_suspended(), Aftermath::Seen);
-    assert_eq!(calls.borrow().as_slice(), ["edit sshd.service"], "the editor really ran");
+    assert_eq!(
+        calls.borrow().as_slice(),
+        ["edit sshd.service"],
+        "the editor really ran"
+    );
 }
 
 /// A refused edit is read like any other output, because there was no
@@ -1366,7 +1853,10 @@ fn an_edit_that_was_refused_leaves_its_refusal_unread() {
     let calls: Calls = Default::default();
     let system = FakeSystemService {
         snapshot: snapshot(),
-        units: vec![unit("sshd.service", masys_domain::unit::ActiveState::Active)],
+        units: vec![unit(
+            "sshd.service",
+            masys_domain::unit::ActiveState::Active,
+        )],
         calls: calls.clone(),
         fails_with: Some("Failed to edit sshd.service: Read-only file system".to_string()),
         journal: Vec::new(),
@@ -1375,22 +1865,32 @@ fn an_edit_that_was_refused_leaves_its_refusal_unread() {
         queued: Default::default(),
         proc_details: Default::default(),
         detail_queries: Default::default(),
+        units_fail_with: None,
+        sample_fail_with: None,
+        smart: None,
+        smart_reads: Default::default(),
     };
     let mut app = App::new(
         Box::new(system),
-        Box::new(Owned(masys_domain::platform::Ownership::Imperative)),
+        Box::new(Owned(Some(masys_domain::platform::Ownership::Imperative))),
         Box::new(fake::NoScanner),
         "devbox".to_string(),
     );
-    app.tick(1_000, "t".to_string()).expect("tick");
+    app.tick(1_000, "t".to_string());
     press(&mut app, "3");
     app.handle_key(Key::new(KeyCode::Down));
     press(&mut app, "E");
     app.handle_key(Key::char('y'));
 
     assert_eq!(app.run_suspended(), Aftermath::Unseen);
-    assert_eq!(calls.borrow().as_slice(), ["edit sshd.service"], "it was attempted");
-    let StatusLine::Error(message) = app.view().status else { panic!("the refusal was not held on the status line") };
+    assert_eq!(
+        calls.borrow().as_slice(),
+        ["edit sshd.service"],
+        "it was attempted"
+    );
+    let StatusLine::Error(message) = app.view().status else {
+        panic!("the refusal was not held on the status line")
+    };
     assert!(message.contains("Read-only"), "{message}");
 }
 
@@ -1398,7 +1898,7 @@ fn an_edit_that_was_refused_leaves_its_refusal_unread() {
 /// calls this unconditionally never pauses on an empty screen.
 #[test]
 fn a_suspension_that_was_never_asked_for_leaves_nothing_unread() {
-    let (mut app, calls) = units_app(masys_domain::platform::Ownership::Imperative);
+    let (mut app, calls) = units_app(Some(masys_domain::platform::Ownership::Imperative));
     assert_eq!(app.run_suspended(), Aftermath::Seen);
     assert!(calls.borrow().is_empty(), "{:?}", calls.borrow());
 }
@@ -1407,7 +1907,7 @@ fn a_suspension_that_was_never_asked_for_leaves_nothing_unread() {
 /// pressed the wrong key is a worse surprise than most.
 #[test]
 fn declining_an_edit_does_not_suspend() {
-    let (mut app, calls) = units_app(masys_domain::platform::Ownership::Imperative);
+    let (mut app, calls) = units_app(Some(masys_domain::platform::Ownership::Imperative));
     press(&mut app, "E");
     assert_eq!(app.handle_key(Key::char('n')), Flow::Continue);
     app.run_suspended();
@@ -1421,13 +1921,15 @@ fn declining_an_edit_does_not_suspend() {
 /// the guard exists to prevent.
 #[test]
 fn editing_warns_where_the_manifest_owns_the_unit() {
-    let (mut app, _) = units_app(masys_domain::platform::Ownership::Declarative {
+    let (mut app, _) = units_app(Some(masys_domain::platform::Ownership::Declarative {
         source: "configuration.nix".to_string(),
         note: "refused now - the unit directory is read-only".to_string(),
         reverted_by: "nixos-rebuild switch".to_string(),
-    });
+    }));
     press(&mut app, "E");
-    let Some(ModalView::Confirm { prompt }) = app.view().modal else { panic!("no confirmation") };
+    let Some(ModalView::Confirm { prompt }) = app.view().modal else {
+        panic!("no confirmation")
+    };
     assert!(prompt.contains("read-only"), "{prompt}");
     assert!(prompt.contains("nixos-rebuild switch"), "{prompt}");
 }
@@ -1435,12 +1937,17 @@ fn editing_warns_where_the_manifest_owns_the_unit() {
 /// And it is dimmed there, like the other two verbs the manifest owns.
 #[test]
 fn edit_dims_where_the_manifest_owns_the_unit() {
-    let (app, _) = units_app(masys_domain::platform::Ownership::Declarative {
+    let (app, _) = units_app(Some(masys_domain::platform::Ownership::Declarative {
         source: "configuration.nix".to_string(),
         note: "generated".to_string(),
         reverted_by: "nixos-rebuild switch".to_string(),
-    });
-    let edit = app.view().actions.iter().find(|b| b.chord == "E").expect("an edit key");
+    }));
+    let edit = app
+        .view()
+        .actions
+        .iter()
+        .find(|b| b.chord == "E")
+        .expect("an edit key");
     assert!(edit.dimmed, "edit is not marked as owned by the manifest");
 }
 
@@ -1454,33 +1961,47 @@ fn edit_dims_where_the_manifest_owns_the_unit() {
 /// the wrong question.
 #[test]
 fn l_on_a_timer_opens_the_log_of_what_it_runs() {
-    let mut timer = unit("nightly-backup.timer", masys_domain::unit::ActiveState::Active);
+    let mut timer = unit(
+        "nightly-backup.timer",
+        masys_domain::unit::ActiveState::Active,
+    );
     timer.kind = masys_domain::unit::UnitKind::Timer;
-    timer.timer =
-        Some(masys_domain::unit::Timer { next_ms: Some(9_000), last_ms: Some(1_000), activates: "nightly-backup.service".to_string() });
+    timer.timer = Some(masys_domain::unit::Timer {
+        next_ms: Some(9_000),
+        last_ms: Some(1_000),
+        activates: "nightly-backup.service".to_string(),
+    });
     let entries = vec![masys_domain::journal::Entry {
         timestamp_ms: 1,
         unit: Some("nightly-backup.service".to_string()),
         priority: masys_domain::journal::Priority::Info,
         message: "backup finished".to_string(),
+        origin: masys_domain::journal::Origin::Userspace,
     }];
     let (mut app, _) = app_with_units_and_journal(vec![timer], entries);
     press(&mut app, "3");
     for _ in 0..6 {
-        if matches!(app.view().rows.get(app.view().selected.unwrap_or(0)), Some(Node::Timer { .. })) {
+        if matches!(
+            app.view().rows.get(app.view().selected.unwrap_or(0)),
+            Some(Node::Timer { .. })
+        ) {
             break;
         }
         app.handle_key(Key::new(KeyCode::Down));
     }
     press(&mut app, "l");
-    assert_eq!(journal_messages(&app), vec!["backup finished"], "the job's log, not the timer's");
+    assert_eq!(
+        journal_messages(&app),
+        vec!["backup finished"],
+        "the job's log, not the timer's"
+    );
 }
 
 /// A failed fetch must not leave the previous unit's log on screen under
 /// the previous unit's name.
 ///
 /// The old code assigned entries and the scope only on success, so an
-/// error kept both - and then switched to the log view anyway. The result
+/// error kept both - and then switched to the log buffer anyway. The result
 /// was a log that belonged to whatever unit was opened last, titled after
 /// that unit, with an error line under it that most people would not read
 /// before believing the rows.
@@ -1491,6 +2012,7 @@ fn a_failed_log_fetch_does_not_show_another_units_log() {
         unit: Some("first.service".to_string()),
         priority: masys_domain::journal::Priority::Info,
         message: "from the first unit".to_string(),
+        origin: masys_domain::journal::Origin::Userspace,
     }];
     let (mut app, _) = app_with_units_and_journal(
         vec![
@@ -1518,14 +2040,25 @@ fn a_failed_log_fetch_does_not_show_another_units_log() {
         queued: Default::default(),
         proc_details: Default::default(),
         detail_queries: Default::default(),
+        units_fail_with: None,
+        sample_fail_with: None,
+        smart: None,
+        smart_reads: Default::default(),
     };
     app.replace_system(Box::new(failing));
     press(&mut app, "l");
 
-    assert!(journal_messages(&app).is_empty(), "the other unit's lines are still on screen: {:?}", journal_messages(&app));
+    assert!(
+        journal_messages(&app).is_empty(),
+        "the other unit's lines are still on screen: {:?}",
+        journal_messages(&app)
+    );
 }
 
-fn app_with_units_and_journal(units: Vec<masys_domain::unit::Unit>, journal: Vec<masys_domain::journal::Entry>) -> (App, Calls) {
+fn app_with_units_and_journal(
+    units: Vec<masys_domain::unit::Unit>,
+    journal: Vec<masys_domain::journal::Entry>,
+) -> (App, Calls) {
     let calls: Calls = Default::default();
     let system = FakeSystemService {
         snapshot: snapshot(),
@@ -1538,10 +2071,19 @@ fn app_with_units_and_journal(units: Vec<masys_domain::unit::Unit>, journal: Vec
         queued: Default::default(),
         proc_details: Default::default(),
         detail_queries: Default::default(),
+        units_fail_with: None,
+        sample_fail_with: None,
+        smart: None,
+        smart_reads: Default::default(),
     };
-    let platform = FakePlatformService { boot_pressure: None, pending_reboot: None };
-    let mut app = App::new(Box::new(system), Box::new(platform), Box::new(fake::NoScanner), "devbox".to_string());
-    app.tick(10_000, "t".to_string()).expect("tick");
+    let platform = FakePlatformService::default();
+    let mut app = App::new(
+        Box::new(system),
+        Box::new(platform),
+        Box::new(fake::NoScanner),
+        "devbox".to_string(),
+    );
+    app.tick(10_000, "t".to_string());
     (app, calls)
 }
 
@@ -1560,8 +2102,15 @@ fn a_matching_process_keeps_its_group() {
     press(&mut app, "1234");
 
     let rows = app.view().rows;
-    assert!(rows.iter().any(|r| matches!(r, Node::Proc { proc, .. } if proc.pid == 1234)), "the match survives: {rows:#?}");
-    assert!(matches!(rows.first(), Some(Node::ProcGroup { .. })), "and its group is above it: {rows:#?}");
+    assert!(
+        rows.iter()
+            .any(|r| matches!(r, Node::Proc { proc, .. } if proc.pid == 1234)),
+        "the match survives: {rows:#?}"
+    );
+    assert!(
+        matches!(rows.first(), Some(Node::ProcGroup { .. })),
+        "and its group is above it: {rows:#?}"
+    );
 }
 
 /// A group whose name matches stays even when nothing under it does -
@@ -1571,7 +2120,14 @@ fn a_matching_group_survives_without_matching_children() {
     let mut app = grouped_procs_app();
     press(&mut app, "/");
     press(&mut app, "user.slice");
-    assert!(app.view().rows.iter().any(|r| matches!(r, Node::ProcGroup { .. })), "the group is gone: {:#?}", app.view().rows);
+    assert!(
+        app.view()
+            .rows
+            .iter()
+            .any(|r| matches!(r, Node::ProcGroup { .. })),
+        "the group is gone: {:#?}",
+        app.view().rows
+    );
 }
 
 /// And a group with neither is dropped, so the buffer does not fill with
@@ -1602,10 +2158,19 @@ fn grouped_procs_app() -> App {
         queued: Default::default(),
         proc_details: Default::default(),
         detail_queries: Default::default(),
+        units_fail_with: None,
+        sample_fail_with: None,
+        smart: None,
+        smart_reads: Default::default(),
     };
-    let platform = FakePlatformService { boot_pressure: None, pending_reboot: None };
-    let mut app = App::new(Box::new(system), Box::new(platform), Box::new(fake::NoScanner), "devbox".to_string());
-    app.tick(1_000, "t".to_string()).expect("tick");
+    let platform = FakePlatformService::default();
+    let mut app = App::new(
+        Box::new(system),
+        Box::new(platform),
+        Box::new(fake::NoScanner),
+        "devbox".to_string(),
+    );
+    app.tick(1_000, "t".to_string());
     press(&mut app, "2");
     app
 }
@@ -1637,7 +2202,7 @@ fn esc_clears_a_committed_filter() {
 
 /// Escape peels one layer at a time. In a drill-down with a filter on it,
 /// the first clears the filter and the second comes back - rather than
-/// leaving the view behind with a filter still set on it.
+/// leaving the buffer behind with a filter still set on it.
 #[test]
 fn esc_peels_the_filter_before_the_drill_down() {
     let entries = vec![masys_domain::journal::Entry {
@@ -1645,6 +2210,7 @@ fn esc_peels_the_filter_before_the_drill_down() {
         unit: Some("sshd.service".to_string()),
         priority: masys_domain::journal::Priority::Info,
         message: "listening".to_string(),
+        origin: masys_domain::journal::Origin::Userspace,
     }];
     let (mut app, _) = units_app_with_journal(entries);
     press(&mut app, "l");
@@ -1664,9 +2230,9 @@ fn esc_peels_the_filter_before_the_drill_down() {
 /// to.
 ///
 /// Filters are per view, which is right for the four fixed views - but
-/// the log view's *identity* changes every time `l` names a new unit, so
+/// the log buffer's *identity* changes every time `l` names a new unit, so
 /// a filter that made sense for one unit's log carried onto the next
-/// one's and silently hid most of it. Leaving one view narrowed and
+/// one's and silently hid most of it. Leaving one buffer narrowed and
 /// coming back to it is a state you chose; arriving somewhere new already
 /// narrowed is not.
 #[test]
@@ -1677,12 +2243,14 @@ fn l_arrives_at_an_unfiltered_log() {
             unit: Some("first.service".to_string()),
             priority: masys_domain::journal::Priority::Info,
             message: "started cleanly".to_string(),
+            origin: masys_domain::journal::Origin::Userspace,
         },
         masys_domain::journal::Entry {
             timestamp_ms: 2,
             unit: Some("second.service".to_string()),
             priority: masys_domain::journal::Priority::Info,
             message: "quite different".to_string(),
+            origin: masys_domain::journal::Origin::Userspace,
         },
     ];
     let (mut app, _) = app_with_units_and_journal(
@@ -1706,65 +2274,146 @@ fn l_arrives_at_an_unfiltered_log() {
     step_onto_a_unit(&mut app);
     press(&mut app, "l");
 
-    assert_eq!(app.view().filter, None, "the previous unit's filter came along");
-    assert_eq!(journal_messages(&app), vec!["quite different"], "so every line is there");
+    assert_eq!(
+        app.view().filter,
+        None,
+        "the previous unit's filter came along"
+    );
+    assert_eq!(
+        journal_messages(&app),
+        vec!["quite different"],
+        "so every line is there"
+    );
 }
 
-/// A filter belongs to the view it was typed in.
+/// Clearing a buffer's filter is not allowed to move that buffer's cursor.
 ///
-/// The exact path this broke on: narrow the systemd view to one unit,
+/// `open_log` lifts the log's filter on every `l`, for the reason above.
+/// The cursor and the filter share one entry now, keyed on the buffer
+/// rather than on its title, so lifting a filter by removing that entry
+/// would take the cursor with it - which is why `App::clear_filter`
+/// empties the text in place.
+///
+/// This is the only one of the three sites that lift a filter where the
+/// difference shows. Going to a unit and jumping to a finding both
+/// reposition the cursor immediately afterwards, so a dropped one is
+/// invisible there; `l` leaves the log's cursor where the last visit put
+/// it, and so is where the suite stands to notice.
+#[test]
+fn reopening_a_log_keeps_the_cursor_that_was_left_in_it() {
+    let entries = (1..=8)
+        .map(|n| masys_domain::journal::Entry {
+            timestamp_ms: n,
+            unit: Some("first.service".to_string()),
+            priority: masys_domain::journal::Priority::Info,
+            message: format!("line {n}"),
+            origin: masys_domain::journal::Origin::Userspace,
+        })
+        .collect();
+    let (mut app, _) = app_with_units_and_journal(
+        vec![unit(
+            "first.service",
+            masys_domain::unit::ActiveState::Active,
+        )],
+        entries,
+    );
+    press(&mut app, "3");
+    step_onto_a_unit(&mut app);
+    press(&mut app, "l");
+    for _ in 0..3 {
+        app.handle_key(Key::new(KeyCode::Down));
+    }
+    let left_at = app.view().selected.expect("a cursor in the log");
+
+    // Leave, and open the same unit's log again.
+    press(&mut app, "3");
+    step_onto_a_unit(&mut app);
+    press(&mut app, "l");
+
+    assert_eq!(
+        app.view().selected,
+        Some(left_at),
+        "the cursor went back to the top when only the filter was cleared"
+    );
+}
+
+/// A filter belongs to the buffer it was typed in.
+///
+/// The exact path this broke on: narrow the systemd buffer to one unit,
 /// press `l`, press `/` and type. The old filter was one string shared by
-/// every view, so the new text appended to `sshd.service` and the search
-/// matched nothing - while the log view had silently been narrowed by a
+/// every buffer, so the new text appended to `sshd.service` and the search
+/// matched nothing - while the log buffer had silently been narrowed by a
 /// unit name the whole time.
 #[test]
-fn each_view_keeps_its_own_filter() {
+fn each_buffer_keeps_its_own_filter() {
     let entries = vec![masys_domain::journal::Entry {
         timestamp_ms: 1,
         unit: Some("sshd.service".to_string()),
         priority: masys_domain::journal::Priority::Info,
         message: "Accepted publickey for user".to_string(),
+        origin: masys_domain::journal::Origin::Userspace,
     }];
     let (mut app, _) = units_app_with_journal(entries);
 
     press(&mut app, "/");
     press(&mut app, "sshd");
     app.handle_key(Key::new(KeyCode::Enter));
-    assert_eq!(app.view().filter, Some("sshd"), "the systemd view is narrowed");
+    assert_eq!(
+        app.view().filter,
+        Some("sshd"),
+        "the systemd buffer is narrowed"
+    );
 
     press(&mut app, "l");
-    assert_eq!(app.view().filter, None, "the log view arrives unfiltered");
-    assert_eq!(journal_messages(&app), vec!["Accepted publickey for user"], "so every line is there");
+    assert_eq!(app.view().filter, None, "the log buffer arrives unfiltered");
+    assert_eq!(
+        journal_messages(&app),
+        vec!["Accepted publickey for user"],
+        "so every line is there"
+    );
 
     press(&mut app, "/");
     press(&mut app, "publickey");
-    assert_eq!(app.view().filter, Some("publickey"), "and typing starts from empty");
+    assert_eq!(
+        app.view().filter,
+        Some("publickey"),
+        "and typing starts from empty"
+    );
     assert_eq!(journal_messages(&app).len(), 1, "the search matches");
 
     // Commit it first: while a filter is being typed, a digit is text.
     app.handle_key(Key::new(KeyCode::Enter));
     press(&mut app, "3");
-    assert_eq!(app.view().filter, Some("sshd"), "and the systemd view still has its own");
+    assert_eq!(
+        app.view().filter,
+        Some("sshd"),
+        "and the systemd buffer still has its own"
+    );
 }
 
-/// `l` is the only way into the log view, and `esc` the way out.
+/// `l` is the only way into the log buffer, and `esc` the way out.
 ///
-/// No digit reaches it. Every other digit lands on a fixed view; this one
+/// No digit reaches it. Every other digit lands on a fixed buffer; this one
 /// would land on "whichever unit you opened last", which is a destination
 /// that depends on what you did rather than on what you pressed. It is a
 /// drill-down, and drill-downs are entered from the thing they are about.
 #[test]
-fn no_digit_reaches_the_log_view() {
+fn no_digit_reaches_the_log_buffer() {
     let entries = vec![masys_domain::journal::Entry {
         timestamp_ms: 1,
         unit: Some("sshd.service".to_string()),
         priority: masys_domain::journal::Priority::Info,
         message: "listening".to_string(),
+        origin: masys_domain::journal::Origin::Userspace,
     }];
     let (mut app, _) = units_app_with_journal(entries);
     for digit in ["1", "2", "3", "4", "5"] {
         press(&mut app, digit);
-        assert_ne!(app.buffer(), Buffer::Log, "`{digit}` reached the log view");
+        assert_ne!(
+            app.buffer(),
+            Buffer::Log,
+            "`{digit}` reached the log buffer"
+        );
     }
 
     press(&mut app, "3");
@@ -1796,37 +2445,54 @@ fn a_failed_units_reason_is_its_own_output_not_systemds() {
                 unit: Some("broken.service".to_string()),
                 priority: masys_domain::journal::Priority::Error,
                 message: "curl: (6) Could not resolve host".to_string(),
+                origin: masys_domain::journal::Origin::Userspace,
             },
             masys_domain::journal::Entry {
                 timestamp_ms: 2,
                 unit: Some("init.scope".to_string()),
                 priority: masys_domain::journal::Priority::Error,
                 message: "broken.service: Failed with result 'exit-code'.".to_string(),
+                origin: masys_domain::journal::Origin::Userspace,
             },
         ],
         journal_queries: Default::default(),
         queued: Default::default(),
         proc_details: Default::default(),
         detail_queries: Default::default(),
+        units_fail_with: None,
+        sample_fail_with: None,
+        smart: None,
+        smart_reads: Default::default(),
     };
     let mut app = App::new(
         Box::new(system),
-        Box::new(Owned(masys_domain::platform::Ownership::Imperative)),
+        Box::new(Owned(Some(masys_domain::platform::Ownership::Imperative))),
         Box::new(fake::NoScanner),
         "devbox".to_string(),
     );
-    app.tick(1_000, "t".to_string()).expect("tick");
+    app.tick(1_000, "t".to_string());
 
     let reason = app
         .view()
         .rows
         .iter()
         .find_map(|r| match r {
-            Node::Finding(masys_domain::finding::Finding::FailedUnit { reason, .. }) => Some(reason.clone()),
+            Node::Finding {
+                finding:
+                    masys_domain::Finding {
+                        kind: masys_domain::finding::FindingKind::FailedUnit { reason, .. },
+                        ..
+                    },
+                ..
+            } => Some(reason.clone()),
             _ => None,
         })
         .expect("a failed-unit finding");
-    assert_eq!(reason, Some("curl: (6) Could not resolve host".to_string()), "systemd's own 'Failed with result' is not the reason");
+    assert_eq!(
+        reason,
+        Some("curl: (6) Could not resolve host".to_string()),
+        "systemd's own 'Failed with result' is not the reason"
+    );
 }
 
 /// systemd keeps a unit failed until something resets it, which is what
@@ -1837,7 +2503,10 @@ fn reset_failed_reaches_the_port() {
     let (mut app, calls) = failed_units_app();
     press(&mut app, "F");
     press(&mut app, "y");
-    assert_eq!(*calls.borrow(), vec!["reset-failed broken.service".to_string()]);
+    assert_eq!(
+        *calls.borrow(),
+        vec!["reset-failed broken.service".to_string()]
+    );
 }
 
 /// It only makes sense on a unit that has actually failed - so on a
@@ -1845,15 +2514,25 @@ fn reset_failed_reaches_the_port() {
 /// ownership guard follows.
 #[test]
 fn reset_failed_dims_on_a_unit_that_has_not_failed() {
-    let (mut app, _) = units_app(masys_domain::platform::Ownership::Imperative);
+    let (mut app, _) = units_app(Some(masys_domain::platform::Ownership::Imperative));
     // units_app's single unit is Active.
-    let dimmed = app.view().actions.iter().find(|b| b.chord == "F").map(|b| b.dimmed);
+    let dimmed = app
+        .view()
+        .actions
+        .iter()
+        .find(|b| b.chord == "F")
+        .map(|b| b.dimmed);
     assert_eq!(dimmed, Some(true), "nothing to reset on a healthy unit");
 
     // And lit where there is something to clear.
     let (app2, _) = failed_units_app();
     let _ = &mut app;
-    let dimmed = app2.view().actions.iter().find(|b| b.chord == "F").map(|b| b.dimmed);
+    let dimmed = app2
+        .view()
+        .actions
+        .iter()
+        .find(|b| b.chord == "F")
+        .map(|b| b.dimmed);
     assert_eq!(dimmed, Some(false), "the failed unit can be reset");
 }
 
@@ -1861,10 +2540,19 @@ fn reset_failed_dims_on_a_unit_that_has_not_failed() {
 /// restarted, and only the verb that needs a failure is marked.
 #[test]
 fn only_reset_failed_dims_for_a_healthy_unit() {
-    let (app, _) = units_app(masys_domain::platform::Ownership::Imperative);
+    let (app, _) = units_app(Some(masys_domain::platform::Ownership::Imperative));
     for chord in ["r", "S", "X", "l"] {
-        let dimmed = app.view().actions.iter().find(|b| b.chord == chord).map(|b| b.dimmed);
-        assert_eq!(dimmed, Some(false), "{chord} must stay lit on a healthy unit");
+        let dimmed = app
+            .view()
+            .actions
+            .iter()
+            .find(|b| b.chord == chord)
+            .map(|b| b.dimmed);
+        assert_eq!(
+            dimmed,
+            Some(false),
+            "{chord} must stay lit on a healthy unit"
+        );
     }
 }
 
@@ -1883,14 +2571,18 @@ fn failed_units_app() -> (App, Calls) {
         queued: Default::default(),
         proc_details: Default::default(),
         detail_queries: Default::default(),
+        units_fail_with: None,
+        sample_fail_with: None,
+        smart: None,
+        smart_reads: Default::default(),
     };
     let mut app = App::new(
         Box::new(system),
-        Box::new(Owned(masys_domain::platform::Ownership::Imperative)),
+        Box::new(Owned(Some(masys_domain::platform::Ownership::Imperative))),
         Box::new(fake::NoScanner),
         "devbox".to_string(),
     );
-    app.tick(1_000, "t".to_string()).expect("tick");
+    app.tick(1_000, "t".to_string());
     press(&mut app, "3");
     app.handle_key(Key::new(KeyCode::Down));
     (app, calls)
@@ -1901,7 +2593,7 @@ fn failed_units_app() -> (App, Calls) {
 /// keymap never had it, and the port could not express it.
 #[test]
 fn masking_reaches_the_port() {
-    let (mut app, calls) = units_app(masys_domain::platform::Ownership::Imperative);
+    let (mut app, calls) = units_app(Some(masys_domain::platform::Ownership::Imperative));
     press(&mut app, "M");
     press(&mut app, "y");
     assert_eq!(*calls.borrow(), vec!["mask sshd.service".to_string()]);
@@ -1909,7 +2601,7 @@ fn masking_reaches_the_port() {
 
 #[test]
 fn unmasking_reaches_the_port() {
-    let (mut app, calls) = units_app(masys_domain::platform::Ownership::Imperative);
+    let (mut app, calls) = units_app(Some(masys_domain::platform::Ownership::Imperative));
     press(&mut app, "U");
     press(&mut app, "y");
     assert_eq!(*calls.borrow(), vec!["unmask sshd.service".to_string()]);
@@ -1920,13 +2612,15 @@ fn unmasking_reaches_the_port() {
 /// operator learns before pressing the key that a rebuild will undo it.
 #[test]
 fn masking_warns_where_the_manifest_owns_the_unit() {
-    let (mut app, _) = units_app(masys_domain::platform::Ownership::Declarative {
+    let (mut app, _) = units_app(Some(masys_domain::platform::Ownership::Declarative {
         source: "configuration.nix".to_string(),
         note: "refused now - the unit directory is read-only".to_string(),
         reverted_by: "nixos-rebuild switch".to_string(),
-    });
+    }));
     press(&mut app, "M");
-    let Some(ModalView::Confirm { prompt }) = app.view().modal else { panic!("no confirmation") };
+    let Some(ModalView::Confirm { prompt }) = app.view().modal else {
+        panic!("no confirmation")
+    };
     assert!(prompt.contains("mask sshd.service"), "{prompt}");
     assert!(prompt.contains("read-only"), "{prompt}");
     assert!(prompt.contains("configuration.nix"), "{prompt}");
@@ -1937,10 +2631,13 @@ fn masking_warns_where_the_manifest_owns_the_unit() {
 /// ownership guard has nothing to say about it.
 #[test]
 fn try_restart_reaches_the_port() {
-    let (mut app, calls) = units_app(masys_domain::platform::Ownership::Imperative);
+    let (mut app, calls) = units_app(Some(masys_domain::platform::Ownership::Imperative));
     app.handle_key(Key::alt(KeyCode::Char('r')));
     press(&mut app, "y");
-    assert_eq!(*calls.borrow(), vec!["try-restart sshd.service".to_string()]);
+    assert_eq!(
+        *calls.borrow(),
+        vec!["try-restart sshd.service".to_string()]
+    );
 }
 
 /// Reload has been on the port since the domain crate landed and was
@@ -1948,28 +2645,31 @@ fn try_restart_reaches_the_port() {
 /// configuration without dropping its connections was unreachable.
 #[test]
 fn reloading_reaches_the_port() {
-    let (mut app, calls) = units_app(masys_domain::platform::Ownership::Imperative);
+    let (mut app, calls) = units_app(Some(masys_domain::platform::Ownership::Imperative));
     press(&mut app, "R");
     press(&mut app, "y");
     assert_eq!(*calls.borrow(), vec!["reload sshd.service".to_string()]);
 }
 
 /// The loop wakes four times a second while a log is open, and needs to
-/// know when that is - "which view is open" is the app's to answer, the
+/// know when that is - "which buffer is open" is the app's to answer, the
 /// same reason `wants_refresh` is asked rather than assumed.
 #[test]
 fn the_session_follows_only_while_a_log_is_open() {
     let (mut app, _) = units_app_with_journal(vec![entry_at(1_779_174_000_000, "before")]);
-    assert!(!app.following(), "the systemd view is not a log");
+    assert!(!app.following(), "the systemd buffer is not a log");
 
     press(&mut app, "l");
     assert!(app.following(), "and this one is");
 
     app.handle_key(Key::new(KeyCode::Esc));
-    assert!(!app.following(), "back out, and the fast poll stops with it");
+    assert!(
+        !app.following(),
+        "back out, and the fast poll stops with it"
+    );
 }
 
-/// A line appended after the view opened appears without waiting for the
+/// A line appended after the buffer opened appears without waiting for the
 /// tick - the whole point of following.
 #[test]
 fn a_line_appended_while_watching_appears() {
@@ -1981,9 +2681,16 @@ fn a_line_appended_while_watching_appears() {
     assert!(!app.follow_log(), "nothing new, nothing redrawn");
     assert_eq!(log_messages(&app), vec!["before".to_string()]);
 
-    *appended.borrow_mut() = Some(vec![entry_at(1_779_174_000_000, "before"), entry_at(1_786_950_060_000, "after")]);
+    *appended.borrow_mut() = Some(vec![
+        entry_at(1_779_174_000_000, "before"),
+        entry_at(1_786_950_060_000, "after"),
+    ]);
     assert!(app.follow_log(), "something arrived");
-    assert_eq!(log_messages(&app), vec!["after".to_string(), "before".to_string()], "newest first, as the view reads");
+    assert_eq!(
+        log_messages(&app),
+        vec!["after".to_string(), "before".to_string()],
+        "newest first, as the buffer reads"
+    );
 }
 
 /// The same fixture, with the fake's "arrived since you last looked" slot
@@ -1998,7 +2705,10 @@ fn units_app_following(journal: Vec<masys_domain::journal::Entry>) -> (App, Appe
     let appended: Appended = Default::default();
     let system = FakeSystemService {
         snapshot: snapshot(),
-        units: vec![unit("sshd.service", masys_domain::unit::ActiveState::Active)],
+        units: vec![unit(
+            "sshd.service",
+            masys_domain::unit::ActiveState::Active,
+        )],
         calls: Default::default(),
         fails_with: None,
         journal,
@@ -2007,14 +2717,18 @@ fn units_app_following(journal: Vec<masys_domain::journal::Entry>) -> (App, Appe
         queued: Default::default(),
         proc_details: Default::default(),
         detail_queries: Default::default(),
+        units_fail_with: None,
+        sample_fail_with: None,
+        smart: None,
+        smart_reads: Default::default(),
     };
     let mut app = App::new(
         Box::new(system),
-        Box::new(Owned(masys_domain::platform::Ownership::Imperative)),
+        Box::new(Owned(Some(masys_domain::platform::Ownership::Imperative))),
         Box::new(fake::NoScanner),
         "devbox".to_string(),
     );
-    app.tick(1_000, "t".to_string()).expect("tick");
+    app.tick(1_000, "t".to_string());
     press(&mut app, "3");
     app.handle_key(Key::new(KeyCode::Down));
     (app, appended)
@@ -2025,11 +2739,14 @@ fn units_app_following(journal: Vec<masys_domain::journal::Entry>) -> (App, Appe
 /// closeable - the same rule the buffer escape ladder follows.
 #[test]
 fn escape_closes_the_transient_and_leaves_the_buffer_alone() {
-    let (mut app, calls) = units_app(masys_domain::platform::Ownership::Imperative);
+    let (mut app, calls) = units_app(Some(masys_domain::platform::Ownership::Imperative));
     let before = app.view().selected;
 
     press(&mut app, "e");
-    assert!(matches!(app.view().modal, Some(ModalView::Transient { .. })), "it opened");
+    assert!(
+        matches!(app.view().modal, Some(ModalView::Transient { .. })),
+        "it opened"
+    );
 
     app.handle_key(Key::new(KeyCode::Esc));
     assert!(app.view().modal.is_none(), "and closed");
@@ -2042,15 +2759,25 @@ fn escape_closes_the_transient_and_leaves_the_buffer_alone() {
 /// run something you cannot see.
 #[test]
 fn a_transient_swallows_keys_the_buffer_would_have_taken() {
-    let (mut app, _) = units_app(masys_domain::platform::Ownership::Imperative);
+    let (mut app, _) = units_app(Some(masys_domain::platform::Ownership::Imperative));
     press(&mut app, "e");
 
     // `3` opens the systemd buffer and `q` quits, from anywhere - except
     // under a popup.
     press(&mut app, "2");
-    assert!(matches!(app.view().modal, Some(ModalView::Transient { .. })), "still open");
-    assert_eq!(app.handle_key(Key::char('q')), Flow::Continue, "and `q` did not quit");
-    assert!(matches!(app.view().modal, Some(ModalView::Transient { .. })), "still open");
+    assert!(
+        matches!(app.view().modal, Some(ModalView::Transient { .. })),
+        "still open"
+    );
+    assert_eq!(
+        app.handle_key(Key::char('q')),
+        Flow::Continue,
+        "and `q` did not quit"
+    );
+    assert!(
+        matches!(app.view().modal, Some(ModalView::Transient { .. })),
+        "still open"
+    );
 }
 
 /// Dispatching closes the transient before the action runs, so the
@@ -2058,11 +2785,13 @@ fn a_transient_swallows_keys_the_buffer_would_have_taken() {
 /// rather than through a popup still covering them.
 #[test]
 fn dispatching_a_row_closes_the_transient_before_the_action_runs() {
-    let (mut app, calls) = units_app(masys_domain::platform::Ownership::Imperative);
+    let (mut app, calls) = units_app(Some(masys_domain::platform::Ownership::Imperative));
     press(&mut app, "e");
     press(&mut app, "s");
 
-    let Some(ModalView::Confirm { prompt }) = app.view().modal else { panic!("the transient gave way to a confirmation") };
+    let Some(ModalView::Confirm { prompt }) = app.view().modal else {
+        panic!("the transient gave way to a confirmation")
+    };
     assert!(prompt.contains("start sshd.service"), "{prompt}");
 
     press(&mut app, "y");
@@ -2075,29 +2804,45 @@ fn dispatching_a_row_closes_the_transient_before_the_action_runs() {
 /// its dim rows would make the mark mean something the design never said.
 #[test]
 fn a_marked_row_still_runs() {
-    let (mut app, calls) = units_app(masys_domain::platform::Ownership::Declarative {
+    let (mut app, calls) = units_app(Some(masys_domain::platform::Ownership::Declarative {
         source: "configuration.nix".to_string(),
         note: "generated from configuration".to_string(),
         reverted_by: "nixos-rebuild switch".to_string(),
-    });
+    }));
     press(&mut app, "e");
-    let Some(ModalView::Transient { groups, .. }) = app.view().modal else { panic!("no transient") };
-    assert!(groups.iter().flat_map(|g| &g.rows).find(|r| r.chord == 'e').is_some_and(|r| r.dimmed), "enable is marked on this host");
+    let Some(ModalView::Transient { groups, .. }) = app.view().modal else {
+        panic!("no transient")
+    };
+    assert!(
+        groups
+            .iter()
+            .flat_map(|g| &g.rows)
+            .find(|r| r.chord == 'e')
+            .is_some_and(|r| r.dimmed),
+        "enable is marked on this host"
+    );
 
     press(&mut app, "e");
     press(&mut app, "y");
-    assert_eq!(*calls.borrow(), vec!["enable sshd.service".to_string()], "and ran anyway");
+    assert_eq!(
+        *calls.borrow(),
+        vec!["enable sshd.service".to_string()],
+        "and ran anyway"
+    );
 }
 
 /// A chord the definition does not bind does nothing and leaves the popup
 /// open, rather than closing it on a typo.
 #[test]
 fn an_unbound_chord_leaves_the_transient_open() {
-    let (mut app, calls) = units_app(masys_domain::platform::Ownership::Imperative);
+    let (mut app, calls) = units_app(Some(masys_domain::platform::Ownership::Imperative));
     press(&mut app, "e");
     press(&mut app, "z");
 
-    assert!(matches!(app.view().modal, Some(ModalView::Transient { .. })), "still open");
+    assert!(
+        matches!(app.view().modal, Some(ModalView::Transient { .. })),
+        "still open"
+    );
     assert!(calls.borrow().is_empty(), "and nothing ran");
 }
 
@@ -2106,22 +2851,374 @@ fn an_unbound_chord_leaves_the_transient_open() {
 /// `crate::buffer` makes about a digit with no buffer behind it.
 #[test]
 fn a_row_with_no_transient_opens_nothing() {
-    let (mut app, _) = units_app(masys_domain::platform::Ownership::Imperative);
+    let (mut app, _) = units_app(Some(masys_domain::platform::Ownership::Imperative));
     // Back onto the section header the cursor started above.
     app.handle_key(Key::new(KeyCode::Up));
     press(&mut app, "e");
 
-    assert!(app.view().modal.is_none(), "no popup, and no empty one either");
+    assert!(
+        app.view().modal.is_none(),
+        "no popup, and no empty one either"
+    );
 }
 
 /// The popup lists the design's groups in the design's order: what runs
 /// now, what survives a reboot, what to look at.
 #[test]
 fn the_unit_popup_lists_the_designs_groups_in_order() {
-    let (mut app, _) = units_app(masys_domain::platform::Ownership::Imperative);
+    let (mut app, _) = units_app(Some(masys_domain::platform::Ownership::Imperative));
     press(&mut app, "e");
-    let Some(ModalView::Transient { groups, .. }) = app.view().modal else { panic!("no transient") };
+    let Some(ModalView::Transient { groups, .. }) = app.view().modal else {
+        panic!("no transient")
+    };
 
-    assert_eq!(groups.iter().map(|g| g.heading.as_str()).collect::<Vec<_>>(), vec!["Runtime", "Persistence", "Inspect"]);
-    assert_eq!(groups[0].rows.iter().map(|r| r.label).collect::<Vec<_>>(), vec!["start", "stop", "restart", "reload"]);
+    assert_eq!(
+        groups
+            .iter()
+            .map(|g| g.heading.as_str())
+            .collect::<Vec<_>>(),
+        vec!["Runtime", "Persistence", "Inspect"]
+    );
+    assert_eq!(
+        groups[0].rows.iter().map(|r| r.label).collect::<Vec<_>>(),
+        vec!["start", "stop", "restart", "reload"]
+    );
+}
+
+/// A `unit_ownership` read that **failed** marks the persistence verbs,
+/// rather than drawing them live.
+///
+/// The footer used to ask `.ok().is_some_and(|o| matches!(o, Declarative))`,
+/// which lands a failed read on `false` - indistinguishable from a host
+/// that answered `Imperative`. `D`, `M` and `U` were then drawn bright,
+/// telling the operator their disable would stick. Nobody measured that,
+/// and it is the one failure this codebase has corrected most often: a
+/// read that failed degrading into a confident answer.
+///
+/// Marked rather than left bright is the narrower claim of the two. masys
+/// cannot promise the change *will* hold, and the popup one keypress away
+/// says why - `persistence unknown`, under `! could not read who owns
+/// this unit`.
+#[test]
+fn a_failed_ownership_read_marks_the_persistence_verbs() {
+    let (app, _) = units_app(None);
+    let dimming = action_dimming(&app);
+
+    for chord in ["D", "M", "U", "E"] {
+        let dimmed = dimming.iter().find(|(c, _)| c == chord).map(|(_, d)| *d);
+        assert_eq!(
+            dimmed,
+            Some(true),
+            "{chord} must be marked when masys could not read who owns the unit: {dimming:?}"
+        );
+    }
+    // And still listed. A key that vanished would take the question with
+    // it, where a marked one leaves the operator somewhere to look.
+    assert!(dimming.iter().any(|(chord, _)| chord == "D"), "{dimming:?}");
+}
+
+/// The same host, read successfully as imperative: the verbs are live.
+///
+/// The pair is the point. Without it, marking everything would pass the
+/// test above and say nothing.
+#[test]
+fn a_unit_nothing_else_owns_keeps_its_persistence_verbs_live() {
+    let (app, _) = units_app(Some(masys_domain::platform::Ownership::Imperative));
+    let dimming = action_dimming(&app);
+
+    for chord in ["D", "M", "U", "E"] {
+        let dimmed = dimming.iter().find(|(c, _)| c == chord).map(|(_, d)| *d);
+        assert_eq!(
+            dimmed,
+            Some(false),
+            "{chord} sticks on an imperative host: {dimming:?}"
+        );
+    }
+}
+
+/// `n` and `p` jump between headings, and which rows count as one is a
+/// fact about the row - the same argument that put `selectable` on `Node`.
+/// Asserted here because `App::jump_section` is the only consumer; the
+/// exhaustiveness itself is the compiler's job, not this test's.
+#[test]
+fn a_section_header_and_a_proc_group_are_the_headings_n_jumps_to() {
+    assert!(
+        Node::SectionHeader {
+            title: "units".to_string(),
+            kind: masys_view::SectionKind::Units,
+            count: None,
+        }
+        .heading()
+    );
+    assert!(
+        Node::ProcGroup {
+            name: "chrome".to_string(),
+            depth: 0,
+            expanded: false,
+            cpu_percent: 0.0,
+            mem_bytes: 0,
+            read_bytes_per_sec: 0.0,
+            write_bytes_per_sec: 0.0,
+            proc_count: 3,
+        }
+        .heading()
+    );
+    // Structure, but not a heading: `n` passes over it.
+    assert!(!Node::Spacer.heading());
+}
+
+/// `i` orders Procs by what is hitting the disk, worst-first.
+///
+/// The third measured column, beside `c` and `m`. It reverses on a second
+/// press like the other two, because a column header that behaved
+/// differently from its neighbours would be a rule with an exception and
+/// no reason for one.
+#[test]
+fn i_sorts_by_io_and_reverses_like_the_others() {
+    let mut app = procs_app();
+    press(&mut app, "i");
+    assert_eq!(
+        sort_marker(&app),
+        ("io".to_string(), true),
+        "io starts worst-first, like cpu and memory"
+    );
+    press(&mut app, "i");
+    assert_eq!(
+        sort_marker(&app),
+        ("io".to_string(), false),
+        "and the same key again reverses"
+    );
+}
+
+/// `i` is the Procs sort and does not reach the Nix buffer's inputs menu.
+///
+/// The two share a letter, kept apart by `owner` the way `a` and `c`
+/// already are. Asserted because a letter doing two things in two buffers
+/// is exactly what the keymap's protected set exists to prevent from
+/// happening by accident.
+#[test]
+fn the_io_sort_belongs_to_procs_alone() {
+    let mut app = procs_app();
+    press(&mut app, "i");
+    assert_eq!(sort_marker(&app), ("io".to_string(), true));
+}
+
+/// A host sampled twice, so a rate exists for whatever moved between the
+/// two samples and no rate at all for a pid that only appears in the
+/// second. Each entry is `(pid, comm, cgroup, io_read_bytes)`.
+///
+/// The one fixture behind the three tests below, which differ only in
+/// how the processes are grouped and which rows the assertion reads.
+/// They were three copies of it, which is the shape `unmeasured_last`
+/// was extracted to stop.
+fn host_sampled_twice(first: &[(u32, &str, &str, u64)], second: &[(u32, &str, &str, u64)]) -> App {
+    let procs = |rows: &[(u32, &str, &str, u64)]| {
+        rows.iter()
+            .map(|(pid, comm, cgroup, read)| masys_domain::sample::Proc {
+                pid: *pid,
+                comm: comm.to_string(),
+                cgroup: Some(cgroup.to_string()),
+                cpu_ticks: 0,
+                rss_bytes: 1_000,
+                io_read_bytes: *read,
+                io_write_bytes: 0,
+                state: masys_domain::sample::ProcState::Running,
+                nice: 0,
+                oom_score: 0,
+                threads: 1,
+                started_at_ms: 0,
+            })
+            .collect()
+    };
+    let mut one = snapshot();
+    one.taken_at_ms = 0;
+    one.procs = procs(first);
+    let mut two = snapshot();
+    two.taken_at_ms = 1_000;
+    two.procs = procs(second);
+
+    let mut app = App::new(
+        Box::new(FakeSystemService::returning(vec![one, two])),
+        Box::new(FakePlatformService::default()),
+        Box::new(fake::NoScanner),
+        "devbox".to_string(),
+    );
+    app.tick(1_000, "t".to_string());
+    app.tick(2_000, "t".to_string());
+    press(&mut app, "2");
+    app
+}
+
+fn group_order(app: &App) -> Vec<String> {
+    app.view()
+        .rows
+        .iter()
+        .filter_map(|row| match row {
+            masys_view::Node::ProcGroup { name, .. } => Some(name.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn member_order(app: &App) -> Vec<String> {
+    app.view()
+        .rows
+        .iter()
+        .filter_map(|row| match row {
+            masys_view::Node::Proc { proc, .. } => Some(proc.comm.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// **A process nothing has measured is not sorted as an idle one.**
+///
+/// `rate_of` answers `None` until two samples exist for a pid, so a
+/// process that appeared this tick has no io rate. Treating that as a
+/// rate of zero would file it among the processes masys knows are idle -
+/// a claim about a reading it has not taken, which is the thing
+/// `masys_domain::rate::derive` states its own `None` exists to avoid.
+///
+/// Unmeasured sorts last in *both* directions, because last is not a
+/// rank here: it is where the rows with no answer wait.
+#[test]
+fn a_process_with_no_io_rate_yet_sorts_last_either_way() {
+    // A cgroup each, so this is the ordering *between* groups.
+    let mut app = host_sampled_twice(
+        &[(101, "busy", "/system.slice/busy.service", 0)],
+        &[
+            (101, "busy", "/system.slice/busy.service", 500_000_000),
+            (202, "newcomer", "/system.slice/newcomer.service", 0),
+        ],
+    );
+
+    press(&mut app, "i");
+    let descending = group_order(&app);
+    assert!(
+        descending.first().is_some_and(|n| n.contains("busy")),
+        "the measured group leads: {descending:?}"
+    );
+    assert!(
+        descending.last().is_some_and(|n| n.contains("newcomer")),
+        "and the unmeasured one waits at the end: {descending:?}"
+    );
+
+    // Reversed, the *measured* order flips - and the unmeasured group
+    // stays last, because it never had a rank to reverse.
+    press(&mut app, "i");
+    let ascending = group_order(&app);
+    assert!(
+        ascending.last().is_some_and(|n| n.contains("newcomer")),
+        "still last, not promoted to 'least io': {ascending:?}"
+    );
+}
+
+/// **And the same rule inside a group.**
+///
+/// Procs sorts twice: once to order the groups, once to order the
+/// processes within each. The rule is the same both times and used to be
+/// written out twice, one copy per tiebreak - so a break in the shared
+/// comparator has to fail both, and only the group test existed to fail.
+#[test]
+fn a_process_with_no_io_rate_yet_sorts_last_inside_its_group_too() {
+    // One cgroup between them, which is the whole difference from the
+    // test above: it moves the assertion onto `Proc` rows.
+    let mut app = host_sampled_twice(
+        &[(101, "busy", "/system.slice/app.service", 0)],
+        &[
+            (101, "busy", "/system.slice/app.service", 500_000_000),
+            (202, "newcomer", "/system.slice/app.service", 0),
+        ],
+    );
+
+    press(&mut app, "i");
+    assert_eq!(
+        member_order(&app),
+        vec!["busy".to_string(), "newcomer".to_string()],
+        "the measured process leads and the unmeasured one waits at the end"
+    );
+
+    press(&mut app, "i");
+    let ascending = member_order(&app);
+    assert_eq!(
+        ascending.last(),
+        Some(&"newcomer".to_string()),
+        "still last reversed, not promoted to 'least io': {ascending:?}"
+    );
+}
+
+/// **Two rows with no answer settle by the tiebreak, not by luck.**
+///
+/// The comparator's fourth arm, and the one neither test above reaches:
+/// both of them have exactly one unmeasured row, so `(None, None)` never
+/// comes up and returning `Ordering::Equal` there would pass them.
+///
+/// Equal is not good enough. It leaves the order to however the rows
+/// arrived, and the rows arrive in sample order - which is kernel order,
+/// and shuffles between ticks. Two unmeasured processes would swap places
+/// under the cursor for no reason anybody could see. The pids here are
+/// deliberately the reverse of the order they are sampled in, so an
+/// implementation that kept sample order fails.
+#[test]
+fn two_processes_with_no_io_rate_settle_by_pid() {
+    let mut app = host_sampled_twice(
+        &[(101, "measured", "/system.slice/app.service", 0)],
+        &[
+            (101, "measured", "/system.slice/app.service", 500_000_000),
+            (303, "later-pid", "/system.slice/app.service", 0),
+            (202, "earlier-pid", "/system.slice/app.service", 0),
+        ],
+    );
+
+    press(&mut app, "i");
+    assert_eq!(
+        member_order(&app),
+        vec![
+            "measured".to_string(),
+            "earlier-pid".to_string(),
+            "later-pid".to_string()
+        ],
+        "the measured one leads, and the two with no answer settle by pid \
+         rather than by the order the kernel happened to list them"
+    );
+}
+
+/// **A SMART row is findable by the word an operator would type.**
+///
+/// `filter.rs` states the invariant this pins: its strings "mirror what
+/// `masys_render::view` prints for each variant", because searching for
+/// what is on the screen has to work. The first version of this row
+/// mirrored it inexactly - the screen said "disk smart self-assessment
+/// failing" and the search text omitted "disk" - so typing the first word
+/// of the row filtered the row away.
+#[test]
+fn a_failing_smart_row_is_found_by_what_the_screen_says() {
+    for typed in ["disk", "smart", "failing"] {
+        let mut system = FakeSystemService::returning(vec![snapshot()]);
+        system.smart = Some(false);
+        let mut app = App::new(
+            Box::new(system),
+            Box::new(FakePlatformService::default()),
+            Box::new(fake::NoScanner),
+            "devbox".to_string(),
+        );
+        app.tick(10_000, "t".to_string());
+
+        press(&mut app, "/");
+        press(&mut app, typed);
+
+        assert!(
+            app.view().rows.iter().any(|r| matches!(
+                r,
+                Node::Finding {
+                    finding: masys_domain::Finding {
+                        kind: masys_domain::finding::FindingKind::SmartFailing,
+                        ..
+                    },
+                    ..
+                }
+            )),
+            "typing {typed:?} must not hide the row that shows it"
+        );
+    }
 }

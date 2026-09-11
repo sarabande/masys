@@ -18,7 +18,12 @@ use crate::links::{generation_id, version_label};
 /// no home-manager and no channels is reported. `booted` is the resolved
 /// `/run/booted-system`, or `None` for a profile where the concept does
 /// not apply.
-pub fn read_profile(kind: ProfileKind, dir: &Path, prefix: &str, booted: Option<&str>) -> Result<Option<Profile>, MasysError> {
+pub fn read_profile(
+    kind: ProfileKind,
+    dir: &Path,
+    prefix: &str,
+    booted: Option<&str>,
+) -> Result<Option<Profile>, MasysError> {
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -32,10 +37,17 @@ pub fn read_profile(kind: ProfileKind, dir: &Path, prefix: &str, booted: Option<
     let current_target = std::fs::canonicalize(dir.join(prefix)).ok();
 
     let mut generations = Vec::new();
-    for entry in entries.flatten() {
+    for entry in entries {
+        // Not `flatten()`: this is a *count* as much as a list - the Nix
+        // buffer reports how many generations there are and boot_pressure
+        // is derived from it - so an entry that could not be read makes
+        // the total wrong rather than shorter, and silently.
+        let entry = entry.map_err(MasysError::Io)?;
         let name = entry.file_name();
         let Some(name) = name.to_str() else { continue };
-        let Some(id) = generation_id(name, prefix) else { continue };
+        let Some(id) = generation_id(name, prefix) else {
+            continue;
+        };
 
         let link = entry.path();
         let resolved = std::fs::canonicalize(&link).ok();
@@ -54,7 +66,9 @@ pub fn read_profile(kind: ProfileKind, dir: &Path, prefix: &str, booted: Option<
             .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
             .map(|since| since.as_millis() as u64);
 
-        let kernel = std::fs::read_link(link.join("kernel")).ok().map(|p| p.to_string_lossy().to_string());
+        let kernel = std::fs::read_link(link.join("kernel"))
+            .ok()
+            .map(|p| p.to_string_lossy().to_string());
 
         generations.push(Generation {
             id,
@@ -66,12 +80,18 @@ pub fn read_profile(kind: ProfileKind, dir: &Path, prefix: &str, booted: Option<
             // profile pointer itself could not be resolved. `.zip` refuses
             // to pair a `None` with anything, so two failed reads can
             // never fabricate a match the way a bare `==` would.
-            current: resolved.as_ref().zip(current_target.as_ref()).is_some_and(|(a, b)| a == b),
+            current: resolved
+                .as_ref()
+                .zip(current_target.as_ref())
+                .is_some_and(|(a, b)| a == b),
             // Both sides must be a real, resolved store path before they
             // can be said to match - `store_path` is `None` for a
             // dangling generation, and `.zip` refuses to pair a `None`
             // with anything, so an unknown never counts as booted.
-            booted: store_path.as_deref().zip(booted).is_some_and(|(path, booted)| path == booted),
+            booted: store_path
+                .as_deref()
+                .zip(booted)
+                .is_some_and(|(path, booted)| path == booted),
             store_path,
             kernel,
         });
@@ -88,7 +108,12 @@ pub fn read_profile(kind: ProfileKind, dir: &Path, prefix: &str, booted: Option<
     // exactly that one file and `/nix/var/nix/profiles/bin` is absent.
     // `prefix` is already the symlink's name for all three kinds:
     // `system`, `profile` and `channels`.
-    Ok(Some(Profile { kind, path: dir.join(prefix).to_string_lossy().to_string(), writable: writable(dir), generations }))
+    Ok(Some(Profile {
+        kind,
+        path: dir.join(prefix).to_string_lossy().to_string(),
+        writable: writable(dir),
+        generations,
+    }))
 }
 
 /// Whether this process could write `dir`: the check `nix-env
@@ -120,6 +145,25 @@ pub fn read_profile(kind: ProfileKind, dir: &Path, prefix: &str, booted: Option<
 /// `EACCES` and `EROFS` are answers - the bits say no, or the filesystem
 /// is mounted read-only - and everything else is the check failing, which
 /// must not be reported as either permission or its absence.
+/// Whether a path is this process's to write, for the elevation
+/// decision.
+///
+/// `pub(crate)`, unlike its neighbours: `ops.rs` takes it as a function
+/// pointer and nothing outside this crate ever has. It was `pub`, which
+/// on a crate that is about to be published is a promise about an
+/// elevation heuristic nobody asked for and semver would then hold this
+/// tree to.
+///
+/// Collapses the underlying check's `None` - the check itself failed - onto
+/// `false`, and that is the fail-safe direction here: a path masys could
+/// not ask about is one it should elevate for rather than one it should
+/// assume it owns. The cost of being wrong is a password prompt that
+/// turns out to be unnecessary; the cost of the other direction is a
+/// command refused after the operator agreed to it.
+pub(crate) fn writable_dir(dir: &str) -> bool {
+    writable(Path::new(dir)) == Some(true)
+}
+
 fn writable(dir: &Path) -> Option<bool> {
     // Unreachable: a path cannot contain an interior NUL, since NUL is the
     // one byte a path component may not hold. `None` rather than an
@@ -127,7 +171,8 @@ fn writable(dir: &Path) -> Option<bool> {
     let path = std::ffi::CString::new(dir.as_os_str().as_bytes()).ok()?;
     // SAFETY: `path` is a valid NUL-terminated C string that outlives the
     // call, and `faccessat` reads it and writes nothing.
-    if unsafe { libc::faccessat(libc::AT_FDCWD, path.as_ptr(), libc::W_OK, libc::AT_EACCESS) } == 0 {
+    if unsafe { libc::faccessat(libc::AT_FDCWD, path.as_ptr(), libc::W_OK, libc::AT_EACCESS) } == 0
+    {
         return Some(true);
     }
     match std::io::Error::last_os_error().raw_os_error() {

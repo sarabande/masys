@@ -1,10 +1,10 @@
 //! What is using the disk: a parallel directory walk behind a channel.
 //!
-//! The one place in masys that spends threads. `masys-design.md` allows
-//! exactly this and says when: "the fix is moving *that one source*
-//! behind a thread and channel, not making everything async." A scan is
-//! 10 s against a 2 s tick - a 500% duty cycle - and is the source that
-//! earns it.
+//! The one place in masys that spends threads, and the rule that allows
+//! it also says when: a source too slow for the tick moves *that one
+//! source* behind a thread and a channel, rather than making everything
+//! async. A scan is 10 s against a 2 s tick - a 500% duty cycle - and is
+//! the source that earns it.
 //!
 //! Parallel because it is the only thing that helps. Measured against
 //! `dust`, which does the same: `du -sh /home/user` takes 9.80 s of wall
@@ -50,7 +50,13 @@ impl ScanState {
         let dirs = self.dirs.lock().expect("scan state");
         ScanProgress {
             root: self.root.lock().expect("scan state").clone(),
-            dirs: dirs.iter().map(|(path, bytes)| DirSize { path: path.clone(), bytes: *bytes }).collect(),
+            dirs: dirs
+                .iter()
+                .map(|(path, bytes)| DirSize {
+                    path: path.clone(),
+                    bytes: *bytes,
+                })
+                .collect(),
             counted_bytes: self.counted_bytes.load(Ordering::Relaxed),
             dirs_seen: self.dirs_seen.load(Ordering::Relaxed),
             unreadable: self.unreadable.load(Ordering::Relaxed),
@@ -74,7 +80,11 @@ impl ScanState {
         if meta.nlink() <= 1 {
             return false;
         }
-        !self.linked.lock().expect("scan state").insert((meta.dev(), meta.ino()))
+        !self
+            .linked
+            .lock()
+            .expect("scan state")
+            .insert((meta.dev(), meta.ino()))
     }
 }
 
@@ -114,7 +124,9 @@ fn walk_dir(path: &Path, device: u64, floor: u64, state: &ScanState) -> u64 {
     // Read before the directory is opened, because it is true whether or
     // not it can be: an unreadable directory can still be stat'd, and
     // `du` counts its blocks too.
-    let mut here = std::fs::symlink_metadata(path).map(|m| m.blocks() * 512).unwrap_or(0);
+    let mut here = std::fs::symlink_metadata(path)
+        .map(|m| m.blocks() * 512)
+        .unwrap_or(0);
 
     let Ok(entries) = std::fs::read_dir(path) else {
         // A permission wall, or a directory that vanished mid-walk.
@@ -123,7 +135,11 @@ fn walk_dir(path: &Path, device: u64, floor: u64, state: &ScanState) -> u64 {
         state.unreadable.fetch_add(1, Ordering::Relaxed);
         state.counted_bytes.fetch_add(here, Ordering::Relaxed);
         if here >= floor {
-            state.dirs.lock().expect("scan state").insert(path.to_path_buf(), here);
+            state
+                .dirs
+                .lock()
+                .expect("scan state")
+                .insert(path.to_path_buf(), here);
         }
         return here;
     };
@@ -154,16 +170,26 @@ fn walk_dir(path: &Path, device: u64, floor: u64, state: &ScanState) -> u64 {
     // subtrees go to the pool, and rayon steals work between them.
     let below: u64 = if subdirs.len() > 1 {
         use rayon::prelude::*;
-        subdirs.par_iter().map(|child| walk_dir(child, device, floor, state)).sum()
+        subdirs
+            .par_iter()
+            .map(|child| walk_dir(child, device, floor, state))
+            .sum()
     } else {
-        subdirs.iter().map(|child| walk_dir(child, device, floor, state)).sum()
+        subdirs
+            .iter()
+            .map(|child| walk_dir(child, device, floor, state))
+            .sum()
     };
 
     let total = here + below;
     // Under the floor the directory folds into its parent: its bytes are
     // in `total` either way, so a fold hides a row and never a byte.
     if total >= floor {
-        state.dirs.lock().expect("scan state").insert(path.to_path_buf(), total);
+        state
+            .dirs
+            .lock()
+            .expect("scan state")
+            .insert(path.to_path_buf(), total);
     }
     total
 }
@@ -202,9 +228,19 @@ impl RayonScanner {
     /// `used_bytes` sets the retention floor - see `floor_for`. It comes
     /// from `statvfs`, so it is known before the walk starts.
     pub fn new(used_bytes: u64) -> Result<RayonScanner, String> {
-        let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(2).min(MAX_THREADS);
-        let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).build().map_err(|e| e.to_string())?;
-        Ok(RayonScanner { state: Mutex::new(Arc::new(ScanState::new())), pool, floor: floor_for(used_bytes) })
+        let threads = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(2)
+            .min(MAX_THREADS);
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .map_err(|e| e.to_string())?;
+        Ok(RayonScanner {
+            state: Mutex::new(Arc::new(ScanState::new())),
+            pool,
+            floor: floor_for(used_bytes),
+        })
     }
 }
 

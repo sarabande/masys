@@ -38,7 +38,7 @@ pub struct Key {
     ///
     /// Carried because without it `convert` in the binary had nowhere to
     /// put the modifier and dropped it, so `ctrl-k` arrived as a bare
-    /// `k` - which in the Procs view opens the SIGTERM confirmation. A
+    /// `k` - which in the Procs buffer opens the SIGTERM confirmation. A
     /// modifier a key model cannot represent is a modifier that silently
     /// becomes a different keystroke.
     pub ctrl: bool,
@@ -46,15 +46,31 @@ pub struct Key {
 
 impl Key {
     pub fn new(code: KeyCode) -> Self {
-        Key { code, alt: false, ctrl: false }
+        Key {
+            code,
+            alt: false,
+            ctrl: false,
+        }
     }
 
+    /// Nothing in the binary calls this - `convert` builds a `Key` as a
+    /// struct literal so it can set both modifiers from one `KeyEvent` at
+    /// once. Exists so tests reaching for an alt-held key don't have to.
     pub fn alt(code: KeyCode) -> Self {
-        Key { code, alt: true, ctrl: false }
+        Key {
+            code,
+            alt: true,
+            ctrl: false,
+        }
     }
 
+    /// Nothing in the binary calls this, for the same reason as `alt`.
     pub fn ctrl(code: KeyCode) -> Self {
-        Key { code, alt: false, ctrl: true }
+        Key {
+            code,
+            alt: false,
+            ctrl: true,
+        }
     }
 
     /// A bare character keypress - by far the most common case.
@@ -76,7 +92,10 @@ impl Key {
         let text = text.trim();
         // `shift+tab` is a key in its own right, not `tab` with a
         // modifier, so it must survive the alt-prefix strip below.
-        if matches!(text.to_ascii_lowercase().as_str(), "backtab" | "shift+tab" | "s-tab") {
+        if matches!(
+            text.to_ascii_lowercase().as_str(),
+            "backtab" | "shift+tab" | "s-tab"
+        ) {
             return Some(Key::new(KeyCode::BackTab));
         }
         // Modifiers in either order, and either case, because a config
@@ -89,7 +108,10 @@ impl Key {
             if let Some(stripped) = lower.strip_prefix("alt+") {
                 alt = true;
                 rest = &rest[rest.len() - stripped.len()..];
-            } else if let Some(stripped) = lower.strip_prefix("ctrl+").or_else(|| lower.strip_prefix("c-")) {
+            } else if let Some(stripped) = lower
+                .strip_prefix("ctrl+")
+                .or_else(|| lower.strip_prefix("c-"))
+            {
                 ctrl = true;
                 rest = &rest[rest.len() - stripped.len()..];
             } else {
@@ -141,7 +163,15 @@ impl Key {
             KeyCode::Other => "?".to_string(),
         };
         // Ctrl outermost, so `ctrl+alt+x` reads the way it is typed.
-        let base = if self.alt { format!("alt+{base}") } else { base };
-        if self.ctrl { format!("ctrl+{base}") } else { base }
+        let base = if self.alt {
+            format!("alt+{base}")
+        } else {
+            base
+        };
+        if self.ctrl {
+            format!("ctrl+{base}")
+        } else {
+            base
+        }
     }
 }
